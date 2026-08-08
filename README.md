@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="brand/muninn-banner-plain.png" alt="Muninn" width="820">
+  <img src="brand/muninn-banner.png" alt="Muninn — Hugging Face edge cache" width="820">
 </p>
-
-<h1 align="center">Muninn</h1>
 
 <p align="center">
   <a href="https://github.com/skibare87/muninn/actions/workflows/ci.yml"><img src="https://github.com/skibare87/muninn/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
@@ -366,8 +364,8 @@ came from.
 
 | file | use |
 |---|---|
-| `brand/muninn-banner.png` | 1280×640 social card, with wordmark |
-| `brand/muninn-banner-plain.png` | same, mark only — the README header |
+| `brand/muninn-banner.png` | 1280×640 wordmark lockup — README header and social card |
+| `brand/muninn-banner-plain.png` | same, mark only, for contexts that supply their own title |
 | `brand/muninn-icon.png` | 1024² transparent icon master |
 | `brand/muninn-icon-{16..512}.png` | pre-sized icons |
 | `brand/favicon.ico` | multi-resolution favicon (16/32/48/64) |
