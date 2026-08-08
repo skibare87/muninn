@@ -1,0 +1,344 @@
+# Muninn
+
+[![ci](https://github.com/skibare87/muninn/actions/workflows/ci.yml/badge.svg)](https://github.com/skibare87/muninn/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A Hugging Face edge cache for a fleet of GPU hosts backed by a large NVMe array.
+
+*In the Norse telling, Odin's raven Muninn — "memory" — flies out each day and
+returns with what it found. Same job here: fetch it once, remember it, and let
+everyone else read from memory.*
+
+**The one idea:** the WAN leg and the LAN leg want different protocols, so don't
+serve both with one reverse proxy.
+
+| leg | protocol | why |
+|---|---|---|
+| NAS ← Hugging Face | native **Xet**, parallel range GETs | 16–64 concurrent streams against the CDN. This is where Xet's speed actually comes from. |
+| edge node ← NAS | plain HTTP, whole file | no chunk reassembly, no second chunk cache on the node. Just bytes off NVMe. |
+
+A conventional caching reverse proxy (nginx, olah, dingospeed, Artifactory)
+can't do this, because its upstream leg inherits whatever protocol the client
+asked for. Disable Xet on the client to make the proxy cacheable and your WAN
+pull collapses to a **single stream off the LFS bridge** — the well-known
+~3 MB/s failure mode. This service sidesteps that by *ingesting* with the real
+`huggingface_hub` client and *serving* with a dumb file server.
+
+Edge nodes keep a small, disposable local cache and delete models freely: a
+re-pull is a LAN-speed stream from the array.
+
+## Quick start
+
+A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
+NAS does not need a toolchain:
+
+```bash
+docker pull ghcr.io/skibare87/muninn:0.1.0
+
+docker run -d --name muninn -p 8080:8080 \
+  -v /mnt/nvme/hf-cache:/cache \
+  -v /var/lib/muninn/xet:/xet \
+  -e HF_TOKEN=hf_xxx \
+  -e XHC_CACHE_MAX_SIZE=70T \
+  ghcr.io/skibare87/muninn:0.1.0
+```
+
+Or from source, which is also how you get the compose file's full env set:
+
+```bash
+cp .env.example .env      # set HF_TOKEN and XHC_CACHE_PATH
+docker compose up -d --build
+curl -s localhost:8080/_cache/status | jq
+```
+
+To run the published image under compose instead of building, replace the
+`build: .` line in `docker-compose.yml` with
+`image: ghcr.io/skibare87/muninn:0.1.0`.
+
+**Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
+GitHub Actions on every version tag:
+
+| tag | meaning |
+|---|---|
+| `0.1.0`, `0.1` | immutable release — **pin this on a fleet** |
+| `latest` | most recent tagged release; moves |
+| `edge` | tracks `main`; expect breakage |
+
+Pin the version tag on edge nodes. `latest` and `edge` both give every node
+whatever was pushed last, with nothing to roll back to when a push goes wrong.
+
+Point edge nodes at it:
+
+```bash
+export HF_ENDPOINT=http://nas.internal:8080
+export HF_HUB_DISABLE_XET=1        # correct HERE (LAN side), wrong in the container
+export HF_HUB_CACHE=/local/nvme/hf # small, disposable
+hf download meta-llama/Llama-3.1-70B-Instruct
+```
+
+`HF_HUB_DISABLE_XET=1` belongs on the **edge nodes only**. On the LAN leg Xet
+buys nothing and costs CPU plus a redundant `~/.cache/huggingface/xet` chunk
+cache on every node — exactly the space you're trying to reclaim. The container
+logs a warning if it sees this variable set on itself.
+
+## How requests are handled
+
+Metadata (`/api/...`) is proxied straight to the Hub — small, latency-bound, and
+any divergence from the real API breaks clients subtly. Only `/…/resolve/…`
+file bytes are intercepted:
+
+```
+GET /org/model/resolve/main/model.safetensors
+  ├─ cached?  → 200, stream from NVMe            (x-xhc-cache: HIT)
+  └─ miss     → start/join single-flight ingest  (x-xhc-cache: MISS)
+                 └─ per XHC_MISS_POLICY: stream | redirect | wait
+```
+
+Responses carry `x-xhc-cache`, `x-xhc-job`, and `x-xhc-miss-policy` so you can
+see what happened from the client side.
+
+**Single-flight coalescing** is the feature that matters most for a fleet that
+rotates models in lockstep. Forty nodes asking for the same 140 GB blob within
+seconds of each other produce exactly one upstream fetch.
+
+**Client Xet negotiation is blocked.** Requests to
+`/api/.../xet-{read,write}-token/...` return 404, so clients can't obtain a real
+`casUrl` and pull bytes straight from HF, silently bypassing the cache. Clients
+fall back to the resolve path automatically — a client that leaves Xet enabled
+still works, it just gets served from cache. Disable with
+`XHC_BLOCK_CLIENT_XET=0`.
+
+### Miss policies
+
+| policy | concurrent cold clients | edge node needs Hub token? | notes |
+|---|---|---|---|
+| `stream` **(default)** | share **one** WAN fetch, all served at ingest speed | no | Tail-follows the partial file. Depends on sequential writes — see below. |
+| `redirect` | each pulls from the WAN **independently** | yes | Coalesces the background ingest but not the clients. Use if you can't rely on sequential writes. |
+| `wait` | share one WAN fetch, but each waits for it to finish first | no | Always correct. Client pays ingest latency *then* transfer latency. |
+
+`redirect` was the original default; measurement changed the recommendation.
+It only coalesces the *ingest* — the clients themselves still each hit the WAN,
+which is the exact traffic multiplication the cache exists to prevent.
+
+If you prewarm properly, misses are rare and this choice barely matters.
+
+## Verifying sequential writes
+
+`stream` tail-follows a partial file, which is only correct if bytes land
+front-to-back. `hf_xet` reconstructs a file from terms that can be written at
+parallel file offsets, in which case a partial file is *not* a valid prefix and
+streaming it would serve holes as real data.
+
+**Measured on `hf_xet` via `huggingface_hub` 0.34.4**, against a 3.95 GB
+Xet-backed file (`Qwen/Qwen2.5-7B-Instruct` shard 1):
+
+| config | result |
+|---|---|
+| `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` unset | **PASS** — 17/17 samples valid prefixes, file grew from 0 monotonically, no preallocation |
+| `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY=1` | **PASS** — 9/9 samples, no measurable throughput penalty |
+
+So on this version writes are already sequential. That is *not* a documented
+guarantee, so the image sets the flag anyway and you should re-verify after any
+`hf_xet` upgrade:
+
+```bash
+docker compose exec muninn python scripts/verify_sequential_writes.py \
+    --repo-id Qwen/Qwen2.5-7B-Instruct \
+    --filename model-00001-of-00004.safetensors \
+    --cache-dir /tmp/verify
+```
+
+The script watches the `.incomplete` file and reads each byte **once, in order,
+at the moment it first becomes available** — exactly what the streaming path
+does — then compares that byte stream against the finished file. If a region
+was a hole when read and filled in later, the script captured the hole, just as
+a client would have. It reports `INCONCLUSIVE` rather than a false `PASS` if the
+download finished too fast to sample (use a multi-GB file).
+
+The service also degrades safely: if it can't find the partial file (the
+`.incomplete` naming is a `huggingface_hub` implementation detail that shifts
+between versions), it falls back to `wait` semantics rather than serving
+garbage.
+
+## Management API
+
+All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer …`.
+
+| method | path | purpose |
+|---|---|---|
+| `GET` | `/_cache/status` | disk, capacity, watermarks, active jobs, scan cost, **effective Xet env** |
+| `GET` | `/_cache/repos?refresh=true` | cached repos with size, file count, revisions, pin state |
+| `POST` | `/_cache/prewarm` | ingest a repo ahead of a rollout |
+| `GET` | `/_cache/jobs`, `/_cache/jobs/{id}` | ingest progress, elapsed, throughput |
+| `GET`/`POST`/`DELETE` | `/_cache/pins` | pin management |
+| `POST` | `/_cache/evict` | force an LRU sweep |
+| `DELETE` | `/_cache/repos` | drop a repo (409 if pinned) |
+| `GET` | `/healthz` | container healthcheck |
+
+`/_cache/status` echoes the Xet variables the process actually sees. A silently
+unset or wrong value there is the single most likely cause of a slow WAN ingest,
+so check it first.
+
+### Prewarming is the primary path
+
+If you know your model set in advance — and with centralised model management
+you do — edge nodes should only ever see cache hits.
+
+```bash
+curl -X POST localhost:8080/_cache/prewarm -H 'content-type: application/json' -d '{
+  "repo_id": "meta-llama/Llama-3.1-70B-Instruct",
+  "allow_patterns": ["*.safetensors", "*.json", "tokenizer*"],
+  "pin": true
+}'
+```
+
+`allow_patterns` matters on the Hub: many repos ship both `.safetensors` and
+`.bin` copies of the same weights, and pulling both doubles your footprint for
+nothing.
+
+### Pinning vs. eviction
+
+Eviction is LRU over revisions, triggered on a timer and by watermark. **Pinning
+is repo-level and absolute** — a pinned repo is never an eviction candidate,
+even if that means the cache can't reach its low-water mark. That's the right
+failure mode for a fleet rollout: better to run hot on disk than to evict the
+model every node is about to request. Pin the current working set; let
+experiments age out.
+
+## Configuration
+
+| variable | default | meaning |
+|---|---|---|
+| `HF_TOKEN` | — | org token. Edge nodes then need no Hub credentials, and gated licences are accepted once, centrally. |
+| `HF_HUB_CACHE` | `/cache` | the array. Standard `huggingface_hub` layout. |
+| `XHC_CACHE_MAX_SIZE` | filesystem size | eviction target, e.g. `70T`. Binary units. |
+| `XHC_HIGH_WATER` / `XHC_LOW_WATER` | `0.90` / `0.75` | evict when above high, down to low |
+| `XHC_EVICT_INTERVAL` | `900` | background sweep, seconds |
+| `XHC_MISS_POLICY` | `stream` | `stream` \| `redirect` \| `wait` |
+| `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
+| `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
+| `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
+| `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
+| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |
+| `HF_XET_HIGH_PERFORMANCE` | unset | bigger buffers/concurrency; wants ≥64 GB RAM |
+| `HF_XET_CHUNK_CACHE_SIZE_BYTES` | `100G` (compose) | `hf_xet` scratch; the one place chunk-level dedup can pay off |
+| `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` | `1` (image) | required by the default `stream` policy |
+
+Invalid config fails at import rather than at first request — a bad
+`XHC_MISS_POLICY` will refuse to start the container.
+
+## On-disk layout
+
+The cache is a stock `huggingface_hub` directory
+(`models--org--name/{blobs,snapshots,refs}`). Deliberately: ingest is just
+`hf_hub_download`, so atomic writes, symlinking and blob-level dedup across
+revisions come for free, and the array stays readable by any standard HF client.
+If this service ever gets in your way you can mount the volume read-only
+elsewhere and point `HF_HUB_CACHE` straight at it. Our own state lives in
+`.xhc/` (currently just `pins.json`).
+
+That file-level dedup is also the dedup that actually pays here. Fine-tunes
+rewrite essentially every weight tensor, so Xet's chunk-level dedup across them
+recovers little beyond tokenizers and configs; identical files across revisions
+already cost one copy.
+
+## Scaling
+
+`scan_cache_dir()` stats every blob, so its cost tracks **file count, not
+bytes**. Measured with `scripts/bench_scan.py` (sparse files, real layout):
+
+| shape | files | logical size | scan |
+|---|---|---|---|
+| 500 repos × 30 large shards | 15,000 | 80.5 TB | **0.55 s** |
+| 2,000 repos × 2 revs × 50 shards | 200,000 | 83.9 TB | **12.1 s** |
+
+Same capacity, 22× the scan cost — file count is what bites, so a cache full of
+many-shard datasets is the case to watch. Two consequences, both handled:
+
+- The view cache TTL is **adaptive**: it holds a scan result for 10× the time
+  the scan took (clamped to 30–600 s), so a slow scan can't eat the wall clock.
+  At 200 k files that's a 120 s TTL; a cached `/_cache/status` returns in 0.5 ms.
+- The eviction sweep deliberately uses the **cached** view for its
+  trigger check. `evict()` re-scans authoritatively before deleting anything, so
+  forcing a fresh scan there would pay for two full scans (24 s) per sweep to
+  answer a question a stale view answers fine.
+
+**The hot path never scans.** A cache hit is a direct path resolution, so
+serving is unaffected by tree size — verified at 200 k files / 84 TB.
+
+Watch `scan_duration_s` on `/_cache/status`. If it climbs past ~30 s, the fix is
+an incremental index rather than a rescan.
+
+## Verified behaviour
+
+Exercised end-to-end against the live Hub, on real Xet-backed repos:
+
+**Correctness**
+
+- `hf download` through `HF_ENDPOINT` cold and warm; served bytes SHA-256
+  identical to a direct upstream download
+- 3 concurrent clients streaming a **3.95 GB** file off a cold cache → all three
+  SHA-256 match, from a **single** ingest
+- 12 concurrent cold requests → 1 ingest job (single-flight)
+- `Range` → `206` with correct `content-range`
+- Xet token endpoints 404'd; clients with Xet still enabled fall back and succeed
+- prewarm, pins, pin-protected eviction (409), delete, LRU eviction over watermark
+- `redirect` policy: 302 + background ingest → next request is a HIT
+
+**Performance** (loopback / page cache, so these bound the software, not your hardware)
+
+- warm hit, single client: **9.7 GB/s**
+- warm hit, 6 concurrent clients: **13.3 GB/s** aggregate
+- cold `stream`, 3 concurrent clients: **157 MB/s each** off one WAN ingest
+  (WAN-bound, not server-bound)
+
+Two real bugs were caught only by end-to-end testing, not by unit checks:
+cache hits returned no `ETag` (which `huggingface_hub` refuses to download
+without — fixed by recovering it from the blob symlink, since
+`snapshots/<commit>/<file>` links to `blobs/<etag>`), and `Settings.from_env()`
+carried a hardcoded default that shadowed the dataclass field, so changing the
+declared default silently did nothing.
+
+## Development
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q          # offline unit tests
+ruff check app scripts tests
+uvicorn app.main:app --reload --port 8080
+```
+
+The unit tests are deliberately offline. The behaviour that actually matters —
+ingest, coalescing, streaming integrity, eviction — needs the live Hub and is
+not run in CI; see **Verified behaviour** for what was exercised by hand and
+how. `scripts/bench_scan.py` and `scripts/verify_sequential_writes.py` are the
+two harnesses worth re-running when dependencies change.
+
+## Contributing
+
+Issues and PRs welcome. Two things make a change much easier to accept:
+
+- If you touch the ingest, streaming, or eviction paths, say how you exercised
+  it against a real repo — the offline tests will not catch a regression there.
+- If you change a default, grep for it. Defaults are asserted in `config.py`,
+  `.env.example`, `docker-compose.yml`, and the README table, and they have
+  drifted apart before.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Limitations
+
+- **Read path only.** Uploads pass through to the Hub unmodified; nothing is
+  written back through the cache.
+- **Single node.** No cache sharing or coordination between multiple instances.
+- **Multi-range requests unsupported** — a multi-range `Range` header gets the
+  whole file (legal, just unhelpful). HF clients only use single suffix ranges
+  to resume.
+- **Eviction granularity is a whole revision**, not individual files.
+- **`stream` depends on undocumented `hf_xet` write ordering.** Verified on
+  0.34.4; re-run the verification script after upgrading, or use `redirect`.
+- Not exercised: sustained multi-day load, and a real 100 GbE fabric (all
+  throughput numbers above are loopback).

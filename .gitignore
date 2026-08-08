@@ -1,0 +1,14 @@
+.venv/
+venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# local scratch from the benchmark / verification harnesses
+bench-cache/
+verify-cache/

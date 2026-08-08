@@ -1,0 +1,61 @@
+services:
+  muninn:
+    build: .
+    image: ghcr.io/skibare87/muninn:0.1.0
+    container_name: muninn
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # The 80T NVMe array. Standard huggingface_hub cache layout, so you can
+      # also mount it read-only elsewhere and point HF_HUB_CACHE at it directly.
+      - ${XHC_CACHE_PATH:-/mnt/nvme/hf-cache}:/cache
+      # hf_xet scratch chunk cache. Keep on fast local disk, separate from /cache.
+      - ${XHC_XET_PATH:-/var/lib/muninn/xet}:/xet
+    environment:
+      # --- identity ------------------------------------------------------
+      # One org token here means edge nodes need no Hub credentials at all,
+      # and gated licences (Llama/Gemma/Mistral) are accepted once, centrally.
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN in .env}
+      XHC_UPSTREAM: https://huggingface.co
+
+      # --- capacity ------------------------------------------------------
+      XHC_CACHE_MAX_SIZE: ${XHC_CACHE_MAX_SIZE:-70T}
+      XHC_HIGH_WATER: "0.90"
+      XHC_LOW_WATER: "0.75"
+      XHC_EVICT_INTERVAL: "900"
+
+      # --- behaviour -----------------------------------------------------
+      # stream:   default. N concurrent cold clients share ONE WAN fetch and
+      #           all get bytes at ingest speed (measured: 3 clients x 157MB/s
+      #           off a single 3.95GB ingest). Needs sequential writes.
+      # redirect: 302 to HF. Coalesces the ingest but NOT the clients -- each
+      #           pulls from the WAN itself and needs a Hub token.
+      # wait:     block until ingest completes. Always correct, slowest.
+      XHC_MISS_POLICY: ${XHC_MISS_POLICY:-stream}
+      XHC_BLOCK_CLIENT_XET: "1"
+      XHC_INGEST_CONCURRENCY: "4"
+      XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
+      XHC_LOG_LEVEL: INFO
+
+      # --- WAN ingest tuning ---------------------------------------------
+      # Raise if the NAS has bandwidth to spare; this is the main throughput
+      # dial. Default in the image is 32 (hf_xet's own default is 16).
+      HF_XET_NUM_CONCURRENT_RANGE_GETS: "32"
+      # Wants >=64GB RAM. Tensions against WRITE_SEQUENTIALLY below -- measure
+      # the combination rather than assuming they compose.
+      # HF_XET_HIGH_PERFORMANCE: "1"
+      # Required for XHC_MISS_POLICY=stream (set in the image too). Measured
+      # no throughput penalty vs unset on a 3.95GB Xet file.
+      HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY: "1"
+      HF_XET_CHUNK_CACHE_SIZE_BYTES: "107374182400"  # 100G of xet scratch
+
+    # scan_cache_dir() over a multi-TB tree is memory-hungry; give it headroom.
+    deploy:
+      resources:
+        limits:
+          memory: ${XHC_MEM_LIMIT:-16G}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

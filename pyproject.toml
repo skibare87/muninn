@@ -1,0 +1,37 @@
+[project]
+name = "muninn"
+version = "0.1.0"
+description = "Muninn - Hugging Face edge cache: ingests over the WAN with native Xet, serves the LAN as plain HTTP"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Matt Pruitt" }]
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/skibare87/muninn"
+Issues = "https://github.com/skibare87/muninn/issues"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE", "EXE", "PLW"]
+ignore = [
+    "E501",    # line length is handled by the formatter, and prose comments run long
+    "SIM105",  # contextlib.suppress is not clearer than try/except: pass here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Both intentionally mutate sys.path before importing the app package so they
+# can run as bare scripts without an install step.
+"tests/*" = ["E402"]
+"scripts/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
