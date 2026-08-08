@@ -1,7 +1,14 @@
-# Muninn
+<p align="center">
+  <img src="brand/muninn-banner-plain.png" alt="Muninn" width="820">
+</p>
 
-[![ci](https://github.com/skibare87/muninn/actions/workflows/ci.yml/badge.svg)](https://github.com/skibare87/muninn/actions/workflows/ci.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<h1 align="center">Muninn</h1>
+
+<p align="center">
+  <a href="https://github.com/skibare87/muninn/actions/workflows/ci.yml"><img src="https://github.com/skibare87/muninn/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <a href="https://github.com/skibare87/muninn/pkgs/container/muninn"><img src="https://img.shields.io/badge/ghcr.io-muninn-2496ED?logo=docker&logoColor=white" alt="ghcr.io/skibare87/muninn"></a>
+</p>
 
 A Hugging Face edge cache for a fleet of GPU hosts backed by a large NVMe array.
 
@@ -351,6 +358,25 @@ Issues and PRs welcome. Two things make a change much easier to accept:
 - If you change a default, grep for it. Defaults are asserted in `config.py`,
   `.env.example`, `docker-compose.yml`, and the README table, and they have
   drifted apart before.
+
+## Brand assets
+
+`brand/` holds the derived assets; `images/` holds the original generations they
+came from.
+
+| file | use |
+|---|---|
+| `brand/muninn-banner.png` | 1280×640 social card, with wordmark |
+| `brand/muninn-banner-plain.png` | same, mark only — the README header |
+| `brand/muninn-icon.png` | 1024² transparent icon master |
+| `brand/muninn-icon-{16..512}.png` | pre-sized icons |
+| `brand/favicon.ico` | multi-resolution favicon (16/32/48/64) |
+
+Palette: ink `#1C222B`, gold `#C7A764`, paper `#E1DED1`.
+
+The icon was keyed off a solid white background with a soft alpha ramp rather
+than a hard threshold, so the dry-brush edges survive; partial-alpha pixels
+average rgb(112,112,112), so there is no white fringe on dark backgrounds.
 
 ## License
 
