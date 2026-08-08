@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
 from . import cachefs, serving
@@ -93,6 +95,120 @@ def upstream_resolve_url(repo_type: str, repo_id: str, revision: str, filename: 
         revision=revision,
         endpoint=settings.upstream,
     )
+
+
+# Upstream failures that are ANSWERS, not outages. Reporting "this file does not
+# exist" as 502 is not a cosmetic wrong code: huggingface_hub treats 5xx as
+# retryable and burns ~23s of backoff before giving up, while a 404 carrying
+# X-Error-Code: EntryNotFound is understood immediately. Clients probe for
+# optional files (processor_config.json, chat_template.jinja, ...) on every
+# model load, so getting this wrong taxes every single load.
+#
+# Order matters: GatedRepoError and DisabledRepoError subclass
+# RepositoryNotFoundError, so they must be tested first.
+_UPSTREAM_ERRORS: tuple[tuple[type[Exception], str, int], ...] = (
+    (hf_errors.GatedRepoError, "GatedRepo", 403),
+    (hf_errors.DisabledRepoError, "DisabledRepo", 403),
+    (hf_errors.EntryNotFoundError, "EntryNotFound", 404),
+    (hf_errors.RevisionNotFoundError, "RevisionNotFound", 404),
+    (hf_errors.RepositoryNotFoundError, "RepoNotFound", 404),
+)
+
+
+def upstream_failure(exc: Exception, repo_id: str, filename: str) -> HTTPException:
+    """Translate an upstream exception into the response the Hub itself would send.
+
+    Only genuine HTTP answers are passed through. Anything with no upstream
+    response behind it (DNS, TLS, connection reset, timeout) really is a bad
+    gateway and stays a 502.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    error_code = None
+    if response is not None:
+        try:
+            error_code = response.headers.get("X-Error-Code")
+        except AttributeError:
+            error_code = None
+
+    if error_code is None:
+        for cls, code, default_status in _UPSTREAM_ERRORS:
+            if isinstance(exc, cls):
+                error_code = code
+                status = status or default_status
+                break
+
+    if status is None:
+        log.warning("upstream unreachable for %s/%s: %s", repo_id, filename, exc)
+        return HTTPException(status_code=502, detail=f"upstream unreachable: {exc}")
+
+    # Not a warning: a missing optional file is the single most common request
+    # this service sees, and logging it at WARNING makes real problems invisible.
+    log.debug("upstream %s for %s/%s (%s)", status, repo_id, filename, error_code)
+    headers = {"X-Error-Code": error_code} if error_code else None
+    return HTTPException(
+        status_code=status,
+        detail=f"upstream returned {status} for {repo_id}/{filename}",
+        headers=headers,
+    )
+
+
+# --------------------------------------------------------------------------
+# negative cache
+#
+# Fixing the status code stops the retry storm, but every probe for an absent
+# optional file is still a WAN round-trip -- once per missing file, per model
+# load, per node. A fleet rotating onto one model does that in lockstep. Hold
+# 404s briefly so the first node pays and the rest do not.
+#
+# TTL is deliberately short: a file that does not exist today may be pushed
+# tomorrow, and `main` moves. This trades a bounded window of staleness on
+# absent files for removing a per-load WAN round-trip.
+# --------------------------------------------------------------------------
+
+_negative: dict[tuple[str, str, str, str], tuple[float, HTTPException]] = {}
+_NEGATIVE_MAX = 20_000
+
+
+def _negative_cache_get(
+    repo_type: str, repo_id: str, revision: str, filename: str
+) -> HTTPException | None:
+    if settings.negative_ttl_s <= 0:
+        return None
+    key = (repo_type, repo_id, revision, filename)
+    entry = _negative.get(key)
+    if entry is None:
+        return None
+    expires, exc = entry
+    if time.monotonic() >= expires:
+        _negative.pop(key, None)
+        return None
+    return exc
+
+
+def _negative_cache_put(
+    repo_type: str, repo_id: str, revision: str, filename: str, exc: HTTPException
+) -> None:
+    if settings.negative_ttl_s <= 0:
+        return
+    if len(_negative) >= _NEGATIVE_MAX:
+        # Cheap bound. Entries are tiny and short-lived; drop the whole map
+        # rather than carry an LRU for what is only a latency optimisation.
+        _negative.clear()
+    _negative[(repo_type, repo_id, revision, filename)] = (
+        time.monotonic() + settings.negative_ttl_s,
+        exc,
+    )
+
+
+def negative_cache_size() -> int:
+    return len(_negative)
+
+
+def negative_cache_clear() -> int:
+    n = len(_negative)
+    _negative.clear()
+    return n
 
 
 async def fetch_metadata(repo_type: str, repo_id: str, revision: str, filename: str):
@@ -174,11 +290,25 @@ async def serve_file(
         )
 
     # --- miss: ask upstream what this actually is --------------------------
+    cached_miss = _negative_cache_get(repo_type, repo_id, revision, filename)
+    if cached_miss is not None:
+        raise cached_miss
+
     try:
         meta = await fetch_metadata(repo_type, repo_id, revision, filename)
     except Exception as exc:
-        log.warning("upstream metadata failed for %s/%s: %s", repo_id, filename, exc)
-        raise HTTPException(status_code=502, detail=f"upstream metadata failed: {exc}") from exc
+        # A MISSING FILE IS NOT AN UPSTREAM FAILURE. huggingface_hub probes for
+        # OPTIONAL files on every single model load -- processor_config.json,
+        # chat_template.jinja, preprocessor variants -- and most repos do not
+        # have most of them. Returning 502 told the client the mirror was
+        # broken, so it retried 5 times with exponential backoff (~23 s) before
+        # falling back, on EVERY absent optional file. Observed loading
+        # MIT/ast-finetuned-audioset: six 502s and five retries for one file
+        # that simply does not exist.
+        failure = upstream_failure(exc, repo_id, filename)
+        if failure.status_code == 404:
+            _negative_cache_put(repo_type, repo_id, revision, filename, failure)
+        raise failure from exc
 
     commit = meta.commit_hash or revision
     etag = (meta.etag or "").strip('"')

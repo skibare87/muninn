@@ -88,6 +88,9 @@ class Settings:
     # casUrl and pull bytes straight from HF, bypassing this cache.
     block_client_xet: bool = True
     ingest_concurrency: int = 4
+    # Seconds to remember that a file 404s upstream. 0 disables. Short by
+    # design -- see the negative cache note in hfcompat.
+    negative_ttl_s: float = 60.0
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -127,6 +130,7 @@ class Settings:
             miss_policy=miss_policy,
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
+            negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),

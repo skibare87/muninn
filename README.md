@@ -108,6 +108,32 @@ fall back to the resolve path automatically — a client that leaves Xet enabled
 still works, it just gets served from cache. Disable with
 `XHC_BLOCK_CLIENT_XET=0`.
 
+### Missing files are answers, not failures
+
+Clients probe for **optional** files on every model load — `processor_config.json`,
+`chat_template.jinja`, preprocessor variants — and most repos have none of them.
+The cache passes the Hub's own answer straight through: the real status code
+*and* the `X-Error-Code` header.
+
+That header is load-bearing. `huggingface_hub` reads it to decide which
+exception to raise, and a bare 404 without it becomes a generic
+`HfHubHTTPError` rather than the `EntryNotFoundError` that callers catch to mean
+"optional file absent":
+
+| upstream | cache returns | client raises |
+|---|---|---|
+| 404 `EntryNotFound` | 404 + `X-Error-Code` | `EntryNotFoundError` — handled instantly |
+| 404 `RepoNotFound` / `RevisionNotFound` | same, passed through | the matching error |
+| 403 `GatedRepo` | 403 + `X-Error-Code` | `GatedRepoError` — fix a token, don't retry |
+| 5xx | passed through unchanged | retryable, as intended |
+| unreachable (DNS/TLS/reset/timeout) | 502 | genuinely a bad gateway |
+
+Reporting a missing file as 502 is not a cosmetic wrong code — it tells the
+client the mirror is broken. Absent files are then also negative-cached for
+`XHC_NEGATIVE_TTL` seconds (default 60), so a fleet rotating onto one model
+pays one WAN round-trip for each absent file instead of one per node per load.
+Measured: 94 ms cold, 1.2 ms from the negative cache.
+
 ### Miss policies
 
 | policy | concurrent cold clients | edge node needs Hub token? | notes |
@@ -217,6 +243,7 @@ experiments age out.
 | `XHC_MISS_POLICY` | `stream` | `stream` \| `redirect` \| `wait` |
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
+| `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |

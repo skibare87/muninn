@@ -131,3 +131,133 @@ def test_miss_policy_default_is_stream():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# Upstream error translation.
+#
+# Regression guard for a real production defect: a missing optional file was
+# reported as 502. huggingface_hub treats 5xx as "the hub is broken", so it
+# retried with backoff and ultimately raised LocalEntryNotFoundError -- a
+# connectivity error -- for a file that simply does not exist. Clients probe
+# for optional files on every model load, so this taxed every load.
+# ---------------------------------------------------------------------------
+
+
+def _resp(status, headers=None):
+    import requests
+
+    r = requests.Response()
+    r.status_code = status
+    r.headers.update(headers or {})
+    return r
+
+
+@pytest.mark.parametrize(
+    "exc_name,status,error_code,expect_status,expect_code",
+    [
+        ("EntryNotFoundError", 404, "EntryNotFound", 404, "EntryNotFound"),
+        ("RepositoryNotFoundError", 404, "RepoNotFound", 404, "RepoNotFound"),
+        ("RevisionNotFoundError", 404, "RevisionNotFound", 404, "RevisionNotFound"),
+        ("GatedRepoError", 403, "GatedRepo", 403, "GatedRepo"),
+        # A genuine hub fault must stay retryable, not be flattened to 404.
+        ("HfHubHTTPError", 500, None, 500, None),
+        ("HfHubHTTPError", 503, None, 503, None),
+    ],
+)
+def test_upstream_failure_passes_through_status_and_error_code(
+    exc_name, status, error_code, expect_status, expect_code
+):
+    from huggingface_hub import errors as E
+
+    from app.hfcompat import upstream_failure
+
+    exc = getattr(E, exc_name)(
+        "boom", response=_resp(status, {"X-Error-Code": error_code} if error_code else {})
+    )
+    http_exc = upstream_failure(exc, "org/repo", "f.json")
+    assert http_exc.status_code == expect_status
+    assert (http_exc.headers or {}).get("X-Error-Code") == expect_code
+
+
+def test_upstream_failure_without_response_uses_exception_class():
+    from huggingface_hub import errors as E
+
+    from app.hfcompat import upstream_failure
+
+    http_exc = upstream_failure(E.EntryNotFoundError("no response"), "org/repo", "f.json")
+    assert http_exc.status_code == 404
+    assert http_exc.headers["X-Error-Code"] == "EntryNotFound"
+
+
+def test_transport_failure_is_still_502():
+    # No upstream response behind it -> genuinely a bad gateway.
+    from app.hfcompat import upstream_failure
+
+    assert upstream_failure(OSError("connection refused"), "o/r", "f").status_code == 502
+    assert upstream_failure(TimeoutError("timed out"), "o/r", "f").status_code == 502
+
+
+def test_gated_is_not_reported_as_missing():
+    # 403 must not collapse into 404: the caller needs to know to fix a token,
+    # not conclude the file does not exist.
+    from huggingface_hub import errors as E
+
+    from app.hfcompat import upstream_failure
+
+    exc = E.GatedRepoError("gated", response=_resp(403, {"X-Error-Code": "GatedRepo"}))
+    assert upstream_failure(exc, "o/r", "f").status_code == 403
+
+
+def test_negative_cache_roundtrip():
+    from fastapi import HTTPException
+
+    from app import hfcompat
+
+    hfcompat.negative_cache_clear()
+    key = ("model", "org/repo", "main", "processor_config.json")
+    assert hfcompat._negative_cache_get(*key) is None
+    hfcompat._negative_cache_put(*key, HTTPException(status_code=404))
+    assert hfcompat._negative_cache_get(*key).status_code == 404
+    # A different file must not be shadowed by the cached miss.
+    assert hfcompat._negative_cache_get("model", "org/repo", "main", "config.json") is None
+    hfcompat.negative_cache_clear()
+
+
+def test_negative_cache_expires():
+    import time as _time
+
+    from fastapi import HTTPException
+
+    from app import hfcompat
+    from app.config import settings
+
+    hfcompat.negative_cache_clear()
+    original = settings.negative_ttl_s
+    settings.negative_ttl_s = 0.05
+    try:
+        key = ("model", "org/repo", "main", "gone.json")
+        hfcompat._negative_cache_put(*key, HTTPException(status_code=404))
+        assert hfcompat._negative_cache_get(*key) is not None
+        _time.sleep(0.1)
+        assert hfcompat._negative_cache_get(*key) is None
+    finally:
+        settings.negative_ttl_s = original
+        hfcompat.negative_cache_clear()
+
+
+def test_negative_cache_disabled_by_zero_ttl():
+    from fastapi import HTTPException
+
+    from app import hfcompat
+    from app.config import settings
+
+    hfcompat.negative_cache_clear()
+    original = settings.negative_ttl_s
+    settings.negative_ttl_s = 0
+    try:
+        key = ("model", "org/repo", "main", "x.json")
+        hfcompat._negative_cache_put(*key, HTTPException(status_code=404))
+        assert hfcompat._negative_cache_get(*key) is None
+    finally:
+        settings.negative_ttl_s = original

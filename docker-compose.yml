@@ -35,6 +35,9 @@ services:
       XHC_MISS_POLICY: ${XHC_MISS_POLICY:-stream}
       XHC_BLOCK_CLIENT_XET: "1"
       XHC_INGEST_CONCURRENCY: "4"
+      # Remember upstream 404s briefly. Clients probe for optional files on
+      # every model load; this keeps that off the WAN. 0 disables.
+      XHC_NEGATIVE_TTL: "60"
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 
