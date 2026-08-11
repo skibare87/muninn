@@ -621,6 +621,8 @@ ENV_TO_SETTING = [
     ("XHC_MAX_FILE_BYTES", "2G", "max_file_bytes", 2 * 1024**3),
     ("XHC_VIEWER_ENDPOINTS", "parquet", "viewer_endpoints", "parquet"),
     ("XHC_VIEWER_CACHE_TTL", "60", "viewer_cache_ttl_s", 60.0),
+    ("XHC_DATASETS_SERVER", "https://ds.invalid", "datasets_server", "https://ds.invalid"),
+    ("XHC_DATASETS_SERVER_ENDPOINTS", "splits", "datasets_server_endpoints", "splits"),
     ("XHC_STREAM_POLL_INTERVAL", "0.5", "stream_poll_interval_s", 0.5),
     ("XHC_STREAM_START_TIMEOUT", "60", "stream_start_timeout_s", 60.0),
     ("XHC_PORT", "9999", "port", 9999),
@@ -1018,6 +1020,74 @@ def test_viewer_keys_do_not_collide_across_subpaths(tmp_path):
         viewer.store("org/ds", "parquet/default/train", b"split", None)
         assert viewer.load("org/ds", "parquet")["body"] == "root"
         assert viewer.load("org/ds", "parquet/default/train")["body"] == "split"
+        assert viewer.stats()["entries"] == 2
+    finally:
+        settings.cache_dir = original
+
+
+# ---------------------------------------------------------------------------
+# datasets-server proxy (opt-in, at our own prefix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("datasets-server/splits", ("splits", "splits")),
+        ("datasets-server/first-rows", ("first-rows", "first-rows")),
+        ("datasets-server/rows", ("rows", "rows")),
+        ("datasets-server/some/deep/path", ("some", "some/deep/path")),
+    ],
+)
+def test_parse_datasets_server_path(path, expected):
+    from app import viewer
+
+    assert viewer.parse_datasets_server_path(path) == expected
+
+
+@pytest.mark.parametrize(
+    "path", ["api/datasets/org/ds/parquet", "datasets-server/", "org/repo/resolve/main/f", ""]
+)
+def test_parse_datasets_server_path_rejects_others(path):
+    from app import viewer
+
+    assert viewer.parse_datasets_server_path(path) is None
+
+
+def test_rows_is_never_cacheable():
+    # Query-dependent and unbounded: caching it badly means serving wrong rows.
+    from app import viewer
+
+    assert viewer.ds_cacheable("splits")
+    assert viewer.ds_cacheable("first-rows")
+    assert not viewer.ds_cacheable("rows")
+
+
+def test_ds_cache_key_is_query_order_independent():
+    # dataset/config/split arrive as query params here, so the key must include
+    # them -- and must not treat a reordering as a different request.
+    from app import viewer
+
+    a = viewer.ds_cache_key("splits", "dataset=org%2Fds&config=default")
+    b = viewer.ds_cache_key("splits", "config=default&dataset=org%2Fds")
+    assert a == b
+    assert viewer.ds_cache_key("splits", "dataset=other") != a
+
+
+def test_ds_store_and_load_roundtrip(tmp_path):
+    from app import viewer
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        k1 = viewer.ds_cache_key("splits", "dataset=a/b")
+        k2 = viewer.ds_cache_key("splits", "dataset=c/d")
+        assert viewer.ds_load(k1) is None
+        viewer.ds_store(k1, b'{"splits":[]}', "application/json")
+        viewer.ds_store(k2, b'{"splits":[1]}', "application/json")
+        assert viewer.ds_load(k1)["body"] == '{"splits":[]}'
+        assert viewer.ds_load(k2)["body"] == '{"splits":[1]}'
         assert viewer.stats()["entries"] == 2
     finally:
         settings.cache_dir = original

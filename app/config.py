@@ -116,6 +116,11 @@ class Settings:
     # datasets-server.huggingface.co and never reaches us at all.
     viewer_endpoints: str = "parquet,croissant"
     viewer_cache_ttl_s: float = 3600.0
+    # Opt-in proxy for datasets-server.huggingface.co, exposed at
+    # /datasets-server/*. Empty string disables the route entirely.
+    datasets_server: str = "https://datasets-server.huggingface.co"
+    # /rows is deliberately absent: query-dependent and unbounded.
+    datasets_server_endpoints: str = "splits,first-rows,info,size,is-valid,parquet"
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -181,6 +186,10 @@ class Settings:
             max_file_bytes=parse_size(os.environ.get("XHC_MAX_FILE_BYTES"), None),
             viewer_endpoints=os.environ.get("XHC_VIEWER_ENDPOINTS", cls.viewer_endpoints),
             viewer_cache_ttl_s=_env_float("XHC_VIEWER_CACHE_TTL", cls.viewer_cache_ttl_s),
+            datasets_server=os.environ.get("XHC_DATASETS_SERVER", cls.datasets_server).rstrip("/"),
+            datasets_server_endpoints=os.environ.get(
+                "XHC_DATASETS_SERVER_ENDPOINTS", cls.datasets_server_endpoints
+            ),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),

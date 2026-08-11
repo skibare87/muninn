@@ -402,6 +402,13 @@ async def catch_all(full_path: str, request: Request) -> Response:
             status_code=404,
         )
 
+    # Opt-in datasets-server proxy. Checked first: it owns its own prefix and
+    # must never be parsed as a repo path.
+    if settings.datasets_server and request.method in ("GET", "HEAD"):
+        ds = viewer.parse_datasets_server_path(full_path)
+        if ds is not None:
+            return await serve_datasets_server(*ds, request)
+
     parsed = parse_resolve(full_path)
     if parsed is not None and request.method in ("GET", "HEAD"):
         repo_type, repo_id, revision, filename = parsed
@@ -554,6 +561,66 @@ def _policy_refusal(repo_type: str, repo_id: str, decision: policy.Decision) -> 
         status_code=403,
         headers={"x-xhc-policy": "denied"},
     )
+
+
+async def serve_datasets_server(endpoint: str, upstream_path: str, request: Request) -> Response:
+    """Proxy datasets-server.huggingface.co, caching the small stable endpoints.
+
+    Nothing routes here unless a caller deliberately uses the /datasets-server/
+    prefix, so this cannot affect a node that does not know about it.
+    """
+    url = f"{settings.datasets_server}/{quote(upstream_path)}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    cacheable = viewer.ds_cacheable(endpoint)
+    key = viewer.ds_cache_key(upstream_path, request.url.query) if cacheable else ""
+
+    if cacheable:
+        entry = viewer.ds_load(key)
+        if entry is not None and viewer.is_fresh(entry):
+            metrics.record_request("DSSERVER-HIT", request.headers.get("x-muninn-client"))
+            return Response(
+                content=entry["body"].encode(),
+                status_code=200,
+                headers={"x-xhc-cache": "DSSERVER-HIT"},
+                media_type=entry.get("content_type", "application/json"),
+            )
+    else:
+        entry = None
+
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+    if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
+        headers["authorization"] = f"Bearer {settings.hf_token}"
+    headers.setdefault("accept-encoding", "identity")
+    try:
+        upstream = await get_client().get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        metrics.record_upstream(None)
+        raise HTTPException(status_code=502, detail=f"datasets-server error: {exc}") from exc
+    metrics.record_upstream(upstream.status_code)
+
+    if cacheable and upstream.status_code == 200:
+        viewer.ds_store(key, upstream.content, upstream.headers.get("content-type"))
+        resp = _passthrough(upstream)
+        resp.headers["x-xhc-cache"] = "DSSERVER-MISS"
+        metrics.record_request("DSSERVER-MISS", request.headers.get("x-muninn-client"))
+        return resp
+
+    if upstream.status_code == 404 and entry is not None:
+        # Dataset gone upstream; the copy we hold is the only one left.
+        metrics.record_request("DSSERVER-SYNTHESIZED", request.headers.get("x-muninn-client"))
+        return Response(
+            content=entry["body"].encode(),
+            status_code=200,
+            headers={"x-xhc-cache": "DSSERVER-SYNTHESIZED", "x-xhc-synthesized": "true"},
+            media_type=entry.get("content_type", "application/json"),
+        )
+
+    metrics.record_request(
+        f"DSSERVER-{upstream.status_code}", request.headers.get("x-muninn-client")
+    )
+    return _passthrough(upstream)
 
 
 async def serve_viewer(
