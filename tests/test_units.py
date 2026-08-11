@@ -475,3 +475,117 @@ def test_synthesized_tag_does_not_break_huggingface_hub_parsing():
     }
     assert ModelInfo(**payload).sha == "b" * 40
     assert DatasetInfo(**payload).sha == "b" * 40
+
+
+# ---------------------------------------------------------------------------
+# Range handling. Multi-range matters for dataset workloads: parquet readers
+# batch column-chunk reads into one request.
+# ---------------------------------------------------------------------------
+
+
+def test_coalesce_merges_overlapping_and_adjacent():
+    from app.serving import coalesce
+
+    assert coalesce([(0, 100), (50, 200)]) == [(0, 200)]  # overlapping
+    assert coalesce([(0, 99), (100, 199)]) == [(0, 199)]  # adjacent
+    assert coalesce([(0, 99), (200, 299)]) == [(0, 99), (200, 299)]  # disjoint
+    assert coalesce([(200, 299), (0, 99)]) == [(0, 99), (200, 299)]  # unordered
+    assert coalesce([]) == []
+
+
+def test_coalesce_defeats_range_amplification():
+    # CVE-2011-3192: many overlapping ranges, each nearly the whole file. After
+    # coalescing the body can never exceed the file size.
+    from app.serving import coalesce
+
+    merged = coalesce([(0, 999_999)] * 500)
+    assert merged == [(0, 999_999)]
+    assert sum(e - s + 1 for s, e in merged) <= 1_000_000
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        ("bytes=0-99,200-299", [(0, 99), (200, 299)]),
+        ("bytes=0-500,400-800", [(0, 800)]),  # coalesced
+        ("bytes=0-99,100-199", [(0, 199)]),  # adjacent -> one part
+        ("bytes=-100", [(900, 999)]),  # suffix
+        ("bytes=500-", [(500, 999)]),  # open-ended
+        ("bytes=0-99,5000-6000", [(0, 99)]),  # drop unsatisfiable member
+        ("bytes = 0-99 , 200-299", [(0, 99), (200, 299)]),  # whitespace
+        ("bytes=abc", None),  # malformed -> ignore header
+        ("bytes=", None),
+        (None, None),
+    ],
+)
+def test_parse_ranges(header, expected):
+    from app.serving import parse_ranges
+
+    assert parse_ranges(header, 1000) == expected
+
+
+def test_parse_ranges_416_only_when_all_unsatisfiable():
+    from fastapi import HTTPException
+
+    from app.serving import parse_ranges
+
+    with pytest.raises(HTTPException) as exc:
+        parse_ranges("bytes=2000-3000", 1000)
+    assert exc.value.status_code == 416
+    assert exc.value.headers["content-range"] == "bytes */1000"
+
+
+def test_too_many_ranges_falls_back_to_whole_file(monkeypatch):
+    from app import serving
+
+    monkeypatch.setattr(serving, "MAX_RANGES", 4)
+    disjoint = ",".join(f"{i * 10}-{i * 10 + 1}" for i in range(20))
+    assert serving.parse_ranges(f"bytes={disjoint}", 1000) is None
+
+
+def test_multipart_content_length_is_exact(tmp_path):
+    # A wrong Content-Length makes clients hang waiting for bytes that never
+    # arrive, rather than fail loudly -- so assert the arithmetic against the
+    # bytes the generator actually produces.
+    from app.serving import _multipart_length, _read_multipart
+
+    data = bytes(range(256)) * 8
+    f = tmp_path / "blob.bin"
+    f.write_bytes(data)
+    ranges = [(0, 99), (500, 599), (1000, 1099)]
+    boundary = "testboundary"
+
+    declared = _multipart_length(boundary, ranges, len(data))
+    actual = sum(len(c) for c in _read_multipart(f, ranges, len(data), boundary))
+    assert declared == actual
+
+
+def test_multipart_body_parses_and_round_trips(tmp_path):
+    import email
+
+    from app.serving import _read_multipart
+
+    data = bytes(range(256)) * 8
+    f = tmp_path / "blob.bin"
+    f.write_bytes(data)
+    ranges = [(0, 49), (100, 149)]
+    boundary = "b0undary"
+
+    body = b"".join(_read_multipart(f, ranges, len(data), boundary))
+    msg = email.message_from_bytes(
+        f"Content-Type: multipart/byteranges; boundary={boundary}\r\n"
+        "MIME-Version: 1.0\r\n\r\n".encode()
+        + body
+    )
+    parts = [p for p in msg.walk() if p.get_payload(decode=True) is not None]
+    assert len(parts) == 2
+    for part, (start, end) in zip(parts, ranges, strict=True):
+        assert part.get("Content-Range") == f"bytes {start}-{end}/{len(data)}"
+        assert part.get_payload(decode=True) == data[start : end + 1]
+
+
+def test_parse_range_single_wrapper_rejects_multi():
+    from app.serving import parse_range
+
+    assert parse_range("bytes=0-99", 1000) == (0, 99)
+    assert parse_range("bytes=0-99,200-299", 1000) is None  # caller must use parse_ranges

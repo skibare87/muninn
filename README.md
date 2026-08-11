@@ -139,6 +139,37 @@ client the mirror is broken. Absent files are then also negative-cached for
 pays one WAN round-trip for each absent file instead of one per node per load.
 Measured: 94 ms cold, 1.2 ms from the negative cache.
 
+### Range requests
+
+Both single and multi-range `Range` headers are honoured, on cache hits **and**
+on cache misses.
+
+| request | response |
+|---|---|
+| `bytes=100-199` | `206`, single body |
+| `bytes=0-99,500-599` | `206`, `multipart/byteranges` with exact `Content-Length` |
+| `bytes=0-500,400-800` | `206`, **coalesced** to one part `0-800` |
+| `bytes=0-99,9e9-9e9` | `206` for the satisfiable member; unsatisfiable ones dropped |
+| every range past EOF | `416` with `Content-Range: bytes */<size>` |
+| malformed, or more than `XHC_MAX_RANGES` parts | header ignored, `200` whole file |
+
+Multi-range matters most for **datasets**: parquet readers (fsspec, DuckDB,
+pyarrow) batch column-chunk reads into a single request. Model weights are
+fetched whole, so this rarely fires for them.
+
+**Ranges work on a cold cache too.** A range request that misses waits only
+until the ingest has written past its start offset, then streams just that
+span — verified serving a 100-byte range out of a 988 MB file in 6.4 s, from
+one upstream fetch, instead of transferring 988 MB. That relies on ingest
+writing sequentially, the same property `stream` depends on. A *multi*-range
+miss instead waits for the ingest to finish and then serves from the completed
+file, because seeking backwards into a partially-written file is not safe.
+
+Overlapping ranges are coalesced before anything is read. That is the real
+defence against multi-range amplification (CVE-2011-3192, "killapache"): a
+thousand overlapping copies of the same span collapse to one, so the body can
+never exceed the file size. `XHC_MAX_RANGES` only bounds per-part bookkeeping.
+
 ### Miss policies
 
 | policy | concurrent cold clients | edge node needs Hub token? | notes |
@@ -350,6 +381,7 @@ experiments age out.
 | `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo listings from cache when upstream 404s |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
+| `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |
 | `HF_XET_HIGH_PERFORMANCE` | unset | bigger buffers/concurrency; wants ≥64 GB RAM |
 | `HF_XET_CHUNK_CACHE_SIZE_BYTES` | `100G` (compose) | `hf_xet` scratch; the one place chunk-level dedup can pay off |
@@ -444,6 +476,16 @@ Exercised end-to-end against the live Hub, on real Xet-backed repos:
 - an uncached repo still 404s honestly; `/tree/` and other sub-resources are not
   synthesized
 
+**Range handling**
+
+- multi-range `206` reassembled with the stdlib multipart parser: 3 parts, each
+  `Content-Range` correct, every byte matching the source
+- declared `Content-Length` equal to the bytes actually produced (691 = 691)
+- overlapping request coalesced to a single part and byte-identical to the span
+- all-unsatisfiable → `416` with `Content-Range: bytes */<size>`
+- **range off a cold cache**: 100 bytes out of a 988 MB file, bytes matching the
+  Hub, in 6.4 s from one ingest — instead of transferring the whole file
+
 **Error semantics**
 
 - upstream 404 → `404` + `X-Error-Code`, client raises `EntryNotFoundError`.
@@ -521,9 +563,6 @@ MIT — see [LICENSE](LICENSE).
 - **Read path only.** Uploads pass through to the Hub unmodified; nothing is
   written back through the cache.
 - **Single node.** No cache sharing or coordination between multiple instances.
-- **Multi-range requests unsupported** — a multi-range `Range` header gets the
-  whole file (legal, just unhelpful). HF clients only use single suffix ranges
-  to resume.
 - **Eviction granularity is a whole revision**, not individual files. The LRU
   sweep picks whole revisions; manual `DELETE /_cache/repos` can target one
   revision, but neither can drop a single file.

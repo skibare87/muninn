@@ -525,9 +525,42 @@ async def serve_file(
         / commit
         / filename
     )
+    headers["x-xhc-cache"] = "MISS-STREAM"
+
+    # Honour Range on a miss too. Without this, a client resuming an
+    # interrupted transfer that lands on a cold cache is served the whole file
+    # from byte 0 -- legal, but on a 140GB shard it is minutes of NIC time for
+    # bytes the client already has.
+    ranges = serving.parse_ranges(range_header, size) if size else None
+
+    if ranges and len(ranges) == 1:
+        start, end = ranges[0]
+        headers["content-length"] = str(end - start + 1)
+        headers["content-range"] = f"bytes {start}-{end}/{size}"
+        headers["accept-ranges"] = "bytes"
+        return StreamingResponse(
+            serving.tail_follow(job, final_path, size, start=start, end=end),
+            status_code=206,
+            headers=headers,
+            media_type="application/octet-stream",
+        )
+
+    if ranges and len(ranges) > 1:
+        # Multipart off a partially-written file would mean seeking backwards
+        # into bytes that may not have landed yet. Rare enough on a cold miss
+        # that waiting for the ingest and serving from the finished file is the
+        # right trade: correct, and still one upstream fetch.
+        await job.done.wait()
+        if job.state == "error":
+            raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+        local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
+        if local is None:
+            raise HTTPException(status_code=500, detail="ingest reported success but file missing")
+        headers["x-xhc-cache"] = "MISS-WAIT-MULTIRANGE"
+        return serving.file_response(local.path, local.size, range_header, headers)
+
     if size:
         headers["content-length"] = str(size)
-    headers["x-xhc-cache"] = "MISS-STREAM"
     return StreamingResponse(
         serving.tail_follow(job, final_path, size),
         status_code=200,
