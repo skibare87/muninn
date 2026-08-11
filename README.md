@@ -423,12 +423,49 @@ Exercised end-to-end against the live Hub, on real Xet-backed repos:
 - cold `stream`, 3 concurrent clients: **157 MB/s each** off one WAN ingest
   (WAN-bound, not server-bound)
 
-Two real bugs were caught only by end-to-end testing, not by unit checks:
-cache hits returned no `ETag` (which `huggingface_hub` refuses to download
-without — fixed by recovering it from the blob symlink, since
-`snapshots/<commit>/<file>` links to `blobs/<etag>`), and `Settings.from_env()`
-carried a hardcoded default that shadowed the dataclass field, so changing the
-declared default silently did nothing.
+**Retention and archive behaviour** (v0.2.0, against a stubbed upstream)
+
+- one repo deleted upstream, one live, eviction forced under real pressure
+  (20 MB cap vs 40 MB cached) → the **live** repo was evicted and the **deleted**
+  one kept
+- unreachable upstream → `inconclusive=1`, orphan mark preserved (the fail-safe:
+  an outage must never make an archive evictable)
+- repo restored upstream → mark cleared automatically
+- `XHC_ORPHAN_POLICY=evict` → the same orphan became evictable again
+- live upstream → zero repos marked, so no false positives
+- force-evict: pinned → `409`; after unpin → deleted, orphan mark cleared,
+  `retained_bytes` 12,512,611 → 0
+
+**Repo-info synthesis**
+
+- cold client, upstream 404ing everything → full `snapshot_download`, 10 files
+- live repos pass through untouched: no `x-xhc-synthesized` header, real Hub
+  fields (`lastModified`, `downloads`) intact
+- an uncached repo still 404s honestly; `/tree/` and other sub-resources are not
+  synthesized
+
+**Error semantics**
+
+- upstream 404 → `404` + `X-Error-Code`, client raises `EntryNotFoundError`.
+  Against the pre-fix code the same request produced `LocalEntryNotFoundError`
+  — a *connectivity* error — for a file that simply does not exist
+- 94 ms cold, 1.2 ms from the negative cache
+
+The `0.2.0` image was pulled back from GHCR and re-verified end to end, so these
+hold for the published artifact and not only the working tree.
+
+Three real bugs were caught only by end-to-end testing, not by unit checks:
+
+1. Cache hits returned no `ETag`, which `huggingface_hub` refuses to download
+   without. Fixed by recovering it from the blob symlink, since
+   `snapshots/<commit>/<file>` links to `blobs/<etag>`.
+2. `Settings.from_env()` carried a hardcoded default that shadowed the dataclass
+   field, so changing the declared default silently did nothing.
+3. Forwarding the upstream `content-encoding: gzip` header alongside
+   `httpx`-decoded bytes made clients try to gunzip plain JSON. `curl` hid this
+   completely — it sends no `Accept-Encoding`, so upstream never compressed —
+   and only a real `requests`-based client exposed it. A reminder that testing
+   with `curl` alone is not testing the client contract.
 
 ## Development
 
@@ -487,7 +524,9 @@ MIT — see [LICENSE](LICENSE).
 - **Multi-range requests unsupported** — a multi-range `Range` header gets the
   whole file (legal, just unhelpful). HF clients only use single suffix ranges
   to resume.
-- **Eviction granularity is a whole revision**, not individual files.
+- **Eviction granularity is a whole revision**, not individual files. The LRU
+  sweep picks whole revisions; manual `DELETE /_cache/repos` can target one
+  revision, but neither can drop a single file.
 - **`stream` depends on undocumented `hf_xet` write ordering.** Verified on
   0.34.4; re-run the verification script after upgrading, or use `redirect`.
 - Not exercised: sustained multi-day load, and a real 100 GbE fabric (all
