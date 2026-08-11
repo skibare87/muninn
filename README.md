@@ -113,6 +113,68 @@ fall back to the resolve path automatically — a client that leaves Xet enabled
 still works, it just gets served from cache. Disable with
 `XHC_BLOCK_CLIENT_XET=0`.
 
+### Mutable refs are revalidated
+
+A cache hit is a disk read, which is the point — but it means a moved `main`
+upstream would otherwise never be noticed, and the client would be told the old
+commit *is* `main`.
+
+Muninn revalidates the **ref**, not the file. A `ref → commit` mapping is
+trusted for `XHC_REF_TTL` seconds (default 300); inside that window a hit costs
+nothing extra, and a commit-pinned request costs nothing ever, since a sha
+cannot move. When the mapping expires and upstream has moved, the request is
+treated as a miss under the new commit.
+
+Revalidation is single-flight per repo-and-ref: forty nodes rotating together
+produce **one** upstream lookup, verified by counting.
+
+It fails open. If upstream is unreachable, rate-limiting, or has deleted the
+repo, we keep serving what we hold — required for orphan retention, where 404
+is permanent and correct. Only a positive, different commit triggers a refetch.
+
+Set `XHC_REF_TTL=0` to disable revalidation entirely; mutable refs then serve
+whatever was first cached, which is what a pure archive wants.
+
+### What this cache will fetch
+
+Any host that can reach the port can otherwise cause an ingest of any repo —
+a typo can pull a 500 GB dataset onto the array.
+
+```bash
+curl -X PUT localhost:8080/_cache/policy -H 'content-type: application/json' -d '{
+  "mode": "allowlist",
+  "allow": ["models/meta-llama/*", "datasets/my-org/*"],
+  "deny":  ["models/*/*-gguf"],
+  "max_file_bytes": 214748364800
+}'
+```
+
+- Patterns are globs over `models/org/name`, `datasets/org/name`, `spaces/…`.
+- **Deny always wins** over allow, so an explicit block cannot be undone by a
+  broad allow someone adds later.
+- Policy gates **ingest, not serving**. A repo already cached keeps serving even
+  after a policy change, so tightening policy cannot break a rollout in flight.
+  `"scope": "all"` enforces on cache hits too.
+- `max_file_bytes` is checked against the upstream HEAD, so an oversized file is
+  refused before any bytes move.
+- Refusals are `403` with `x-xhc-policy: denied`. They deliberately do **not**
+  borrow an HF `X-Error-Code` — this is a local rule, not the Hub's answer, and
+  labelling it `GatedRepo` would send people hunting for a token that would not
+  help.
+- `/_cache/prewarm` honours policy unless called with `"force": true`; the
+  management API is already authenticated.
+
+Env (`XHC_INGEST_POLICY`, `XHC_ALLOW_REPOS`, `XHC_DENY_REPOS`) seeds the policy;
+a `PUT` persists to `.xhc/policy.json` and wins from then on, same precedence as
+pins.
+
+### Conditional requests
+
+A cache hit answers `304 Not Modified` when `If-None-Match` matches the ETag it
+would return (`*` matches too). `If-Modified-Since` is deliberately **not**
+implemented: blob mtimes come from our ingest, not from the Hub, so any answer
+would be a guess.
+
 ### Missing files are answers, not failures
 
 Clients probe for **optional** files on every model load — `processor_config.json`,
@@ -235,6 +297,7 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `GET`/`POST`/`DELETE` | `/_cache/pins` | pin management |
 | `GET`/`DELETE` | `/_cache/orphans` | repos deleted upstream and retained |
 | `POST` | `/_cache/orphans/check` | run an upstream liveness sweep now |
+| `GET`/`PUT` | `/_cache/policy` | inspect or set what may be ingested |
 | `POST` | `/_cache/evict` | force an LRU sweep |
 | `DELETE` | `/_cache/repos` | drop a repo, or one `revision` of it (409 if pinned) |
 | `GET` | `/healthz` | container healthcheck |
@@ -293,6 +356,12 @@ so a Hub outage or a rate-limit burst cannot quietly convert your archive back
 into eviction fodder.
 
 #### Orphans stay fully usable
+
+Both `/api/{type}s/{repo}` and `/api/{type}s/{repo}/tree/{rev}` are rebuilt from
+the cached snapshot, so `snapshot_download` **and** `list_repo_files` work on a
+repo that no longer exists upstream. The tree's `oid` is the same value the
+resolve path serves as the ETag — they agree by construction, since both read
+the blob symlink.
 
 Retaining the bytes is only half the job. `snapshot_download` (and `hf download
 <repo>`) enumerates a repo through `/api/{type}s/{repo}` before fetching
@@ -378,7 +447,12 @@ experiments age out.
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |
 | `XHC_ORPHAN_CHECK_INTERVAL` | `21600` | seconds between upstream liveness sweeps; `0` disables |
-| `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo listings from cache when upstream 404s |
+| `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo/tree listings from cache when upstream 404s |
+| `XHC_REF_TTL` | `300` | seconds a ref→commit mapping is trusted; `0` never revalidates |
+| `XHC_INGEST_POLICY` | `open` | `open` \| `allowlist` |
+| `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins |
+| `XHC_POLICY_SCOPE` | `ingest` | `ingest` \| `all` — whether policy also gates cache hits |
+| `XHC_MAX_FILE_BYTES` | unset | refuse to ingest a file larger than this |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |

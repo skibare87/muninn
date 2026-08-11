@@ -100,6 +100,17 @@ class Settings:
     # Rebuild repo-info listings from the cached snapshot when upstream 404s,
     # so a repo deleted from the Hub stays enumerable (snapshot_download).
     synthesize_repo_info: bool = True
+    # Seconds a ref->commit mapping is trusted before revalidating upstream.
+    # 0 disables revalidation entirely: mutable refs then serve whatever was
+    # first cached, forever, which is what a pure archive wants.
+    ref_ttl_s: float = 300.0
+    # Ingest policy. `open` allows anything not explicitly denied; `allowlist`
+    # allows nothing that is not explicitly allowed. Deny always wins.
+    ingest_policy: str = "open"
+    allow_repos: str = ""
+    deny_repos: str = ""
+    policy_scope: str = "ingest"  # ingest | all
+    max_file_bytes: int | None = None
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -125,6 +136,14 @@ class Settings:
         if orphan_policy not in ("retain", "evict"):
             raise ValueError(f"XHC_ORPHAN_POLICY must be retain|evict, got {orphan_policy!r}")
 
+        ingest_policy = (os.environ.get("XHC_INGEST_POLICY") or cls.ingest_policy).strip().lower()
+        if ingest_policy not in ("open", "allowlist"):
+            raise ValueError(f"XHC_INGEST_POLICY must be open|allowlist, got {ingest_policy!r}")
+
+        policy_scope = (os.environ.get("XHC_POLICY_SCOPE") or cls.policy_scope).strip().lower()
+        if policy_scope not in ("ingest", "all"):
+            raise ValueError(f"XHC_POLICY_SCOPE must be ingest|all, got {policy_scope!r}")
+
         high = _env_float("XHC_HIGH_WATER", 0.90)
         low = _env_float("XHC_LOW_WATER", 0.75)
         if not 0 < low < high <= 1:
@@ -149,6 +168,12 @@ class Settings:
                 "XHC_ORPHAN_CHECK_INTERVAL", cls.orphan_check_interval_s
             ),
             synthesize_repo_info=_env_bool("XHC_SYNTHESIZE_REPO_INFO", cls.synthesize_repo_info),
+            ref_ttl_s=_env_float("XHC_REF_TTL", cls.ref_ttl_s),
+            ingest_policy=ingest_policy,
+            allow_repos=os.environ.get("XHC_ALLOW_REPOS", cls.allow_repos),
+            deny_repos=os.environ.get("XHC_DENY_REPOS", cls.deny_repos),
+            policy_scope=policy_scope,
+            max_file_bytes=parse_size(os.environ.get("XHC_MAX_FILE_BYTES"), None),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -21,7 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response, Streamin
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, serving
+from . import cachefs, policy, refs, serving
 from .config import settings
 from .jobs import manager
 
@@ -117,6 +118,89 @@ def parse_repo_info_path(full_path: str) -> tuple[str, str, str | None] | None:
     if not repo_id or repo_id.count("/") > 1:
         return None
     return repo_type, repo_id, revision or None
+
+
+def parse_tree_path(full_path: str) -> tuple[str, str, str, str] | None:
+    """Match `api/{type}s/{repo}/tree/{rev}[/{path}]`, used by list_repo_files."""
+    if not full_path.startswith("api/") or "/tree/" not in full_path:
+        return None
+    rest = full_path[len("api/") :]
+    repo_type = tail = None
+    for prefix, rtype in (("models/", "model"), ("datasets/", "dataset"), ("spaces/", "space")):
+        if rest.startswith(prefix):
+            repo_type, tail = rtype, rest[len(prefix) :]
+            break
+    if tail is None:
+        return None
+    repo_id, _, after = tail.partition("/tree/")
+    repo_id = repo_id.strip("/")
+    if not repo_id or repo_id.count("/") > 1 or not after:
+        return None
+    revision, _, path_in_repo = after.partition("/")
+    return repo_type, repo_id, unquote(revision), unquote(path_in_repo).strip("/")
+
+
+def synthesize_tree(
+    repo_type: str,
+    repo_id: str,
+    revision: str,
+    path_in_repo: str,
+    recursive: bool,
+    expand: bool,
+) -> list[dict] | None:
+    """Rebuild a tree listing from the cached snapshot.
+
+    `oid` is the blob's git sha, which in the HF cache layout is the symlink
+    target's filename -- the same value the resolve path serves as the ETag, so
+    the two agree by construction rather than by coincidence.
+    """
+    commit = cachefs.resolve_commit(repo_type, repo_id, revision or "main")
+    if commit is None:
+        return None
+    files = cachefs.snapshot_files(repo_type, repo_id, commit)
+    if not files:
+        return None
+
+    root = (
+        Path(settings.cache_dir)
+        / cachefs.repo_folder_name(repo_id, repo_type)
+        / "snapshots"
+        / commit
+    )
+    prefix = f"{path_in_repo}/" if path_in_repo else ""
+    scoped = [f for f in files if f.startswith(prefix)]
+    if not scoped:
+        return None
+
+    entries: list[dict] = []
+    seen_dirs: set[str] = set()
+    for rel in scoped:
+        remainder = rel[len(prefix) :]
+        if not recursive and "/" in remainder:
+            # Collapse to the immediate child directory.
+            d = prefix + remainder.split("/", 1)[0]
+            if d not in seen_dirs:
+                seen_dirs.add(d)
+                entries.append({"type": "directory", "oid": None, "size": 0, "path": d})
+            continue
+        target = root / rel
+        try:
+            size = target.stat().st_size
+        except OSError:
+            continue
+        oid = None
+        if target.is_symlink():
+            try:
+                oid = os.path.basename(os.readlink(target))
+            except OSError:
+                oid = None
+        item = {"type": "file", "oid": oid, "size": size, "path": rel}
+        if expand:
+            # We cannot invent commit history or scan results; null is honest.
+            item["lastCommit"] = None
+            item["securityFileStatus"] = None
+        entries.append(item)
+    return sorted(entries, key=lambda e: e["path"])
 
 
 def synthesize_repo_info(repo_type: str, repo_id: str, revision: str | None) -> dict | None:
@@ -326,17 +410,39 @@ async def catch_all(full_path: str, request: Request) -> Response:
     # Repo info is the one metadata endpoint we can honestly answer ourselves,
     # and it is the one that decides whether an orphaned repo is usable at all:
     # snapshot_download enumerates through it before fetching anything.
-    info = parse_repo_info_path(full_path)
-    if info is not None and request.method == "GET" and settings.synthesize_repo_info:
-        return await serve_repo_info(*info, full_path, request)
+    if request.method == "GET" and settings.synthesize_repo_info:
+        info = parse_repo_info_path(full_path)
+        if info is not None:
+            return await serve_repo_info(*info, full_path, request)
+        tree = parse_tree_path(full_path)
+        if tree is not None:
+            return await serve_tree(*tree, full_path, request)
 
     return await proxy_upstream(full_path, request)
 
 
-async def serve_repo_info(
-    repo_type: str, repo_id: str, revision: str | None, full_path: str, request: Request
-) -> Response:
-    """Proxy repo info, falling back to the cached snapshot on an upstream 404."""
+def _passthrough(upstream: httpx.Response) -> Response:
+    """Forward an upstream response we have already decoded.
+
+    content-encoding is stripped: httpx decompresses .content, so keeping the
+    header would make clients try to gunzip plain bytes.
+    """
+    out = {k: v for k, v in upstream.headers.items() if k.lower() not in _DECODED_DROP}
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=out,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+async def _proxy_get(full_path: str, request: Request) -> httpx.Response:
+    """GET upstream, non-streamed.
+
+    Unreachable is not the same as deleted, so a transport error surfaces as 502
+    rather than falling back to cached data -- a Hub outage must never start
+    serving stale listings.
+    """
     url = f"{settings.upstream}/{quote(full_path)}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -344,32 +450,23 @@ async def serve_repo_info(
     if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
         headers["authorization"] = f"Bearer {settings.hf_token}"
     headers.setdefault("accept-encoding", "identity")
-
     try:
-        upstream = await get_client().get(url, headers=headers)
+        return await get_client().get(url, headers=headers)
     except httpx.HTTPError as exc:
-        # Unreachable is not the same as deleted; do not synthesize over an
-        # outage, or a Hub blip would silently start serving stale listings.
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
 
+
+async def serve_repo_info(
+    repo_type: str, repo_id: str, revision: str | None, full_path: str, request: Request
+) -> Response:
+    """Proxy repo info, falling back to the cached snapshot on an upstream 404."""
+    upstream = await _proxy_get(full_path, request)
     if upstream.status_code != 404:
-        out = {k: v for k, v in upstream.headers.items() if k.lower() not in _DECODED_DROP}
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=out,
-            media_type=upstream.headers.get("content-type"),
-        )
+        return _passthrough(upstream)
 
     body = synthesize_repo_info(repo_type, repo_id, revision)
     if body is None:
-        out = {k: v for k, v in upstream.headers.items() if k.lower() not in _DECODED_DROP}
-        return Response(
-            content=upstream.content,
-            status_code=404,
-            headers=out,
-            media_type=upstream.headers.get("content-type"),
-        )
+        return _passthrough(upstream)
 
     log.info(
         "repo info synthesized for %s/%s (upstream 404, %d files from cache)",
@@ -384,6 +481,59 @@ async def serve_repo_info(
             "x-xhc-cache": "SYNTHESIZED",
             "x-repo-commit": body["sha"],
         },
+    )
+
+
+async def serve_tree(
+    repo_type: str,
+    repo_id: str,
+    revision: str,
+    path_in_repo: str,
+    full_path: str,
+    request: Request,
+) -> Response:
+    """Proxy a tree listing, falling back to the cached snapshot on a 404."""
+    upstream = await _proxy_get(full_path, request)
+    if upstream.status_code != 404:
+        return _passthrough(upstream)
+
+    params = request.query_params
+    entries = synthesize_tree(
+        repo_type,
+        repo_id,
+        revision,
+        path_in_repo,
+        recursive=params.get("recursive", "").lower() in ("1", "true"),
+        expand=params.get("expand", "").lower() in ("1", "true"),
+    )
+    if entries is None:
+        return _passthrough(upstream)
+    log.info(
+        "tree synthesized for %s/%s@%s (upstream 404, %d entries)",
+        repo_type,
+        repo_id,
+        revision,
+        len(entries),
+    )
+    # One page, no Link header: huggingface_hub's paginate() stops when Link is
+    # absent, so this terminates correctly rather than by accident.
+    return JSONResponse(
+        entries, headers={"x-xhc-synthesized": "true", "x-xhc-cache": "SYNTHESIZED"}
+    )
+
+
+def _policy_refusal(repo_type: str, repo_id: str, decision: policy.Decision) -> Response:
+    """403 for a local policy decision.
+
+    Deliberately does not borrow an HF X-Error-Code: this is our rule, not the
+    Hub's answer, and labelling it GatedRepo would send people hunting for a
+    token that would not help.
+    """
+    log.warning("policy refused %ss/%s: %s", repo_type, repo_id, decision.reason)
+    return JSONResponse(
+        {"error": f"blocked by cache policy: {decision.reason}", "repo": f"{repo_type}s/{repo_id}"},
+        status_code=403,
+        headers={"x-xhc-policy": "denied"},
     )
 
 
@@ -408,6 +558,18 @@ async def _hit_response(
             log.warning("hit for %s/%s but no etag available: %s", repo_id, filename, exc)
 
     headers = _cache_headers(local.commit, etag, {"x-xhc-cache": "HIT"})
+
+    # Conditional request: if the client already holds this exact blob, say so
+    # instead of resending it. Deliberately no If-Modified-Since -- blob mtimes
+    # come from our ingest, not from the Hub, so any answer would be a guess.
+    inm = request.headers.get("if-none-match")
+    if inm and etag:
+        quoted = etag if etag.startswith(('"', "W/")) else f'"{etag}"'
+        candidates = {t.strip() for t in inm.split(",")}
+        if "*" in candidates or quoted in candidates or etag in candidates:
+            headers["x-xhc-cache"] = "HIT-304"
+            return Response(status_code=304, headers=headers)
+
     if request.method == "HEAD":
         headers["content-length"] = str(local.size)
         headers["accept-ranges"] = "bytes"
@@ -420,12 +582,26 @@ async def serve_file(
 ) -> Response:
     range_header = request.headers.get("range")
 
+    # Policy gates ingest by default, so a repo already cached keeps serving
+    # even after a policy change -- tightening policy must not break a fleet
+    # mid-rollout. scope=all opts into enforcing on hits too.
+    pol = policy.load()
+    decision = policy.check(repo_type, repo_id, pol)
+    if not decision.allowed and policy.enforced_on_hits(pol):
+        return _policy_refusal(repo_type, repo_id, decision)
+
     # --- fast path: already cached -----------------------------------------
     local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
     if local is not None:
-        return await _hit_response(
-            local, repo_type, repo_id, revision, filename, request, range_header
-        )
+        # A mutable ref may have moved upstream. This is a ref-level check with
+        # a TTL, not a per-file HEAD -- inside the TTL, and always for
+        # sha-pinned requests, it costs nothing and the hit stays a disk read.
+        if await refs.is_stale(repo_type, repo_id, revision, local.commit):
+            local = None  # fall through and ingest the new commit
+        else:
+            return await _hit_response(
+                local, repo_type, repo_id, revision, filename, request, range_header
+            )
 
     # --- miss: ask upstream what this actually is --------------------------
     cached_miss = _negative_cache_get(repo_type, repo_id, revision, filename)
@@ -478,6 +654,13 @@ async def serve_file(
             },
         )
         return Response(status_code=200, headers=headers)
+
+    # --- policy: refuse before any bytes move -------------------------------
+    if not decision.allowed:
+        return _policy_refusal(repo_type, repo_id, decision)
+    size_decision = policy.check_size(size, pol)
+    if not size_decision.allowed:
+        return _policy_refusal(repo_type, repo_id, size_decision)
 
     # --- kick off (or join) the single-flight ingest ------------------------
     incomplete = str(cachefs.blob_incomplete_path(repo_type, repo_id, etag)) if etag else None

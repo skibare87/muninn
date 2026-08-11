@@ -44,6 +44,16 @@ services:
       XHC_ORPHAN_CHECK_INTERVAL: "21600"
       # Keep deleted repos enumerable by rebuilding their listing from cache.
       XHC_SYNTHESIZE_REPO_INFO: "1"
+      # Revalidate mutable refs (main, branches, tags) this often. 0 = never,
+      # which serves whatever was first cached forever.
+      XHC_REF_TTL: "${XHC_REF_TTL:-300}"
+      # Ingest policy: open | allowlist. Deny wins over allow. Gates ingest,
+      # not serving, unless XHC_POLICY_SCOPE=all.
+      XHC_INGEST_POLICY: ${XHC_INGEST_POLICY:-open}
+      XHC_ALLOW_REPOS: ${XHC_ALLOW_REPOS:-}
+      XHC_DENY_REPOS: ${XHC_DENY_REPOS:-}
+      XHC_POLICY_SCOPE: ${XHC_POLICY_SCOPE:-ingest}
+      XHC_MAX_FILE_BYTES: ${XHC_MAX_FILE_BYTES:-}
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 
