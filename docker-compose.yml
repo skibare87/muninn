@@ -54,6 +54,10 @@ services:
       XHC_DENY_REPOS: ${XHC_DENY_REPOS:-}
       XHC_POLICY_SCOPE: ${XHC_POLICY_SCOPE:-ingest}
       XHC_MAX_FILE_BYTES: ${XHC_MAX_FILE_BYTES:-}
+      # Small dataset metadata worth holding, so a deleted dataset stays
+      # describable. Never /rows.
+      XHC_VIEWER_ENDPOINTS: ${XHC_VIEWER_ENDPOINTS:-parquet,croissant}
+      XHC_VIEWER_CACHE_TTL: "${XHC_VIEWER_CACHE_TTL:-3600}"
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 

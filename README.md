@@ -284,6 +284,48 @@ The service also degrades safely: if it can't find the partial file (the
 between versions), it falls back to `wait` semantics rather than serving
 garbage.
 
+## Metrics
+
+`GET /metrics` exposes Prometheus text format. Unauthenticated by design: it
+carries counts only — no repo names, no file paths — so it is safe to scrape
+from the LAN.
+
+```
+muninn_requests_total{result="HIT"}            2
+muninn_requests_total{result="MISS-STREAM"}    1
+muninn_client_requests_total{client="gpu-01"}  2
+muninn_upstream_requests_total{status="404"}   1
+muninn_bytes_served_total                   2421
+muninn_bytes_ingested_total                  807
+```
+
+Plus gauges for cache bytes, files, repos, capacity, free disk, active ingests,
+orphan count and bytes, scan duration, and ref lookups.
+
+The `client` label comes from an optional `X-Muninn-Client` header a node can
+set. It is **attribution, not an audit trail** — it is self-reported, and a node
+can claim to be anything. Label cardinality is capped (200, overflowing to
+`__other__`) so a client sending a unique value per request cannot blow up a
+scrape.
+
+## Dataset metadata
+
+`/api/datasets/{id}/parquet` and `/croissant` are cached for
+`XHC_VIEWER_CACHE_TTL` seconds, and — like repo info — keep being served when
+upstream 404s, so a deleted dataset stays describable. Those responses carry
+`x-xhc-cache: VIEWER-SYNTHESIZED` and `x-xhc-synthesized: true`.
+
+Two deliberate exclusions:
+
+- **`/rows` is never cached.** It is query-dependent and unbounded; caching it
+  badly means serving wrong rows.
+- **`/splits`, `/rows` and `/first-rows` never reach Muninn at all.** They live
+  on `datasets-server.huggingface.co`, a separate host clients contact directly.
+  Nothing here can cache them without proxying that host too, which would be a
+  separate feature.
+
+`DELETE /_cache/viewer` drops the cached metadata; repo bytes are untouched.
+
 ## Management API
 
 All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer …`.
@@ -298,6 +340,7 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `GET`/`DELETE` | `/_cache/orphans` | repos deleted upstream and retained |
 | `POST` | `/_cache/orphans/check` | run an upstream liveness sweep now |
 | `GET`/`PUT` | `/_cache/policy` | inspect or set what may be ingested |
+| `DELETE` | `/_cache/viewer` | drop cached dataset metadata |
 | `POST` | `/_cache/evict` | force an LRU sweep |
 | `DELETE` | `/_cache/repos` | drop a repo, or one `revision` of it (409 if pinned) |
 | `GET` | `/healthz` | container healthcheck |
@@ -453,6 +496,8 @@ experiments age out.
 | `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins |
 | `XHC_POLICY_SCOPE` | `ingest` | `ingest` \| `all` — whether policy also gates cache hits |
 | `XHC_MAX_FILE_BYTES` | unset | refuse to ingest a file larger than this |
+| `XHC_VIEWER_ENDPOINTS` | `parquet,croissant` | dataset metadata endpoints to cache |
+| `XHC_VIEWER_CACHE_TTL` | `3600` | seconds; `0` disables freshness but keeps entries for deleted datasets |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |

@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response, Streamin
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, policy, refs, serving
+from . import cachefs, metrics, policy, refs, serving, viewer
 from .config import settings
 from .jobs import manager
 
@@ -405,7 +405,19 @@ async def catch_all(full_path: str, request: Request) -> Response:
     parsed = parse_resolve(full_path)
     if parsed is not None and request.method in ("GET", "HEAD"):
         repo_type, repo_id, revision, filename = parsed
-        return await serve_file(repo_type, repo_id, revision, filename, request)
+        response = await serve_file(repo_type, repo_id, revision, filename, request)
+        # The one place every file request's outcome is known. The client label
+        # is self-reported (X-Muninn-Client): useful for attribution, but not an
+        # audit trail -- see docs/SPEC-0.3.0.md item 7.
+        metrics.record_request(
+            response.headers.get("x-xhc-cache", str(response.status_code)),
+            request.headers.get("x-muninn-client"),
+        )
+        try:
+            metrics.record_served(int(response.headers.get("content-length", 0)))
+        except (TypeError, ValueError):
+            pass
+        return response
 
     # Repo info is the one metadata endpoint we can honestly answer ourselves,
     # and it is the one that decides whether an orphaned repo is usable at all:
@@ -417,6 +429,10 @@ async def catch_all(full_path: str, request: Request) -> Response:
         tree = parse_tree_path(full_path)
         if tree is not None:
             return await serve_tree(*tree, full_path, request)
+
+        view = viewer.parse_path(full_path)
+        if view is not None:
+            return await serve_viewer(*view, full_path, request)
 
     return await proxy_upstream(full_path, request)
 
@@ -451,9 +467,12 @@ async def _proxy_get(full_path: str, request: Request) -> httpx.Response:
         headers["authorization"] = f"Bearer {settings.hf_token}"
     headers.setdefault("accept-encoding", "identity")
     try:
-        return await get_client().get(url, headers=headers)
+        resp = await get_client().get(url, headers=headers)
     except httpx.HTTPError as exc:
+        metrics.record_upstream(None)
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+    metrics.record_upstream(resp.status_code)
+    return resp
 
 
 async def serve_repo_info(
@@ -535,6 +554,44 @@ def _policy_refusal(repo_type: str, repo_id: str, decision: policy.Decision) -> 
         status_code=403,
         headers={"x-xhc-policy": "denied"},
     )
+
+
+async def serve_viewer(
+    repo_id: str, endpoint: str, key_suffix: str, full_path: str, request: Request
+) -> Response:
+    """Serve small dataset metadata from cache, and keep serving it if the
+    dataset is deleted upstream."""
+    entry = viewer.load(repo_id, key_suffix)
+    if entry is not None and viewer.is_fresh(entry):
+        metrics.record_request("VIEWER-HIT", request.headers.get("x-muninn-client"))
+        return Response(
+            content=entry["body"].encode(),
+            status_code=200,
+            headers={"x-xhc-cache": "VIEWER-HIT"},
+            media_type=entry.get("content_type", "application/json"),
+        )
+
+    upstream = await _proxy_get(full_path, request)
+
+    if upstream.status_code == 200:
+        viewer.store(repo_id, key_suffix, upstream.content, upstream.headers.get("content-type"))
+        resp = _passthrough(upstream)
+        resp.headers["x-xhc-cache"] = "VIEWER-MISS"
+        return resp
+
+    if upstream.status_code == 404 and entry is not None:
+        # The dataset is gone; the copy we hold is the only one left. Same
+        # reasoning as repo-info synthesis, and tagged the same way.
+        log.info("viewer %s for %s served from cache (upstream 404)", endpoint, repo_id)
+        metrics.record_request("VIEWER-SYNTHESIZED", request.headers.get("x-muninn-client"))
+        return Response(
+            content=entry["body"].encode(),
+            status_code=200,
+            headers={"x-xhc-cache": "VIEWER-SYNTHESIZED", "x-xhc-synthesized": "true"},
+            media_type=entry.get("content_type", "application/json"),
+        )
+
+    return _passthrough(upstream)
 
 
 async def _hit_response(
