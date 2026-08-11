@@ -38,6 +38,10 @@ services:
       # Remember upstream 404s briefly. Clients probe for optional files on
       # every model load; this keeps that off the WAN. 0 disables.
       XHC_NEGATIVE_TTL: "60"
+      # Repos deleted or gated upstream exist only here, so evicting one cannot
+      # be undone. retain exempts them from eviction; evict opts out.
+      XHC_ORPHAN_POLICY: ${XHC_ORPHAN_POLICY:-retain}
+      XHC_ORPHAN_CHECK_INTERVAL: "21600"
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 

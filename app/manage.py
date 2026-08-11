@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import cachefs
+from . import cachefs, orphans
 from .config import XET_ENV_KEYS, settings
 from .jobs import manager
 
@@ -83,6 +83,12 @@ async def status() -> dict:
             "warnings": view.warnings[:20],
         },
         "jobs": {"active": len(active), "total_tracked": len(jobs)},
+        "orphans": {
+            "policy": settings.orphan_policy,
+            "count": len(_orphans := cachefs.load_orphans()),
+            "retained_bytes": sum(v.get("size_on_disk", 0) for v in _orphans.values()),
+            "last_check": orphans.last_check(),
+        },
         # Surfaced because a silently-unset Xet var is the single most likely
         # cause of "why is my WAN ingest doing 3 MB/s".
         "xet_env": {k: settings.xet_env.get(k) for k in XET_ENV_KEYS},
@@ -156,6 +162,53 @@ async def remove_pin(req: RepoRef) -> dict:
     pins.discard(cachefs.repo_key(req.repo_type, req.repo_id))
     cachefs.save_pins(pins)
     return {"pins": sorted(pins)}
+
+
+@router.get("/orphans", dependencies=[Depends(require_manage_token)])
+async def list_orphans() -> dict:
+    """Cached repos whose upstream has gone away.
+
+    Under XHC_ORPHAN_POLICY=retain these are exempt from eviction: the copy
+    here is the only copy, so evicting one cannot be undone.
+    """
+    o = cachefs.load_orphans()
+    return {
+        "policy": settings.orphan_policy,
+        "check_interval_s": settings.orphan_check_interval_s,
+        "last_check": orphans.last_check(),
+        "count": len(o),
+        "retained_bytes": sum(v.get("size_on_disk", 0) for v in o.values()),
+        "orphans": [
+            {
+                "key": k,
+                "reason": v.get("reason"),
+                "since": v.get("since"),
+                "last_checked": v.get("last_checked"),
+                "size_on_disk": v.get("size_on_disk"),
+            }
+            for k, v in sorted(o.items())
+        ],
+    }
+
+
+@router.post("/orphans/check", dependencies=[Depends(require_manage_token)])
+async def check_orphans() -> dict:
+    """Run an upstream liveness sweep now instead of waiting for the timer."""
+    return await orphans.check_all(force_rescan=True)
+
+
+@router.delete("/orphans", dependencies=[Depends(require_manage_token)])
+async def forget_orphan(req: RepoRef) -> dict:
+    """Drop a repo's orphan mark, making it evictable again.
+
+    Use when you have deliberately decided an archived copy is no longer worth
+    keeping -- the next sweep will re-mark it if upstream is still gone.
+    """
+    o = cachefs.load_orphans()
+    key = cachefs.repo_key(req.repo_type, req.repo_id)
+    existed = o.pop(key, None) is not None
+    cachefs.save_orphans(o)
+    return {"forgotten": existed, "key": key, "remaining": len(o)}
 
 
 @router.post("/evict", dependencies=[Depends(require_manage_token)])

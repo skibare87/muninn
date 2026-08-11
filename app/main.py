@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import cachefs, hfcompat, manage
+from . import cachefs, hfcompat, manage, orphans
 from .config import settings
 
 logging.basicConfig(
@@ -49,15 +49,18 @@ async def lifespan(app: FastAPI):
     )
 
     evictor = asyncio.create_task(cachefs.eviction_loop())
+    orphan_sweep = asyncio.create_task(orphans.orphan_loop())
     try:
         yield
     finally:
-        evictor.cancel()
-        try:
-            await evictor
-        except asyncio.CancelledError:
-            pass
+        for task in (evictor, orphan_sweep):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await hfcompat.close_client()
+        await orphans.close_client()
 
 
 app = FastAPI(

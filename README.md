@@ -202,6 +202,8 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `POST` | `/_cache/prewarm` | ingest a repo ahead of a rollout |
 | `GET` | `/_cache/jobs`, `/_cache/jobs/{id}` | ingest progress, elapsed, throughput |
 | `GET`/`POST`/`DELETE` | `/_cache/pins` | pin management |
+| `GET`/`DELETE` | `/_cache/orphans` | repos deleted upstream and retained |
+| `POST` | `/_cache/orphans/check` | run an upstream liveness sweep now |
 | `POST` | `/_cache/evict` | force an LRU sweep |
 | `DELETE` | `/_cache/repos` | drop a repo (409 if pinned) |
 | `GET` | `/healthz` | container healthcheck |
@@ -227,6 +229,44 @@ curl -X POST localhost:8080/_cache/prewarm -H 'content-type: application/json' -
 `.bin` copies of the same weights, and pulling both doubles your footprint for
 nothing.
 
+### Retention: models deleted upstream
+
+Eviction is LRU, and LRU is the wrong instinct for a repo that no longer exists
+on the Hub. Evicting a *live* repo costs you a re-download. Evicting one that
+has been **deleted upstream destroys the only remaining copy** — and if you use
+this cache as a reproducibility reference, that ends the experiment.
+
+So Muninn checks cached repos against upstream every `XHC_ORPHAN_CHECK_INTERVAL`
+(6 h) and marks the ones that have gone. Under the default
+`XHC_ORPHAN_POLICY=retain` those are exempt from eviction, exactly like a pin,
+but applied automatically — you don't have to predict which models will vanish.
+
+```bash
+curl localhost:8080/_cache/orphans | jq          # what is being retained, and why
+curl -X POST localhost:8080/_cache/orphans/check # sweep now
+curl -X DELETE localhost:8080/_cache/orphans \
+  -H 'content-type: application/json' -d '{"repo_id":"org/model"}'   # release one
+```
+
+Classification is deliberately biased toward keeping data:
+
+| upstream says | marked | rationale |
+|---|---|---|
+| `200` | live — mark cleared if it had one | it can be re-fetched |
+| `404` | **orphan** (`deleted`) | gone; this is the only copy |
+| `401` / `403` | **orphan** (`gated_or_unauthorized`) | you can't re-fetch it either |
+| `429`, `5xx`, timeout, DNS failure | *unchanged* | a transient fault must never make an archive evictable |
+
+That last row is the important one. Only an unambiguous `200` un-marks a repo,
+so a Hub outage or a rate-limit burst cannot quietly convert your archive back
+into eviction fodder.
+
+**The cost is real:** retained orphans are unevictable, so they permanently
+reduce usable capacity. Eviction logs a warning and `/_cache/evict` returns
+`reached_goal: false` with `protected_bytes` when protection wins over the
+target — watch that rather than discovering a full array. Set
+`XHC_ORPHAN_POLICY=evict` if you'd rather have the space.
+
 ### Pinning vs. eviction
 
 Eviction is LRU over revisions, triggered on a timer and by watermark. **Pinning
@@ -249,6 +289,8 @@ experiments age out.
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
+| `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |
+| `XHC_ORPHAN_CHECK_INTERVAL` | `21600` | seconds between upstream liveness sweeps; `0` disables |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |

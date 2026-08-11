@@ -28,6 +28,7 @@ log = logging.getLogger("xhc.cachefs")
 REPO_ID_SEPARATOR = "--"
 _STATE_DIR = ".xhc"
 _PINS_FILE = "pins.json"
+_ORPHANS_FILE = "orphans.json"
 
 # scan_cache_dir() stats every blob, so its cost tracks FILE COUNT, not bytes.
 # Measured: ~36us/file, i.e. 0.55s for 15k files (80TB of large shards) but 12s
@@ -140,6 +141,45 @@ def save_pins(pins: set[str]) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(sorted(pins), indent=2))
     tmp.replace(p)
+
+
+# --------------------------------------------------------------------------
+# orphans: repos whose upstream has gone away
+#
+# Once a repo is deleted (or gated) on the Hub, the copy here is the only copy.
+# Evicting it is irreversible in a way that evicting a live repo is not: a live
+# repo can always be re-fetched, an orphan cannot. Under the default retain
+# policy these are exempt from eviction, which is what makes the cache usable
+# as a reproducibility archive rather than just an accelerator.
+# --------------------------------------------------------------------------
+
+
+def load_orphans() -> dict[str, dict]:
+    p = _state_dir() / _ORPHANS_FILE
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        log.warning("orphans file unreadable, treating as empty", exc_info=True)
+        return {}
+
+
+def save_orphans(orphans: dict[str, dict]) -> None:
+    p = _state_dir() / _ORPHANS_FILE
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(orphans, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def protected_keys() -> set[str]:
+    """Repo keys eviction must not touch: explicit pins, plus orphans when the
+    policy is to retain them."""
+    protected = load_pins()
+    if settings.orphan_policy == "retain":
+        protected |= set(load_orphans())
+    return protected
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +314,8 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
     the model every node is about to ask for.
     """
     pins = load_pins()
+    orphans = load_orphans()
+    protected = protected_keys()
     stats = disk_stats()
     capacity = stats["capacity"]
     low = int(capacity * settings.low_water)
@@ -295,8 +337,10 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
 
     # (last_accessed, size, commit, repo_key) per revision, oldest first.
     candidates = []
+    protected_bytes = 0
     for r in info.repos:
-        if repo_key(r.repo_type, r.repo_id) in pins:
+        if repo_key(r.repo_type, r.repo_id) in protected:
+            protected_bytes += r.size_on_disk
             continue
         for rev in r.revisions:
             candidates.append(
@@ -328,13 +372,30 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
         strategy.execute()
         log.info("evicted %d revisions, freed %d bytes", len(to_delete), freed)
 
+    if used - freed > goal:
+        # Protection won over the target. Say so loudly rather than silently
+        # running hot: on a reproducibility archive this is expected, but it is
+        # also exactly how a disk fills up unnoticed.
+        log.warning(
+            "eviction could not reach target: %.1fGB still used vs %.1fGB goal; "
+            "%.1fGB is protected (%d pinned, %d orphaned)",
+            (used - freed) / 1e9,
+            goal / 1e9,
+            protected_bytes / 1e9,
+            len(pins),
+            len(orphans),
+        )
+
     return {
         "evicted": evicted,
         "freed": freed,
         "used_before": used,
         "used_after": used - freed,
         "goal": goal,
+        "reached_goal": (used - freed) <= goal,
+        "protected_bytes": protected_bytes,
         "pinned_skipped": sorted(pins),
+        "orphans_skipped": sorted(orphans) if settings.orphan_policy == "retain" else [],
     }
 
 

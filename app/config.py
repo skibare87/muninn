@@ -91,6 +91,12 @@ class Settings:
     # Seconds to remember that a file 404s upstream. 0 disables. Short by
     # design -- see the negative cache note in hfcompat.
     negative_ttl_s: float = 60.0
+    # What to do with cached repos whose upstream has disappeared.
+    #   retain - never evict them. The copy here is the only copy, so eviction
+    #            is irreversible. Makes the cache a reproducibility archive.
+    #   evict  - treat them as ordinary LRU candidates.
+    orphan_policy: str = "retain"
+    orphan_check_interval_s: float = 21600.0  # 6h; 0 disables detection
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -112,6 +118,10 @@ class Settings:
                 f"XHC_MISS_POLICY must be one of redirect|stream|wait, got {miss_policy!r}"
             )
 
+        orphan_policy = (os.environ.get("XHC_ORPHAN_POLICY") or cls.orphan_policy).strip().lower()
+        if orphan_policy not in ("retain", "evict"):
+            raise ValueError(f"XHC_ORPHAN_POLICY must be retain|evict, got {orphan_policy!r}")
+
         high = _env_float("XHC_HIGH_WATER", 0.90)
         low = _env_float("XHC_LOW_WATER", 0.75)
         if not 0 < low < high <= 1:
@@ -131,6 +141,10 @@ class Settings:
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
+            orphan_policy=orphan_policy,
+            orphan_check_interval_s=_env_float(
+                "XHC_ORPHAN_CHECK_INTERVAL", cls.orphan_check_interval_s
+            ),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),

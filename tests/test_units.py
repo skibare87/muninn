@@ -261,3 +261,117 @@ def test_negative_cache_disabled_by_zero_ttl():
         assert hfcompat._negative_cache_get(*key) is None
     finally:
         settings.negative_ttl_s = original
+
+
+# ---------------------------------------------------------------------------
+# Orphan retention. A live repo can be re-fetched; an orphan cannot, so
+# evicting one is irreversible.
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_policy_validation():
+    from app.config import Settings
+
+    os.environ["XHC_ORPHAN_POLICY"] = "nonsense"
+    try:
+        with pytest.raises(ValueError):
+            Settings.from_env()
+    finally:
+        del os.environ["XHC_ORPHAN_POLICY"]
+
+
+def test_orphan_policy_defaults_to_retain():
+    from app.config import Settings
+
+    os.environ.pop("XHC_ORPHAN_POLICY", None)
+    assert Settings.from_env().orphan_policy == "retain"
+
+
+def test_protected_keys_includes_orphans_only_when_retaining(tmp_path):
+    from app import cachefs
+    from app.config import settings
+
+    original_dir, original_policy = settings.cache_dir, settings.orphan_policy
+    settings.cache_dir = str(tmp_path)
+    try:
+        cachefs.save_pins({"models/org/pinned"})
+        cachefs.save_orphans({"models/org/gone": {"reason": "deleted", "since": 0}})
+
+        settings.orphan_policy = "retain"
+        assert cachefs.protected_keys() == {"models/org/pinned", "models/org/gone"}
+
+        settings.orphan_policy = "evict"
+        assert cachefs.protected_keys() == {"models/org/pinned"}
+    finally:
+        settings.cache_dir, settings.orphan_policy = original_dir, original_policy
+
+
+def test_orphan_state_survives_unreadable_file(tmp_path):
+    from app import cachefs
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        (tmp_path / ".xhc").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".xhc" / "orphans.json").write_text("{ not json")
+        assert cachefs.load_orphans() == {}  # degrade, don't crash
+    finally:
+        settings.cache_dir = original
+
+
+@pytest.mark.parametrize(
+    "status,expected_state",
+    [
+        (200, "alive"),
+        (404, "orphaned"),  # deleted
+        (401, "orphaned"),  # access revoked -- also unrecoverable
+        (403, "orphaned"),  # gated
+        # Anything ambiguous must NOT change state: a transient fault must
+        # never make an irreplaceable archive evictable.
+        (429, "unknown"),
+        (500, "unknown"),
+        (503, "unknown"),
+    ],
+)
+def test_orphan_classification(status, expected_state):
+    import asyncio
+
+    import httpx
+
+    from app import orphans
+
+    class FakeClient:
+        async def get(self, url, headers=None):
+            return httpx.Response(status, request=httpx.Request("GET", url))
+
+    original = orphans._get_client
+    fake = FakeClient()
+    orphans._get_client = lambda: fake
+    try:
+        state, _ = asyncio.run(orphans._classify("model", "org/repo"))
+        assert state == expected_state
+    finally:
+        orphans._get_client = original
+
+
+def test_orphan_classification_treats_network_error_as_unknown():
+    import asyncio
+
+    import httpx
+
+    from app import orphans
+
+    class FailingClient:
+        async def get(self, url, headers=None):
+            raise httpx.ConnectError("no route to host")
+
+    original = orphans._get_client
+    failing = FailingClient()
+    orphans._get_client = lambda: failing
+    try:
+        state, reason = asyncio.run(orphans._classify("model", "org/repo"))
+        assert state == "unknown"
+        assert "unreachable" in reason
+    finally:
+        orphans._get_client = original
