@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import cachefs, hfcompat, manage, orphans
+from . import cachefs, hfcompat, manage, orphans, refs
 from .config import settings
 
 logging.basicConfig(
@@ -61,6 +61,7 @@ async def lifespan(app: FastAPI):
                 pass
         await hfcompat.close_client()
         await orphans.close_client()
+        await refs.close_client()
 
 
 app = FastAPI(

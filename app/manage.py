@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import cachefs, orphans
+from . import cachefs, orphans, policy, refs
 from .config import XET_ENV_KEYS, settings
 from .jobs import manager
 
@@ -41,6 +41,9 @@ class PrewarmRequest(BaseModel):
         description="glob patterns, e.g. ['*.safetensors','*.json'] to skip .bin duplicates",
     )
     pin: bool = Field(default=False, description="pin the repo as part of prewarming")
+    force: bool = Field(
+        default=False, description="override ingest policy (management is authenticated)"
+    )
 
 
 class RepoRef(BaseModel):
@@ -50,6 +53,16 @@ class RepoRef(BaseModel):
 
 class EvictRequest(BaseModel):
     target_free_bytes: int = 0
+
+
+class PolicyRequest(BaseModel):
+    mode: Literal["open", "allowlist"] = "open"
+    allow: list[str] = Field(
+        default_factory=list, description="fnmatch globs over 'models/org/name'"
+    )
+    deny: list[str] = Field(default_factory=list, description="wins over allow")
+    scope: Literal["ingest", "all"] = "ingest"
+    max_file_bytes: int | None = None
 
 
 class DeleteRequest(BaseModel):
@@ -92,6 +105,8 @@ async def status() -> dict:
             "warnings": view.warnings[:20],
         },
         "jobs": {"active": len(active), "total_tracked": len(jobs)},
+        "refs": {"ttl_s": settings.ref_ttl_s, **refs.stats()},
+        "policy": policy.load(),
         "orphans": {
             "policy": settings.orphan_policy,
             "count": len(_orphans := cachefs.load_orphans()),
@@ -129,6 +144,12 @@ async def list_repos(refresh: bool = False) -> dict:
 
 @router.post("/prewarm", dependencies=[Depends(require_manage_token)])
 async def prewarm(req: PrewarmRequest) -> dict:
+    decision = policy.check(req.repo_type, req.repo_id)
+    if not decision.allowed and not req.force:
+        raise HTTPException(
+            status_code=403,
+            detail=f"blocked by cache policy: {decision.reason}; pass force=true to override",
+        )
     if req.pin:
         pins = cachefs.load_pins()
         pins.add(cachefs.repo_key(req.repo_type, req.repo_id))
@@ -218,6 +239,20 @@ async def forget_orphan(req: RepoRef) -> dict:
     existed = o.pop(key, None) is not None
     cachefs.save_orphans(o)
     return {"forgotten": existed, "key": key, "remaining": len(o)}
+
+
+@router.get("/policy", dependencies=[Depends(require_manage_token)])
+async def get_policy() -> dict:
+    return policy.load()
+
+
+@router.put("/policy", dependencies=[Depends(require_manage_token)])
+async def put_policy(req: PolicyRequest) -> dict:
+    """Persist policy to .xhc/policy.json. Env seeds it; the file then wins."""
+    try:
+        return policy.save(req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/evict", dependencies=[Depends(require_manage_token)])

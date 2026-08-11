@@ -589,3 +589,297 @@ def test_parse_range_single_wrapper_rejects_multi():
 
     assert parse_range("bytes=0-99", 1000) == (0, 99)
     assert parse_range("bytes=0-99,200-299", 1000) is None  # caller must use parse_ranges
+
+
+# ---------------------------------------------------------------------------
+# Config wiring.
+#
+# This has now bitten twice: a dataclass field is added, from_env() is not
+# updated, and the setting silently ignores its environment variable. Both
+# times it was only caught by inspecting the *effective* value at runtime.
+# This table asserts the wiring directly.
+# ---------------------------------------------------------------------------
+
+ENV_TO_SETTING = [
+    ("XHC_MISS_POLICY", "wait", "miss_policy", "wait"),
+    ("XHC_UPSTREAM", "https://example.invalid", "upstream", "https://example.invalid"),
+    ("XHC_CACHE_MAX_SIZE", "5T", "capacity_bytes", 5 * 1024**4),
+    ("XHC_HIGH_WATER", "0.8", "high_water", 0.8),
+    ("XHC_LOW_WATER", "0.6", "low_water", 0.6),
+    ("XHC_EVICT_INTERVAL", "123", "evict_interval_s", 123),
+    ("XHC_BLOCK_CLIENT_XET", "0", "block_client_xet", False),
+    ("XHC_INGEST_CONCURRENCY", "9", "ingest_concurrency", 9),
+    ("XHC_NEGATIVE_TTL", "11", "negative_ttl_s", 11.0),
+    ("XHC_ORPHAN_POLICY", "evict", "orphan_policy", "evict"),
+    ("XHC_ORPHAN_CHECK_INTERVAL", "77", "orphan_check_interval_s", 77.0),
+    ("XHC_SYNTHESIZE_REPO_INFO", "0", "synthesize_repo_info", False),
+    ("XHC_REF_TTL", "42", "ref_ttl_s", 42.0),
+    ("XHC_INGEST_POLICY", "allowlist", "ingest_policy", "allowlist"),
+    ("XHC_ALLOW_REPOS", "models/a/*", "allow_repos", "models/a/*"),
+    ("XHC_DENY_REPOS", "datasets/*", "deny_repos", "datasets/*"),
+    ("XHC_POLICY_SCOPE", "all", "policy_scope", "all"),
+    ("XHC_MAX_FILE_BYTES", "2G", "max_file_bytes", 2 * 1024**3),
+    ("XHC_STREAM_POLL_INTERVAL", "0.5", "stream_poll_interval_s", 0.5),
+    ("XHC_STREAM_START_TIMEOUT", "60", "stream_start_timeout_s", 60.0),
+    ("XHC_PORT", "9999", "port", 9999),
+    ("XHC_REQUEST_TIMEOUT", "13", "request_timeout_s", 13.0),
+    ("XHC_MANAGE_TOKEN", "sekrit", "manage_token", "sekrit"),
+]
+
+
+@pytest.mark.parametrize("env,value,field,expected", ENV_TO_SETTING)
+def test_env_var_reaches_settings(env, value, field, expected, monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv(env, value)
+    assert getattr(Settings.from_env(), field) == expected
+
+
+def test_every_setting_has_an_env_var_or_is_deliberately_internal():
+    """Catch a field added to Settings without a corresponding env var.
+
+    Anything genuinely internal goes in the exempt set with a reason, so the
+    omission is a decision rather than an oversight.
+    """
+    import dataclasses
+
+    from app.config import Settings
+
+    exempt = {
+        "hf_token",  # HF_TOKEN / HUGGING_FACE_HUB_TOKEN, handled separately
+        "cache_dir",  # HF_HUB_CACHE, the huggingface_hub name
+        "host",  # XHC_HOST, string passthrough
+        "xet_env",  # reporting only, mirrors the HF_XET_* process env
+    }
+    covered = {field for _, _, field, _ in ENV_TO_SETTING} | exempt
+    declared = {f.name for f in dataclasses.fields(Settings)}
+    missing = declared - covered
+    assert not missing, f"Settings fields with no env-var test: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# Ref revalidation
+# ---------------------------------------------------------------------------
+
+
+def test_immutable_revisions_are_never_revalidated():
+    from app import refs
+
+    assert refs.is_immutable("a" * 40)
+    assert refs.is_immutable("71034c5d8bde858ff824298bdedc65515b97d2b9"[:40].ljust(40, "0"))
+    assert not refs.is_immutable("main")
+    assert not refs.is_immutable("v1.0")
+    assert not refs.is_immutable("refs/pr/1")
+    assert not refs.is_immutable("A" * 40)  # uppercase is not a git sha
+
+
+def test_sha_pinned_requests_make_no_upstream_call():
+    import asyncio
+
+    from app import refs
+
+    refs.clear()
+    sha = "b" * 40
+    assert asyncio.run(refs.upstream_commit("model", "org/repo", sha)) == sha
+    assert refs.stats()["lookups"] == 0
+
+
+def test_ref_ttl_zero_disables_revalidation():
+    import asyncio
+
+    from app import refs
+    from app.config import settings
+
+    refs.clear()
+    original = settings.ref_ttl_s
+    settings.ref_ttl_s = 0
+    try:
+        stale = asyncio.run(refs.is_stale("model", "org/repo", "main", "c" * 40))
+        assert stale is False
+        assert refs.stats()["lookups"] == 0
+    finally:
+        settings.ref_ttl_s = original
+        refs.clear()
+
+
+def test_unknown_upstream_never_reports_stale():
+    # Fail-open: if we cannot find out, we keep serving what we have. Required
+    # for orphans, where upstream 404s by definition.
+    import asyncio
+
+    from app import refs
+    from app.config import settings
+
+    refs.clear()
+    original = settings.ref_ttl_s
+    settings.ref_ttl_s = 300
+
+    class Failing:
+        async def get(self, url, headers=None):
+            raise httpx_mod.ConnectError("down")
+
+    import httpx as httpx_mod
+
+    failing = Failing()
+    saved = refs._get_client
+    refs._get_client = lambda: failing
+    try:
+        assert asyncio.run(refs.is_stale("model", "org/repo", "main", "d" * 40)) is False
+        assert refs.stats()["failed"] == 1
+    finally:
+        refs._get_client = saved
+        settings.ref_ttl_s = original
+        refs.clear()
+
+
+# ---------------------------------------------------------------------------
+# Ingest policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mode,allow,deny,repo_type,repo_id,expected",
+    [
+        ("open", [], [], "model", "org/name", True),
+        ("open", [], ["models/org/*"], "model", "org/name", False),
+        ("open", [], ["datasets/*"], "model", "org/name", True),
+        ("open", [], ["datasets/*"], "dataset", "big/set", False),
+        ("allowlist", ["models/ok/*"], [], "model", "ok/name", True),
+        ("allowlist", ["models/ok/*"], [], "model", "other/name", False),
+        # deny beats allow, always
+        ("allowlist", ["models/*"], ["models/org/secret"], "model", "org/secret", False),
+        ("open", ["models/*"], ["models/*"], "model", "any/thing", False),
+    ],
+)
+def test_policy_matching(mode, allow, deny, repo_type, repo_id, expected, tmp_path):
+    from app import policy
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        pol = {
+            "mode": mode,
+            "allow": allow,
+            "deny": deny,
+            "scope": "ingest",
+            "max_file_bytes": None,
+        }
+        assert policy.check(repo_type, repo_id, pol).allowed is expected
+    finally:
+        settings.cache_dir = original
+
+
+def test_policy_size_guard():
+    from app import policy
+
+    pol = {"mode": "open", "allow": [], "deny": [], "scope": "ingest", "max_file_bytes": 1000}
+    assert policy.check_size(999, pol).allowed
+    assert policy.check_size(1000, pol).allowed
+    assert not policy.check_size(1001, pol).allowed
+    # No cap, or unknown size -> allowed
+    assert policy.check_size(10**12, {**pol, "max_file_bytes": None}).allowed
+    assert policy.check_size(None, pol).allowed
+
+
+def test_policy_file_overrides_env_and_round_trips(tmp_path):
+    from app import policy
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        assert policy.load()["source"] == "env"
+        saved = policy.save(
+            {
+                "mode": "allowlist",
+                "allow": ["models/a/*"],
+                "deny": [],
+                "scope": "all",
+                "max_file_bytes": 42,
+            }
+        )
+        assert saved["source"] == "file"
+        assert saved["mode"] == "allowlist"
+        assert policy.enforced_on_hits() is True
+        assert policy.load()["max_file_bytes"] == 42
+    finally:
+        settings.cache_dir = original
+
+
+def test_policy_rejects_invalid_values(tmp_path):
+    from app import policy
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            policy.save({"mode": "nonsense"})
+        with pytest.raises(ValueError):
+            policy.save({"mode": "open", "scope": "nonsense"})
+    finally:
+        settings.cache_dir = original
+
+
+# ---------------------------------------------------------------------------
+# Tree synthesis
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("api/models/org/name/tree/main", ("model", "org/name", "main", "")),
+        ("api/models/org/name/tree/main/sub/dir", ("model", "org/name", "main", "sub/dir")),
+        ("api/datasets/org/ds/tree/v1", ("dataset", "org/ds", "v1", "")),
+        ("api/models/gpt2/tree/main", ("model", "gpt2", "main", "")),
+    ],
+)
+def test_parse_tree_path(path, expected):
+    from app.hfcompat import parse_tree_path
+
+    assert parse_tree_path(path) == expected
+
+
+@pytest.mark.parametrize(
+    "path", ["api/models/org/name", "api/models/org/name/tree/", "org/name/resolve/main/f"]
+)
+def test_parse_tree_path_rejects_others(path):
+    from app.hfcompat import parse_tree_path
+
+    assert parse_tree_path(path) is None
+
+
+def test_synthesize_tree_matches_snapshot(tmp_path):
+    from app.config import settings
+    from app.hfcompat import synthesize_tree
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        commit = "e" * 40
+        base = tmp_path / "models--org--name"
+        (base / "refs").mkdir(parents=True)
+        (base / "refs" / "main").write_text(commit)
+        snap = base / "snapshots" / commit
+        (snap / "nested").mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "nested" / "w.bin").write_text("xx")
+
+        flat = synthesize_tree("model", "org/name", "main", "", recursive=True, expand=False)
+        assert {e["path"] for e in flat} == {"config.json", "nested/w.bin"}
+        assert all(e["type"] == "file" for e in flat)
+
+        shallow = synthesize_tree("model", "org/name", "main", "", recursive=False, expand=False)
+        kinds = {e["path"]: e["type"] for e in shallow}
+        assert kinds == {"config.json": "file", "nested": "directory"}
+
+        expanded = synthesize_tree("model", "org/name", "main", "", recursive=True, expand=True)
+        assert expanded[0]["lastCommit"] is None  # honest about what we cannot know
+
+        assert (
+            synthesize_tree("model", "org/none", "main", "", recursive=True, expand=False) is None
+        )
+    finally:
+        settings.cache_dir = original
