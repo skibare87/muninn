@@ -19,6 +19,7 @@ badly means serving wrong rows.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -55,6 +56,82 @@ def parse_path(full_path: str) -> tuple[str, str, str] | None:
             if endpoint in cacheable_endpoints():
                 return repo_id, endpoint, "/".join(parts[split_at:])
     return None
+
+
+# --------------------------------------------------------------------------
+# datasets-server proxy (opt-in, at our own path)
+#
+# datasets-server.huggingface.co is a separate host. huggingface_hub never calls
+# it, and there is no HF_ENDPOINT equivalent for it, so a client cannot be
+# redirected here by configuration. Rather than MITM a public hostname with
+# internal DNS and a private CA, we expose it under our own prefix:
+#
+#   GET http://muninn:8080/datasets-server/splits?dataset=org/ds
+#
+# Tooling that accepts a base URL can point at that. Nothing is intercepted, so
+# a node that knows nothing about this cannot be broken by it.
+# --------------------------------------------------------------------------
+
+DS_SERVER_PREFIX = "datasets-server/"
+
+
+def parse_datasets_server_path(full_path: str) -> tuple[str, str] | None:
+    """Return (endpoint, upstream_path) for a /datasets-server/... request."""
+    if not full_path.startswith(DS_SERVER_PREFIX):
+        return None
+    upstream_path = full_path[len(DS_SERVER_PREFIX) :].strip("/")
+    if not upstream_path:
+        return None
+    return upstream_path.split("/")[0], upstream_path
+
+
+def ds_cacheable(endpoint: str) -> bool:
+    raw = settings.datasets_server_endpoints or ""
+    return endpoint in {e.strip() for e in raw.split(",") if e.strip()}
+
+
+def ds_cache_key(upstream_path: str, query: str) -> str:
+    """Key on path *and* sorted query: dataset/config/split arrive as query
+    parameters here, so ignoring them would collapse every dataset onto one
+    entry."""
+    from urllib.parse import parse_qsl, urlencode
+
+    return f"{upstream_path}?{urlencode(sorted(parse_qsl(query)))}"
+
+
+def _hashed_name(namespace: str, key: str) -> Path:
+    h = hashlib.sha256(f"{namespace}\0{key}".encode()).hexdigest()[:40]
+    d = Path(settings.cache_dir) / ".xhc" / _DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{namespace}-{h}.json"
+
+
+def ds_load(key: str) -> dict | None:
+    p = _hashed_name("dsserver", key)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def ds_store(key: str, body: bytes, content_type: str | None) -> None:
+    p = _hashed_name("dsserver", key)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(
+                {
+                    "fetched_at": time.time(),
+                    "content_type": content_type or "application/json",
+                    "body": body.decode("utf-8", errors="replace"),
+                }
+            )
+        )
+        tmp.replace(p)
+    except OSError:
+        log.warning("could not persist datasets-server entry %s", p, exc_info=True)
 
 
 def _path_for(repo_id: str, key_suffix: str) -> Path:

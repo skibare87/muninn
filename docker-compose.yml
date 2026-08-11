@@ -58,6 +58,8 @@ services:
       # describable. Never /rows.
       XHC_VIEWER_ENDPOINTS: ${XHC_VIEWER_ENDPOINTS:-parquet,croissant}
       XHC_VIEWER_CACHE_TTL: "${XHC_VIEWER_CACHE_TTL:-3600}"
+      # Opt-in datasets-server proxy at /datasets-server/*. Empty disables.
+      XHC_DATASETS_SERVER: ${XHC_DATASETS_SERVER:-https://datasets-server.huggingface.co}
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 

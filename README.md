@@ -315,6 +315,30 @@ scrape.
 upstream 404s, so a deleted dataset stays describable. Those responses carry
 `x-xhc-cache: VIEWER-SYNTHESIZED` and `x-xhc-synthesized: true`.
 
+### Reaching datasets-server
+
+`splits`, `rows` and `first-rows` live on `datasets-server.huggingface.co` — a
+separate host. `huggingface_hub` never calls it, and there is **no `HF_ENDPOINT`
+equivalent** for it, so no client can be redirected here by configuration.
+
+Rather than MITM a public hostname with internal DNS and a private CA, Muninn
+exposes it under its own prefix:
+
+```bash
+curl "http://nas.internal:8080/datasets-server/splits?dataset=org/ds"
+```
+
+Point tooling that accepts a base URL at that. Nothing is intercepted, so a node
+that knows nothing about this cannot be broken by it — which is also why it does
+not help the fleet's normal workload: `load_dataset` resolves files through
+paths already cached, and the web viewer talks to the Hub directly.
+
+Small stable endpoints (`splits`, `first-rows`, `info`, `size`, `is-valid`,
+`parquet`) are cached and survive a deleted dataset. `rows` is proxied but
+**never cached** — it is query-dependent and unbounded. Cache keys include the
+sorted query string, since `dataset`/`config`/`split` arrive as parameters
+there. Set `XHC_DATASETS_SERVER=` (empty) to disable the route entirely.
+
 Two deliberate exclusions:
 
 - **`/rows` is never cached.** It is query-dependent and unbounded; caching it
@@ -498,6 +522,8 @@ experiments age out.
 | `XHC_MAX_FILE_BYTES` | unset | refuse to ingest a file larger than this |
 | `XHC_VIEWER_ENDPOINTS` | `parquet,croissant` | dataset metadata endpoints to cache |
 | `XHC_VIEWER_CACHE_TTL` | `3600` | seconds; `0` disables freshness but keeps entries for deleted datasets |
+| `XHC_DATASETS_SERVER` | `https://datasets-server.huggingface.co` | upstream for the `/datasets-server/*` route; empty disables it |
+| `XHC_DATASETS_SERVER_ENDPOINTS` | `splits,first-rows,info,size,is-valid,parquet` | which of those to cache (never `rows`) |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |
