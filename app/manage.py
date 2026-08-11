@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import cachefs, orphans, policy, refs
+from . import cachefs, orphans, policy, refs, viewer
 from .config import XET_ENV_KEYS, settings
 from .jobs import manager
 
@@ -107,6 +107,7 @@ async def status() -> dict:
         "jobs": {"active": len(active), "total_tracked": len(jobs)},
         "refs": {"ttl_s": settings.ref_ttl_s, **refs.stats()},
         "policy": policy.load(),
+        "viewer": {"ttl_s": settings.viewer_cache_ttl_s, **viewer.stats()},
         "orphans": {
             "policy": settings.orphan_policy,
             "count": len(_orphans := cachefs.load_orphans()),
@@ -253,6 +254,12 @@ async def put_policy(req: PolicyRequest) -> dict:
         return policy.save(req.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/viewer", dependencies=[Depends(require_manage_token)])
+async def clear_viewer_cache() -> dict:
+    """Drop cached dataset metadata. Bytes stay; only the metadata copies go."""
+    return {"cleared": viewer.clear()}
 
 
 @router.post("/evict", dependencies=[Depends(require_manage_token)])

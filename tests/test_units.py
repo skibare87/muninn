@@ -619,6 +619,8 @@ ENV_TO_SETTING = [
     ("XHC_DENY_REPOS", "datasets/*", "deny_repos", "datasets/*"),
     ("XHC_POLICY_SCOPE", "all", "policy_scope", "all"),
     ("XHC_MAX_FILE_BYTES", "2G", "max_file_bytes", 2 * 1024**3),
+    ("XHC_VIEWER_ENDPOINTS", "parquet", "viewer_endpoints", "parquet"),
+    ("XHC_VIEWER_CACHE_TTL", "60", "viewer_cache_ttl_s", 60.0),
     ("XHC_STREAM_POLL_INTERVAL", "0.5", "stream_poll_interval_s", 0.5),
     ("XHC_STREAM_START_TIMEOUT", "60", "stream_start_timeout_s", 60.0),
     ("XHC_PORT", "9999", "port", 9999),
@@ -881,5 +883,141 @@ def test_synthesize_tree_matches_snapshot(tmp_path):
         assert (
             synthesize_tree("model", "org/none", "main", "", recursive=True, expand=False) is None
         )
+    finally:
+        settings.cache_dir = original
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_counters_and_exposition():
+    from app import metrics
+
+    metrics.reset()
+    metrics.record_request("HIT", "gpu-01")
+    metrics.record_request("HIT", "gpu-01")
+    metrics.record_request("MISS-STREAM", "gpu-02")
+    metrics.record_upstream(200)
+    metrics.record_upstream(404)
+    metrics.record_upstream(None)
+    metrics.record_served(1500)
+    metrics.record_ingested(900)
+
+    out = metrics.render({"muninn_cache_bytes": 42})
+    assert 'muninn_requests_total{result="HIT"} 2' in out
+    assert 'muninn_requests_total{result="MISS-STREAM"} 1' in out
+    assert 'muninn_client_requests_total{client="gpu-01"} 2' in out
+    assert 'muninn_upstream_requests_total{status="404"} 1' in out
+    assert 'muninn_upstream_requests_total{status="error"} 1' in out
+    assert "muninn_bytes_served_total 1500" in out
+    assert "muninn_bytes_ingested_total 900" in out
+    assert "muninn_cache_bytes 42" in out
+    assert "# TYPE muninn_cache_bytes gauge" in out
+    metrics.reset()
+
+
+def test_metrics_client_label_cardinality_is_bounded():
+    # A client sending a unique header per request would otherwise grow the
+    # label set without limit and blow up the scrape.
+    from app import metrics
+
+    metrics.reset()
+    for i in range(metrics.MAX_CLIENT_LABELS + 50):
+        metrics.record_request("HIT", f"client-{i}")
+    snap = metrics.snapshot()
+    assert len(snap["clients"]) <= metrics.MAX_CLIENT_LABELS + 1
+    assert snap["clients"]["__other__"] == 50
+    metrics.reset()
+
+
+def test_metrics_escapes_label_values():
+    from app import metrics
+
+    metrics.reset()
+    metrics.record_request("HIT", 'we"ird\nvalue')
+    out = metrics.render({})
+    assert "\n" not in out.split('client="')[1].split('"}')[0]
+    assert '\\"' in out
+    metrics.reset()
+
+
+# ---------------------------------------------------------------------------
+# Dataset metadata cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("api/datasets/org/ds/parquet", ("org/ds", "parquet", "parquet")),
+        ("api/datasets/org/ds/croissant", ("org/ds", "croissant", "croissant")),
+        (
+            "api/datasets/org/ds/parquet/default/train",
+            ("org/ds", "parquet", "parquet/default/train"),
+        ),
+        ("api/datasets/imdb/parquet", ("imdb", "parquet", "parquet")),
+    ],
+)
+def test_viewer_parse_path(path, expected):
+    from app import viewer
+
+    assert viewer.parse_path(path) == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "api/datasets/org/ds/rows",  # query-dependent, never cached
+        "api/datasets/org/ds",  # repo info, handled elsewhere
+        "api/models/org/name/parquet",  # models are not datasets
+        "api/datasets/org/ds/tree/main",
+    ],
+)
+def test_viewer_parse_path_rejects_others(path):
+    from app import viewer
+
+    assert viewer.parse_path(path) is None
+
+
+def test_viewer_store_load_and_ttl(tmp_path):
+    from app import viewer
+    from app.config import settings
+
+    original_dir, original_ttl = settings.cache_dir, settings.viewer_cache_ttl_s
+    settings.cache_dir = str(tmp_path)
+    try:
+        assert viewer.load("org/ds", "parquet") is None
+        viewer.store("org/ds", "parquet", b'{"a":1}', "application/json")
+        entry = viewer.load("org/ds", "parquet")
+        assert entry["body"] == '{"a":1}'
+
+        settings.viewer_cache_ttl_s = 3600
+        assert viewer.is_fresh(entry) is True
+        settings.viewer_cache_ttl_s = 0  # 0 disables freshness...
+        assert viewer.is_fresh(entry) is False
+        # ...but the entry survives, so it can still answer a deleted upstream.
+        assert viewer.load("org/ds", "parquet") is not None
+
+        assert viewer.stats()["entries"] == 1
+        assert viewer.clear() == 1
+        assert viewer.load("org/ds", "parquet") is None
+    finally:
+        settings.cache_dir, settings.viewer_cache_ttl_s = original_dir, original_ttl
+
+
+def test_viewer_keys_do_not_collide_across_subpaths(tmp_path):
+    from app import viewer
+    from app.config import settings
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        viewer.store("org/ds", "parquet", b"root", None)
+        viewer.store("org/ds", "parquet/default/train", b"split", None)
+        assert viewer.load("org/ds", "parquet")["body"] == "root"
+        assert viewer.load("org/ds", "parquet/default/train")["body"] == "split"
+        assert viewer.stats()["entries"] == 2
     finally:
         settings.cache_dir = original

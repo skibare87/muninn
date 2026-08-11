@@ -23,7 +23,7 @@ from typing import Literal
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from . import cachefs
+from . import cachefs, metrics
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
@@ -188,6 +188,10 @@ class JobManager:
                     path = await asyncio.to_thread(self._download_snapshot, job)
                 job.result_path = str(path)
                 job.state = "done"
+                try:
+                    metrics.record_ingested(Path(path).stat().st_size)
+                except OSError:
+                    pass
                 log.info("ingest done %s in %.1fs", job.id, time.time() - (job.started_at or 0))
         except asyncio.CancelledError:
             job.state = "error"

@@ -111,6 +111,11 @@ class Settings:
     deny_repos: str = ""
     policy_scope: str = "ingest"  # ingest | all
     max_file_bytes: int | None = None
+    # Small, stable dataset metadata endpoints worth holding. NOT /rows: it is
+    # query-dependent and unbounded. Note /splits lives on
+    # datasets-server.huggingface.co and never reaches us at all.
+    viewer_endpoints: str = "parquet,croissant"
+    viewer_cache_ttl_s: float = 3600.0
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -174,6 +179,8 @@ class Settings:
             deny_repos=os.environ.get("XHC_DENY_REPOS", cls.deny_repos),
             policy_scope=policy_scope,
             max_file_bytes=parse_size(os.environ.get("XHC_MAX_FILE_BYTES"), None),
+            viewer_endpoints=os.environ.get("XHC_VIEWER_ENDPOINTS", cls.viewer_endpoints),
+            viewer_cache_ttl_s=_env_float("XHC_VIEWER_CACHE_TTL", cls.viewer_cache_ttl_s),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),
