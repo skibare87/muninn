@@ -205,7 +205,7 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `GET`/`DELETE` | `/_cache/orphans` | repos deleted upstream and retained |
 | `POST` | `/_cache/orphans/check` | run an upstream liveness sweep now |
 | `POST` | `/_cache/evict` | force an LRU sweep |
-| `DELETE` | `/_cache/repos` | drop a repo (409 if pinned) |
+| `DELETE` | `/_cache/repos` | drop a repo, or one `revision` of it (409 if pinned) |
 | `GET` | `/healthz` | container healthcheck |
 
 `/_cache/status` echoes the Xet variables the process actually sees. A silently
@@ -261,6 +261,62 @@ That last row is the important one. Only an unambiguous `200` un-marks a repo,
 so a Hub outage or a rate-limit burst cannot quietly convert your archive back
 into eviction fodder.
 
+#### Orphans stay fully usable
+
+Retaining the bytes is only half the job. `snapshot_download` (and `hf download
+<repo>`) enumerates a repo through `/api/{type}s/{repo}` before fetching
+anything, and that call is proxied — so a deleted repo used to be *half*
+usable: `hf_hub_download` worked per file, but you could not list it.
+
+When upstream 404s a repo we still hold, Muninn now rebuilds the listing from
+the cached snapshot — `sha` from `refs/`, `siblings` from the snapshot tree,
+and only files that actually resolve, so it never advertises a blob it cannot
+serve. Verified: a cold client runs a full `snapshot_download` of a repo whose
+upstream returns 404 for everything.
+
+The answer is tagged both ways, so an archived listing is never mistaken for a
+live one:
+
+- response header `x-xhc-synthesized: true` (plus `x-xhc-cache: SYNTHESIZED`)
+- body fields `xhcSynthesized` and `xhcSynthesizedReason`
+
+The body tag is safe: `huggingface_hub`'s `ModelInfo`/`DatasetInfo` accept
+unknown fields, which is asserted in the test suite so a future release cannot
+silently break the contract.
+
+Deliberate limits — this synthesizes a **file listing**, not the Hub API:
+
+- only `/api/{models,datasets,spaces}/{repo}[/revision/{rev}]`; sub-resources
+  like `/tree/` and `/paths-info` still go upstream
+- only on a real upstream **404**. An unreachable Hub returns 502, so an outage
+  can never quietly start serving stale listings
+- only when we hold the snapshot; an uncached repo still 404s honestly
+- live repos always get the Hub's real answer, untouched
+
+Set `XHC_SYNTHESIZE_REPO_INFO=0` to turn it off.
+
+#### Releasing a retained orphan
+
+Retention makes orphans unevictable, so freeing that space is a deliberate act:
+
+```bash
+# whole repo, and the orphan mark is cleared with it
+curl -X DELETE localhost:8080/_cache/repos \
+  -H 'content-type: application/json' -d '{"repo_id":"org/model"}'
+
+# or a single revision, leaving the rest of the repo intact
+curl -X DELETE localhost:8080/_cache/repos \
+  -H 'content-type: application/json' \
+  -d '{"repo_id":"org/model","revision":"<commit-sha>"}'
+```
+
+Deleting always clears the orphan mark once nothing of the repo remains, so
+`retained_bytes` cannot keep claiming space that is no longer held.
+
+**Pins remain absolute** — there is deliberately no force flag. A pinned repo
+returns 409 and you must `DELETE /_cache/pins` first. That unpin is the
+acceptance step that stops a pinned model being destroyed by one mistyped call.
+
 **The cost is real:** retained orphans are unevictable, so they permanently
 reduce usable capacity. Eviction logs a warning and `/_cache/evict` returns
 `reached_goal: false` with `protected_bytes` when protection wins over the
@@ -291,6 +347,7 @@ experiments age out.
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |
 | `XHC_ORPHAN_CHECK_INTERVAL` | `21600` | seconds between upstream liveness sweeps; `0` disables |
+| `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo listings from cache when upstream 404s |
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |

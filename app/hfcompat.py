@@ -42,6 +42,11 @@ _HOP_BY_HOP = {
     "host",
     "content-length",
 }
+# httpx transparently decompresses .content, so any response we forward as
+# decoded bytes must NOT keep the upstream's content-encoding -- the client
+# would try to gunzip plain JSON. Only the streaming proxy, which forwards raw
+# bytes via aiter_raw(), may pass content-encoding through.
+_DECODED_DROP = _HOP_BY_HOP | {"content-encoding"}
 
 _client: httpx.AsyncClient | None = None
 
@@ -81,6 +86,78 @@ def parse_resolve(full_path: str) -> tuple[str, str, str, str] | None:
     if not head or not filename:
         return None
     return repo_type, head, revision, filename
+
+
+def parse_repo_info_path(full_path: str) -> tuple[str, str, str | None] | None:
+    """Match the repo-info endpoints snapshot_download uses, and only those.
+
+    `api/models/org/name` and `api/models/org/name/revision/main` qualify.
+    Sub-resources (`/tree/`, `/paths-info`, ...) deliberately do not: we can
+    honestly synthesize a file listing, not arbitrary Hub API surface.
+    """
+    if not full_path.startswith("api/"):
+        return None
+    rest = full_path[len("api/") :]
+    repo_type = tail = None
+    for prefix, rtype in (("models/", "model"), ("datasets/", "dataset"), ("spaces/", "space")):
+        if rest.startswith(prefix):
+            repo_type, tail = rtype, rest[len(prefix) :]
+            break
+    if tail is None:
+        return None
+
+    revision = None
+    if "/revision/" in tail:
+        repo_id, _, revision = tail.partition("/revision/")
+        revision = unquote(revision).strip("/")
+    else:
+        repo_id = tail
+    repo_id = repo_id.strip("/")
+    # "gpt2" (canonical) or "org/name". More segments means a sub-resource.
+    if not repo_id or repo_id.count("/") > 1:
+        return None
+    return repo_type, repo_id, revision or None
+
+
+def synthesize_repo_info(repo_type: str, repo_id: str, revision: str | None) -> dict | None:
+    """Build a repo-info response from the cached snapshot.
+
+    Only used when upstream 404s a repo we still hold. Without this, a repo
+    deleted from the Hub is half-usable: hf_hub_download works per file, but
+    snapshot_download fails because it cannot enumerate what to fetch.
+    """
+    commit = cachefs.resolve_commit(repo_type, repo_id, revision or "main")
+    if commit is None:
+        return None
+    files = cachefs.snapshot_files(repo_type, repo_id, commit)
+    if not files:
+        return None
+
+    body = {
+        "_id": commit,
+        "id": repo_id,
+        "sha": commit,
+        "siblings": [{"rfilename": f} for f in files],
+        "private": False,
+        "gated": False,
+        "disabled": False,
+        "tags": [],
+        "downloads": 0,
+        "likes": 0,
+        "lastModified": None,
+        "createdAt": None,
+        # Tagged so a client -- or a human reading a reproducibility record --
+        # can tell an archived answer from one the Hub confirmed. Verified that
+        # huggingface_hub's ModelInfo/DatasetInfo accept unknown fields, so this
+        # cannot break parsing.
+        "xhcSynthesized": True,
+        "xhcSynthesizedReason": "upstream returned 404; listing rebuilt from the cached snapshot",
+    }
+    if repo_type == "model":
+        body["modelId"] = repo_id
+    if repo_type == "dataset":
+        body["author"] = repo_id.split("/")[0] if "/" in repo_id else None
+    return body
 
 
 def is_xet_token_path(full_path: str) -> bool:
@@ -242,11 +319,72 @@ async def catch_all(full_path: str, request: Request) -> Response:
         )
 
     parsed = parse_resolve(full_path)
-    if parsed is None or request.method not in ("GET", "HEAD"):
-        return await proxy_upstream(full_path, request)
+    if parsed is not None and request.method in ("GET", "HEAD"):
+        repo_type, repo_id, revision, filename = parsed
+        return await serve_file(repo_type, repo_id, revision, filename, request)
 
-    repo_type, repo_id, revision, filename = parsed
-    return await serve_file(repo_type, repo_id, revision, filename, request)
+    # Repo info is the one metadata endpoint we can honestly answer ourselves,
+    # and it is the one that decides whether an orphaned repo is usable at all:
+    # snapshot_download enumerates through it before fetching anything.
+    info = parse_repo_info_path(full_path)
+    if info is not None and request.method == "GET" and settings.synthesize_repo_info:
+        return await serve_repo_info(*info, full_path, request)
+
+    return await proxy_upstream(full_path, request)
+
+
+async def serve_repo_info(
+    repo_type: str, repo_id: str, revision: str | None, full_path: str, request: Request
+) -> Response:
+    """Proxy repo info, falling back to the cached snapshot on an upstream 404."""
+    url = f"{settings.upstream}/{quote(full_path)}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+    if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
+        headers["authorization"] = f"Bearer {settings.hf_token}"
+    headers.setdefault("accept-encoding", "identity")
+
+    try:
+        upstream = await get_client().get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        # Unreachable is not the same as deleted; do not synthesize over an
+        # outage, or a Hub blip would silently start serving stale listings.
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+
+    if upstream.status_code != 404:
+        out = {k: v for k, v in upstream.headers.items() if k.lower() not in _DECODED_DROP}
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=out,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    body = synthesize_repo_info(repo_type, repo_id, revision)
+    if body is None:
+        out = {k: v for k, v in upstream.headers.items() if k.lower() not in _DECODED_DROP}
+        return Response(
+            content=upstream.content,
+            status_code=404,
+            headers=out,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    log.info(
+        "repo info synthesized for %s/%s (upstream 404, %d files from cache)",
+        repo_type,
+        repo_id,
+        len(body["siblings"]),
+    )
+    return JSONResponse(
+        body,
+        headers={
+            "x-xhc-synthesized": "true",
+            "x-xhc-cache": "SYNTHESIZED",
+            "x-repo-commit": body["sha"],
+        },
+    )
 
 
 async def _hit_response(

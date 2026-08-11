@@ -97,6 +97,9 @@ class Settings:
     #   evict  - treat them as ordinary LRU candidates.
     orphan_policy: str = "retain"
     orphan_check_interval_s: float = 21600.0  # 6h; 0 disables detection
+    # Rebuild repo-info listings from the cached snapshot when upstream 404s,
+    # so a repo deleted from the Hub stays enumerable (snapshot_download).
+    synthesize_repo_info: bool = True
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
@@ -145,6 +148,7 @@ class Settings:
             orphan_check_interval_s=_env_float(
                 "XHC_ORPHAN_CHECK_INTERVAL", cls.orphan_check_interval_s
             ),
+            synthesize_repo_info=_env_bool("XHC_SYNTHESIZE_REPO_INFO", cls.synthesize_repo_info),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),

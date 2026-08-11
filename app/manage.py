@@ -52,6 +52,15 @@ class EvictRequest(BaseModel):
     target_free_bytes: int = 0
 
 
+class DeleteRequest(BaseModel):
+    repo_id: str
+    repo_type: RepoType = "model"
+    revision: str | None = Field(
+        default=None,
+        description="delete only this revision (commit sha or ref); omit to delete the whole repo",
+    )
+
+
 @router.get("/status", dependencies=[Depends(require_manage_token)])
 async def status() -> dict:
     view = await cachefs.get_view()
@@ -217,11 +226,39 @@ async def run_evict(req: EvictRequest) -> dict:
 
 
 @router.delete("/repos", dependencies=[Depends(require_manage_token)])
-async def delete_repo(req: RepoRef) -> dict:
-    if cachefs.repo_key(req.repo_type, req.repo_id) in cachefs.load_pins():
-        raise HTTPException(status_code=409, detail="repo is pinned; unpin before deleting")
-    result = await asyncio.to_thread(cachefs.delete_repo_sync, req.repo_type, req.repo_id)
-    if not result["deleted"]:
-        raise HTTPException(status_code=404, detail="repo not in cache")
+async def delete_repo(req: DeleteRequest) -> dict:
+    """Forcibly drop a cached repo, or one revision of it.
+
+    This is the escape hatch for retained orphans: retention makes them
+    unevictable by the LRU sweep, so releasing the space has to be a deliberate
+    act. Deleting also clears any orphan mark, so retained_bytes cannot go on
+    claiming space that is no longer held.
+
+    Pins remain absolute -- there is deliberately no force flag. Unpinning first
+    is the acceptance step that stops a pinned model being destroyed by one
+    mistyped call.
+    """
+    key = cachefs.repo_key(req.repo_type, req.repo_id)
+    if key in cachefs.load_pins():
+        raise HTTPException(
+            status_code=409,
+            detail=f"{key} is pinned; DELETE /_cache/pins first (pins are absolute by design)",
+        )
+
+    if req.revision:
+        result = await asyncio.to_thread(
+            cachefs.delete_revision_sync, req.repo_type, req.repo_id, req.revision
+        )
+        if not result["deleted"]:
+            raise HTTPException(
+                status_code=404, detail=f"revision {req.revision} of {key} not in cache"
+            )
+    else:
+        result = await asyncio.to_thread(cachefs.delete_repo_sync, req.repo_type, req.repo_id)
+        if not result["deleted"]:
+            raise HTTPException(status_code=404, detail=f"{key} not in cache")
+
     cachefs.invalidate_view()
+    result["key"] = key
+    result["orphan_mark_cleared"] = not cachefs.repo_is_cached(req.repo_type, req.repo_id)
     return result

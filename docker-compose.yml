@@ -42,6 +42,8 @@ services:
       # be undone. retain exempts them from eviction; evict opts out.
       XHC_ORPHAN_POLICY: ${XHC_ORPHAN_POLICY:-retain}
       XHC_ORPHAN_CHECK_INTERVAL: "21600"
+      # Keep deleted repos enumerable by rebuilding their listing from cache.
+      XHC_SYNTHESIZE_REPO_INFO: "1"
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
       XHC_LOG_LEVEL: INFO
 

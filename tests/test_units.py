@@ -375,3 +375,103 @@ def test_orphan_classification_treats_network_error_as_unknown():
         assert "unreachable" in reason
     finally:
         orphans._get_client = original
+
+
+# ---------------------------------------------------------------------------
+# Repo-info synthesis: keeps an orphaned repo enumerable, so snapshot_download
+# still works after the repo is deleted from the Hub.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("api/models/org/name", ("model", "org/name", None)),
+        ("api/models/org/name/revision/main", ("model", "org/name", "main")),
+        ("api/models/gpt2", ("model", "gpt2", None)),  # canonical, no org
+        ("api/datasets/org/ds/revision/v1.1", ("dataset", "org/ds", "v1.1")),
+        ("api/spaces/org/sp", ("space", "org/sp", None)),
+        ("api/models/org/name/revision/refs%2Fpr%2F1", ("model", "org/name", "refs/pr/1")),
+    ],
+)
+def test_parse_repo_info_path(path, expected):
+    from app.hfcompat import parse_repo_info_path
+
+    assert parse_repo_info_path(path) == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "api/models/org/name/tree/main",  # sub-resource, not a repo-info call
+        "api/models/org/name/paths-info/main",
+        "api/whoami-v2",
+        "org/name/resolve/main/f.bin",
+        "api/unknown/org/name",
+        "api/models/",
+    ],
+)
+def test_parse_repo_info_path_rejects_other_endpoints(path):
+    # We synthesize a file listing and nothing else; anything broader must fall
+    # through to the real Hub rather than be answered from guesswork.
+    from app.hfcompat import parse_repo_info_path
+
+    assert parse_repo_info_path(path) is None
+
+
+def test_synthesize_returns_none_when_not_cached(tmp_path):
+    from app.config import settings
+    from app.hfcompat import synthesize_repo_info
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        # Nothing cached -> must not fabricate a listing.
+        assert synthesize_repo_info("model", "org/never-seen", "main") is None
+    finally:
+        settings.cache_dir = original
+
+
+def test_synthesize_builds_listing_from_snapshot(tmp_path):
+    from app.config import settings
+    from app.hfcompat import synthesize_repo_info
+
+    original = settings.cache_dir
+    settings.cache_dir = str(tmp_path)
+    try:
+        commit = "a" * 40
+        base = tmp_path / "models--org--name"
+        snap = base / "snapshots" / commit / "nested"
+        snap.mkdir(parents=True)
+        (base / "refs").mkdir(parents=True)
+        (base / "refs" / "main").write_text(commit)
+        (base / "snapshots" / commit / "config.json").write_text("{}")
+        (snap / "weights.safetensors").write_text("x")
+
+        body = synthesize_repo_info("model", "org/name", "main")
+        assert body is not None
+        assert body["sha"] == commit
+        assert {s["rfilename"] for s in body["siblings"]} == {
+            "config.json",
+            "nested/weights.safetensors",
+        }
+        # Tagged so an archived answer is distinguishable from a live one.
+        assert body["xhcSynthesized"] is True
+    finally:
+        settings.cache_dir = original
+
+
+def test_synthesized_tag_does_not_break_huggingface_hub_parsing():
+    # The tag rides in the JSON body, so it must survive ModelInfo/DatasetInfo
+    # construction or it would break every client instead of informing them.
+    from huggingface_hub.hf_api import DatasetInfo, ModelInfo
+
+    payload = {
+        "id": "org/name",
+        "sha": "b" * 40,
+        "siblings": [{"rfilename": "config.json"}],
+        "private": False,
+        "xhcSynthesized": True,
+    }
+    assert ModelInfo(**payload).sha == "b" * 40
+    assert DatasetInfo(**payload).sha == "b" * 40

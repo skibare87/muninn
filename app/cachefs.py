@@ -108,6 +108,58 @@ def resolve_local(
     return ResolvedFile(path=target, commit=commit, size=size, etag=etag)
 
 
+def resolve_commit(repo_type: str, repo_id: str, revision: str) -> str | None:
+    """Map a branch/tag/sha to a commit we actually hold, or None."""
+    base = Path(settings.cache_dir) / repo_folder_name(repo_id, repo_type)
+    if not base.is_dir():
+        return None
+    ref_file = base / "refs" / revision
+    if ref_file.is_file():
+        try:
+            commit = ref_file.read_text().strip()
+            if commit and (base / "snapshots" / commit).is_dir():
+                return commit
+        except OSError:
+            pass
+    if (base / "snapshots" / revision).is_dir():
+        return revision
+    return None
+
+
+def snapshot_files(repo_type: str, repo_id: str, commit: str) -> list[str]:
+    """Repo-relative paths held for a commit.
+
+    Only files that actually resolve are listed: a snapshot entry is a symlink
+    into blobs/, and a dangling one means the blob was evicted. Advertising a
+    file we cannot then serve would be worse than omitting it.
+    """
+    root = Path(settings.cache_dir) / repo_folder_name(repo_id, repo_type) / "snapshots" / commit
+    if not root.is_dir():
+        return []
+    out = []
+    for p in root.rglob("*"):
+        try:
+            if p.is_file():
+                out.append(p.relative_to(root).as_posix())
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def repo_is_cached(repo_type: str, repo_id: str) -> bool:
+    base = Path(settings.cache_dir) / repo_folder_name(repo_id, repo_type)
+    return (base / "snapshots").is_dir() and any((base / "snapshots").iterdir())
+
+
+def forget_orphan(key: str) -> bool:
+    """Drop an orphan mark. Called after a delete so state cannot go stale."""
+    orphans = load_orphans()
+    existed = orphans.pop(key, None) is not None
+    if existed:
+        save_orphans(orphans)
+    return existed
+
+
 def blob_incomplete_path(repo_type: str, repo_id: str, etag: str) -> Path:
     """Where hf_hub_download writes bytes before committing them to blobs/."""
     base = Path(settings.cache_dir) / repo_folder_name(repo_id, repo_type)
@@ -406,6 +458,28 @@ async def evict(target_free_bytes: int = 0) -> dict:
     return result
 
 
+def delete_revision_sync(repo_type: str, repo_id: str, commit: str) -> dict:
+    """Delete a single revision, leaving the repo's other revisions intact."""
+    info = scan_cache_dir(settings.cache_dir)
+    match = [
+        rev.commit_hash
+        for r in info.repos
+        if r.repo_id == repo_id and r.repo_type == repo_type
+        for rev in r.revisions
+        if rev.commit_hash == commit or commit in rev.refs
+    ]
+    if not match:
+        return {"deleted": False, "freed": 0}
+    strategy = info.delete_revisions(*match)
+    freed = strategy.expected_freed_size
+    strategy.execute()
+    key = repo_key(repo_type, repo_id)
+    # Only release the orphan mark if nothing of the repo survives.
+    if not repo_is_cached(repo_type, repo_id):
+        forget_orphan(key)
+    return {"deleted": True, "freed": freed, "revisions": match}
+
+
 def delete_repo_sync(repo_type: str, repo_id: str) -> dict:
     info = scan_cache_dir(settings.cache_dir)
     commits = [
@@ -423,6 +497,9 @@ def delete_repo_sync(repo_type: str, repo_id: str) -> dict:
     folder = Path(settings.cache_dir) / repo_folder_name(repo_id, repo_type)
     if folder.is_dir() and not any((folder / "snapshots").glob("*")):
         shutil.rmtree(folder, ignore_errors=True)
+    # The data is gone, so the orphan mark must go too -- otherwise it keeps
+    # claiming to retain bytes that no longer exist and inflates retained_bytes.
+    forget_orphan(repo_key(repo_type, repo_id))
     return {"deleted": True, "freed": freed, "revisions": commits}
 
 
