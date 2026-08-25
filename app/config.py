@@ -124,6 +124,42 @@ class Settings:
     stream_poll_interval_s: float = 0.25
     stream_start_timeout_s: float = 120.0
 
+    # --- docker / OCI pull-through (0.5.0) -----------------------------------
+    # A second protocol on the same array, addressed by path prefix:
+    #   docker pull muninn.host/ghcr.io/org/img:tag
+    # Storage is a SEPARATE root from the HF cache so scan_cache_dir never sees
+    # it and image churn can never evict models.
+    docker_enabled: bool = True
+    docker_dir: str = "/docker"
+    docker_capacity_bytes: int | None = None
+    # Used when the first path segment has no dot, so `muninn.host/nginx`
+    # behaves the way everyone expects.
+    docker_default_upstream: str = "docker.io"
+    # Seconds a tag->digest mapping is trusted. Parity with XHC_REF_TTL: a tag
+    # is a mutable ref pointing at an immutable digest, exactly the main->commit
+    # problem. 0 disables revalidation, making the cache a pure archive.
+    docker_tag_ttl_s: float = 300.0
+    # Client-facing auth. `none` matches the HF side's LAN posture. `basic`
+    # implies TLS -- Docker refuses basic auth over plaintext except on
+    # localhost. Phase 3.
+    docker_auth: str = "none"
+    docker_htpasswd: str | None = None
+    # Upstream credentials as a standard ~/.docker/config.json, so `docker
+    # login` output can be mounted directly and nothing bespoke is invented.
+    registry_auth_file: str | None = None
+    # Registry-host and image policy. Defaults to `open`, at parity with
+    # XHC_INGEST_POLICY on the HF side -- the maintainer's ruling was parity.
+    # NOTE the exposure that parity implies: path-prefix routing means anyone
+    # who can reach this host can pull from ANY registry onto the array. Two
+    # env vars close that (XHC_DOCKER_POLICY=allowlist plus XHC_ALLOW_REGISTRIES)
+    # and it is the single highest-value hardening step for a shared box.
+    docker_policy: str = "open"
+    allow_registries: str = ""
+    deny_registries: str = ""
+    allow_images: str = ""
+    deny_images: str = ""
+    docker_max_blob_bytes: int | None = None
+
     # --- server --------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8080
@@ -159,6 +195,14 @@ class Settings:
         if not 0 < low < high <= 1:
             raise ValueError(f"require 0 < XHC_LOW_WATER ({low}) < XHC_HIGH_WATER ({high}) <= 1")
 
+        docker_policy = (os.environ.get("XHC_DOCKER_POLICY") or cls.docker_policy).strip().lower()
+        if docker_policy not in ("open", "allowlist"):
+            raise ValueError(f"XHC_DOCKER_POLICY must be open|allowlist, got {docker_policy!r}")
+
+        docker_auth = (os.environ.get("XHC_DOCKER_AUTH") or cls.docker_auth).strip().lower()
+        if docker_auth not in ("none", "basic"):
+            raise ValueError(f"XHC_DOCKER_AUTH must be none|basic, got {docker_auth!r}")
+
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
         return cls(
@@ -192,6 +236,22 @@ class Settings:
             ),
             stream_poll_interval_s=_env_float("XHC_STREAM_POLL_INTERVAL", 0.25),
             stream_start_timeout_s=_env_float("XHC_STREAM_START_TIMEOUT", 120.0),
+            docker_enabled=_env_bool("XHC_DOCKER_ENABLED", cls.docker_enabled),
+            docker_dir=os.environ.get("XHC_DOCKER_DIR", cls.docker_dir),
+            docker_capacity_bytes=parse_size(os.environ.get("XHC_DOCKER_MAX_SIZE"), None),
+            docker_default_upstream=os.environ.get(
+                "XHC_DOCKER_DEFAULT_UPSTREAM", cls.docker_default_upstream
+            ),
+            docker_tag_ttl_s=_env_float("XHC_DOCKER_TAG_TTL", cls.docker_tag_ttl_s),
+            docker_auth=docker_auth,
+            docker_htpasswd=os.environ.get("XHC_DOCKER_HTPASSWD") or None,
+            registry_auth_file=os.environ.get("XHC_REGISTRY_AUTH_FILE") or None,
+            docker_policy=docker_policy,
+            allow_registries=os.environ.get("XHC_ALLOW_REGISTRIES", cls.allow_registries),
+            deny_registries=os.environ.get("XHC_DENY_REGISTRIES", cls.deny_registries),
+            allow_images=os.environ.get("XHC_ALLOW_IMAGES", cls.allow_images),
+            deny_images=os.environ.get("XHC_DENY_IMAGES", cls.deny_images),
+            docker_max_blob_bytes=parse_size(os.environ.get("XHC_DOCKER_MAX_BLOB_BYTES"), None),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),
             port=_env_int("XHC_PORT", 8080),
             manage_token=os.environ.get("XHC_MANAGE_TOKEN") or None,

@@ -628,6 +628,21 @@ ENV_TO_SETTING = [
     ("XHC_PORT", "9999", "port", 9999),
     ("XHC_REQUEST_TIMEOUT", "13", "request_timeout_s", 13.0),
     ("XHC_MANAGE_TOKEN", "sekrit", "manage_token", "sekrit"),
+    # --- docker / OCI (0.5.0) ---
+    ("XHC_DOCKER_ENABLED", "0", "docker_enabled", False),
+    ("XHC_DOCKER_DIR", "/mnt/oci", "docker_dir", "/mnt/oci"),
+    ("XHC_DOCKER_MAX_SIZE", "3T", "docker_capacity_bytes", 3 * 1024**4),
+    ("XHC_DOCKER_DEFAULT_UPSTREAM", "quay.io", "docker_default_upstream", "quay.io"),
+    ("XHC_DOCKER_TAG_TTL", "90", "docker_tag_ttl_s", 90.0),
+    ("XHC_DOCKER_AUTH", "basic", "docker_auth", "basic"),
+    ("XHC_DOCKER_HTPASSWD", "/run/secrets/htp", "docker_htpasswd", "/run/secrets/htp"),
+    ("XHC_REGISTRY_AUTH_FILE", "/run/secrets/dc", "registry_auth_file", "/run/secrets/dc"),
+    ("XHC_DOCKER_POLICY", "allowlist", "docker_policy", "allowlist"),
+    ("XHC_ALLOW_REGISTRIES", "ghcr.io", "allow_registries", "ghcr.io"),
+    ("XHC_DENY_REGISTRIES", "evil.io", "deny_registries", "evil.io"),
+    ("XHC_ALLOW_IMAGES", "ghcr.io/org/*", "allow_images", "ghcr.io/org/*"),
+    ("XHC_DENY_IMAGES", "*/*:nightly", "deny_images", "*/*:nightly"),
+    ("XHC_DOCKER_MAX_BLOB_BYTES", "10G", "docker_max_blob_bytes", 10 * 1024**3),
 ]
 
 

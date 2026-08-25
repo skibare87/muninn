@@ -84,6 +84,13 @@ def save(policy: dict) -> dict:
         raise ValueError("mode must be open|allowlist")
     if keep["scope"] not in ("ingest", "all"):
         raise ValueError("scope must be ingest|all")
+    # Preserve a docker policy this caller did not send, so saving the HF half
+    # cannot silently erase the registry half.
+    existing = _raw_file()
+    if "docker" in existing:
+        keep["docker"] = existing["docker"]
+    if "docker" in policy:
+        keep["docker"] = policy["docker"]
     p = _state_path()
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(keep, indent=2, sort_keys=True))
@@ -134,3 +141,94 @@ def check_size(size: int | None, policy: dict | None = None) -> Decision:
 
 def enforced_on_hits(policy: dict | None = None) -> bool:
     return (policy or load()).get("scope") == "all"
+
+
+def _raw_file() -> dict:
+    p = _state_path()
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def load_docker() -> dict:
+    """Effective Docker/OCI policy.
+
+    Same shape and semantics as the HF side so there is one model to learn, but
+    with an extra axis: `registries` gates the upstream HOST, separately from
+    the image patterns. That separation is deliberate -- a two-line allowlist of
+    hosts blocks the entire class of "someone pulled a random image from a
+    random registry through the shared box", which is the exposure that
+    path-prefix routing creates.
+    """
+    d = _raw_file().get("docker")
+    if isinstance(d, dict):
+        return {
+            "mode": d.get("mode", settings.docker_policy),
+            "registries": list(d.get("registries", [])),
+            "allow": list(d.get("allow", [])),
+            "deny": list(d.get("deny", [])),
+            "scope": d.get("scope", settings.policy_scope),
+            "max_blob_bytes": d.get("max_blob_bytes", settings.docker_max_blob_bytes),
+            "source": "file",
+        }
+    return {
+        "mode": settings.docker_policy,
+        "registries": _split(settings.allow_registries),
+        "allow": _split(settings.allow_images),
+        "deny": _split(settings.deny_images),
+        "scope": settings.policy_scope,
+        "max_blob_bytes": settings.docker_max_blob_bytes,
+        "source": "env",
+        "deny_registries": _split(settings.deny_registries),
+    }
+
+
+def check_docker(upstream: str, repo: str, policy: dict | None = None) -> Decision:
+    """Decide whether this image may be ingested. Deny always wins, as on the
+    HF side."""
+    pol = policy or load_docker()
+    key = f"{upstream}/{repo}"
+
+    denied_host = _matches(upstream, pol.get("deny_registries", []))
+    if denied_host:
+        return Decision(False, f"registry denied by pattern {denied_host!r}")
+
+    denied_by = _matches(key, pol["deny"])
+    if denied_by:
+        return Decision(False, f"denied by pattern {denied_by!r}")
+
+    if pol["mode"] == "allowlist":
+        # The registry allowlist, when set, is authoritative on the host.
+        if pol["registries"] and not _matches(upstream, pol["registries"]):
+            return Decision(False, f"registry {upstream!r} is not on the allowlist")
+        if pol["allow"] and not _matches(key, pol["allow"]):
+            return Decision(False, "not on the allowlist")
+        if not pol["registries"] and not pol["allow"]:
+            return Decision(False, "not on the allowlist")
+    elif pol["registries"] and not _matches(upstream, pol["registries"]):
+        # Registries can be restricted even in `open` mode: it is the cheap,
+        # high-value guard and should not require flipping the whole policy.
+        return Decision(False, f"registry {upstream!r} is not on the allowlist")
+
+    return Decision(True)
+
+
+def check_blob_size(size: int | None, policy: dict | None = None) -> Decision:
+    """Refuse an oversized layer using the upstream Content-Length, before any
+    bytes move."""
+    pol = policy or load_docker()
+    cap = pol.get("max_blob_bytes")
+    if not cap or not size:
+        return Decision(True)
+    if size > cap:
+        return Decision(False, f"blob is {size} bytes, over the {cap} byte limit")
+    return Decision(True)
+
+
+def docker_enforced_on_hits(policy: dict | None = None) -> bool:
+    return (policy or load_docker()).get("scope") == "all"

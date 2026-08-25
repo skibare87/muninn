@@ -9,7 +9,8 @@ from pathlib import Path
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from . import cachefs, hfcompat, manage, metrics, orphans, refs
+from . import cachefs, hfcompat, manage, metrics, ocicompat, ocistore, orphans, refs
+from . import registry as ociregistry
 from .config import settings
 from .jobs import manager
 
@@ -23,6 +24,8 @@ log = logging.getLogger("xhc")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
+    if settings.docker_enabled:
+        Path(settings.docker_dir).mkdir(parents=True, exist_ok=True)
 
     if os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() in ("1", "true", "yes"):
         # This is the exact misconfiguration the whole design exists to avoid.
@@ -48,6 +51,22 @@ async def lifespan(app: FastAPI):
         settings.capacity_bytes or "filesystem",
         settings.miss_policy,
     )
+    if settings.docker_enabled:
+        log.info(
+            "docker/OCI pull-through on /v2/* | dir=%s policy=%s tag_ttl=%ss",
+            settings.docker_dir,
+            settings.docker_policy,
+            settings.docker_tag_ttl_s,
+        )
+        if settings.docker_policy == "open" and not settings.allow_registries:
+            # Parity with the HF side is the ruling, but the exposure it implies
+            # is different in kind: anyone who can reach this host can pull from
+            # ANY registry onto the array. Say so once, at boot.
+            log.warning(
+                "docker policy is `open` with no registry allowlist: any client "
+                "may pull from any upstream registry through this cache. Set "
+                "XHC_ALLOW_REGISTRIES to restrict it."
+            )
 
     evictor = asyncio.create_task(cachefs.eviction_loop())
     orphan_sweep = asyncio.create_task(orphans.orphan_loop())
@@ -61,6 +80,7 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
         await hfcompat.close_client()
+        await ociregistry.close_client()
         await orphans.close_client()
         await refs.close_client()
 
@@ -72,7 +92,7 @@ app = FastAPI(
         "(parallel range GETs), serves the LAN over plain HTTP (no Xet, no chunk "
         "reassembly). Point clients at this host with HF_ENDPOINT."
     ),
-    version="0.4.0",
+    version="0.5.0-rc",
     lifespan=lifespan,
 )
 
@@ -106,6 +126,13 @@ async def prometheus_metrics() -> Response:
         "muninn_ref_lookups_total": refs.stats()["lookups"],
         "muninn_disk_free_bytes": disk["fs_free"],
     }
+    if settings.docker_enabled:
+        dstats = ocistore.stats()
+        gauges["muninn_docker_blobs"] = dstats["blobs"]
+        gauges["muninn_docker_manifests"] = dstats["manifests"]
+        gauges["muninn_docker_bytes"] = dstats["bytes"]
+        if settings.docker_capacity_bytes:
+            gauges["muninn_docker_capacity_bytes"] = settings.docker_capacity_bytes
     body = metrics.render(
         gauges,
         {
@@ -118,5 +145,9 @@ async def prometheus_metrics() -> Response:
 
 
 app.include_router(manage.router)
+# Before hfcompat: /v2/* is the Docker surface and the HF catch-all would
+# otherwise swallow it.
+if settings.docker_enabled:
+    app.include_router(ocicompat.router)
 # Must be last: hfcompat owns the catch-all route.
 app.include_router(hfcompat.router)

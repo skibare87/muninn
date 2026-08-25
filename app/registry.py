@@ -1,0 +1,245 @@
+"""Upstream OCI registry client: name resolution, the bearer-token dance, creds.
+
+Two jobs.
+
+**Resolution.** `docker pull muninn.host/ghcr.io/org/img:tag` reaches us as
+`GET /v2/ghcr.io/org/img/manifests/tag`, because Docker treats the first
+component of a reference as a registry host only when it contains a `.` or `:`
+(or is `localhost`), and dots are legal inside a repository path. So the whole
+`ghcr.io/org/img` arrives as an opaque repository name and we split it here.
+
+**Auth.** Registries answer `401` with a `WWW-Authenticate: Bearer` challenge;
+the client is expected to fetch a short-lived scoped token from the named realm
+and retry. Muninn performs that on the fleet's behalf, so edge nodes stay
+anonymous and credentials live in exactly one place -- the same win as HF_TOKEN.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import httpx
+
+from .config import settings
+
+log = logging.getLogger("xhc.registry")
+
+# Docker Hub is the special case, and it is the most used upstream. `docker.io`
+# is not the API host, `index.docker.io` is an alias for it, and single-segment
+# repositories carry an implicit `library/`. Encoded once, here, so no other
+# module has to know.
+_HUB_ALIASES = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+_HUB_CANONICAL = "docker.io"
+_HUB_API = "https://registry-1.docker.io"
+
+_CHALLENGE_RE = re.compile(r'(\w+)="([^"]*)"')
+
+_client: httpx.AsyncClient | None = None
+_tokens: dict[tuple[str, str], tuple[str, float]] = {}
+_token_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_creds_cache: dict | None = None
+
+
+@dataclass(frozen=True)
+class Ref:
+    """A resolved reference. `upstream` is the canonical host used for policy,
+    storage paths and metrics; `api` is where requests actually go."""
+
+    upstream: str
+    api: str
+    repo: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.upstream}/{self.repo}"
+
+
+class ResolveError(ValueError):
+    pass
+
+
+def resolve(name: str) -> Ref:
+    """Split `<maybe-host>/<repo...>` into an upstream and a repository."""
+    name = name.strip("/")
+    if not name:
+        raise ResolveError("empty repository name")
+    head, _, rest = name.partition("/")
+
+    if "." in head or ":" in head or head == "localhost":
+        host, repo = head, rest
+    else:
+        # No dot in the first segment, so it is part of the repo name and the
+        # default upstream applies: `muninn.host/nginx` -> docker.io/library/nginx.
+        host, repo = settings.docker_default_upstream, name
+
+    if host in _HUB_ALIASES:
+        upstream, api = _HUB_CANONICAL, _HUB_API
+        if repo and "/" not in repo:
+            repo = f"library/{repo}"
+    else:
+        upstream, api = host, f"https://{host}"
+
+    if not repo:
+        raise ResolveError(f"no repository in {name!r}")
+    return Ref(upstream=upstream, api=api, repo=repo)
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client  # noqa: PLW0603 - module-level cache
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.request_timeout_s, read=None),
+            follow_redirects=True,
+        )
+    return _client
+
+
+async def close_client() -> None:
+    global _client  # noqa: PLW0603 - module-level cache
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+def _load_credentials() -> dict:
+    """Read a standard ~/.docker/config.json. Reusing the format `docker login`
+    already produces means no bespoke config format, and mounting it as a Docker
+    secret keeps credentials out of `docker inspect`."""
+    global _creds_cache  # noqa: PLW0603 - module-level cache
+    if _creds_cache is not None:
+        return _creds_cache
+    _creds_cache = {}
+    path = settings.registry_auth_file
+    if path and Path(path).is_file():
+        try:
+            data = json.loads(Path(path).read_text())
+            for host, entry in (data.get("auths") or {}).items():
+                canonical = _HUB_CANONICAL if host in _HUB_ALIASES else host
+                # Hosts appear with and without scheme/path in real config files.
+                canonical = canonical.split("/")[0].replace("https://", "")
+                if entry.get("auth"):
+                    _creds_cache[canonical] = base64.b64decode(entry["auth"]).decode()
+                elif entry.get("username"):
+                    _creds_cache[canonical] = f"{entry['username']}:{entry.get('password','')}"
+            log.info("loaded registry credentials for %s", sorted(_creds_cache))
+        except (OSError, ValueError, KeyError) as exc:
+            log.warning("could not read XHC_REGISTRY_AUTH_FILE %s: %s", path, exc)
+    return _creds_cache
+
+
+def reset_credentials() -> None:
+    global _creds_cache  # noqa: PLW0603 - module-level cache
+    _creds_cache = None
+
+
+def _basic_for(upstream: str) -> str | None:
+    creds = _load_credentials().get(upstream)
+    return base64.b64encode(creds.encode()).decode() if creds else None
+
+
+def _parse_challenge(header: str) -> dict:
+    return dict(_CHALLENGE_RE.findall(header or ""))
+
+
+async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
+    realm = challenge.get("realm")
+    if not realm:
+        return None
+    params = {k: v for k, v in challenge.items() if k in ("service", "scope") and v}
+    params.setdefault("scope", f"repository:{ref.repo}:pull")
+    headers = {}
+    basic = _basic_for(ref.upstream)
+    if basic:
+        headers["authorization"] = f"Basic {basic}"
+    try:
+        r = await _get_client().get(realm, params=params, headers=headers)
+    except httpx.HTTPError as exc:
+        log.warning("token fetch failed for %s: %s", ref.upstream, exc)
+        return None
+    if r.status_code != 200:
+        log.warning("token endpoint %s returned %s for %s", realm, r.status_code, ref.key)
+        return None
+    body = r.json()
+    token = body.get("token") or body.get("access_token")
+    if not token:
+        return None
+    ttl = float(body.get("expires_in") or 300)
+    # Expire a little early rather than discovering staleness mid-pull.
+    _tokens[(ref.upstream, params["scope"])] = (token, time.time() + max(ttl - 30, 30))
+    return token
+
+
+def _cached_token(ref: Ref) -> str | None:
+    entry = _tokens.get((ref.upstream, f"repository:{ref.repo}:pull"))
+    if not entry:
+        return None
+    token, expires = entry
+    return token if time.time() < expires else None
+
+
+def clear_tokens() -> None:
+    _tokens.clear()
+
+
+async def _authed_request(
+    method: str, url: str, ref: Ref, headers: dict, *, stream: bool
+):
+    """Issue a request, performing the bearer dance once on a 401.
+
+    Returns an httpx.Response. When `stream` is True the caller owns closing it.
+    """
+    client = _get_client()
+    hdrs = dict(headers)
+    token = _cached_token(ref)
+    if token:
+        hdrs["authorization"] = f"Bearer {token}"
+
+    async def send(h):
+        req = client.build_request(method, url, headers=h)
+        return await client.send(req, stream=stream)
+
+    r = await send(hdrs)
+    if r.status_code != 401:
+        return r
+
+    challenge = _parse_challenge(r.headers.get("www-authenticate", ""))
+    if stream:
+        await r.aclose()
+    else:
+        await r.aread()
+
+    if (challenge.get("Bearer") is None) and "realm" not in challenge:
+        # Not a bearer challenge we can satisfy (e.g. Basic). Hand the client
+        # the registry's own answer rather than inventing one.
+        return r
+
+    lock = _token_locks.setdefault((ref.upstream, ref.repo), asyncio.Lock())
+    async with lock:
+        # Another request may have refreshed while we waited.
+        token = _cached_token(ref) or await _fetch_token(ref, challenge)
+    if not token:
+        return r
+    hdrs["authorization"] = f"Bearer {token}"
+    return await send(hdrs)
+
+
+async def get(ref: Ref, path: str, headers: dict | None = None, *, method: str = "GET"):
+    """Non-streaming request against `<api>/v2/<repo>/<path>`; body is read."""
+    url = f"{ref.api}/v2/{ref.repo}/{path}"
+    r = await _authed_request(method, url, ref, headers or {}, stream=False)
+    if not hasattr(r, "_content_read"):
+        await r.aread()
+    return r
+
+
+async def open_stream(ref: Ref, path: str, headers: dict | None = None):
+    """Streaming request; the caller MUST close the returned response."""
+    url = f"{ref.api}/v2/{ref.repo}/{path}"
+    return await _authed_request("GET", url, ref, headers or {}, stream=True)
