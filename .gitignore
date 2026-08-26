@@ -12,3 +12,5 @@ dist/
 # local scratch from the benchmark / verification harnesses
 bench-cache/
 verify-cache/
+CLAUDE.md
+CLAUDE.md.draft
