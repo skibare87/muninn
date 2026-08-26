@@ -350,6 +350,101 @@ Two deliberate exclusions:
 
 `DELETE /_cache/viewer` drops the cached metadata; repo bytes are untouched.
 
+## Docker and OCI pull-through
+
+Muninn speaks a second protocol. `/v2/*` is a full OCI Distribution **pull** surface for
+**any** upstream registry, addressed by path prefix:
+
+```bash
+docker pull muninn.host/ghcr.io/org/img:1.2.3
+docker pull muninn.host/quay.io/prometheus/prometheus:v3.1.0
+docker pull muninn.host/nginx                    # -> docker.io/library/nginx
+```
+
+Everything that is not `/v2/*` stays Hugging Face and is unchanged.
+
+**Why a path prefix rather than a mirror.** Docker treats the first component of a reference
+as a registry host when it contains a `.` or `:`, and dots are legal inside a repository
+path — so `ghcr.io/org/img` arrives as an opaque repository name and Muninn routes on it.
+That means **zero per-node configuration**: no `hosts.toml`, no `registry-mirrors` (which
+only ever worked for Docker Hub), no daemon restart, and identical behaviour across docker,
+podman, containerd, buildkit and Kubernetes. The cost is that image references have to be
+rewritten, and anything missed silently bypasses the cache.
+
+**What it gives you**
+
+- Blobs are content-addressed, so the digest is **verified on ingest**. Bytes that do not
+  hash to their digest are discarded, never cached — a corrupt layer served forever is far
+  worse than a failed pull.
+- Manifests are stored and served **byte-for-byte**. Any re-encoding would change the digest
+  and break pull-by-digest and every signature check.
+- Layers are shared across repositories on an upstream, so **layer dedup is free**.
+- Single-flight: N nodes pulling the same cold image cost **one** upstream fetch per blob.
+- Tags are revalidated like Hugging Face refs (`XHC_DOCKER_TAG_TTL`), and revalidation
+  **fails open** — a tag deleted upstream keeps serving the digest you hold.
+
+**Storage is a separate root** (`XHC_DOCKER_DIR`) with its own capacity budget, so image
+churn can never evict models.
+
+### Garbage collection is mark-and-sweep, not LRU
+
+This is the one place the Docker side genuinely differs from the Hugging Face side. HF blobs
+belong to exactly one snapshot tree, so LRU is safe. **Docker blobs are referenced by
+manifests, and manifests by tags** — and an index points at per-platform manifests which
+point at layers. Naive LRU evicts a layer a retained manifest still needs and produces an
+image that fails at *pull* time with a baffling error, long after the eviction that caused it.
+
+So Muninn walks tags and pins → manifests → config and layers, recursing through indexes, and
+sweeps only what falls outside that set. Freeing space when everything is referenced drops a
+**tag** and re-marks; eviction is top-down, because a blob is only safe once nothing points at
+it. **Pinned tags and retained orphans are never candidates**, even if that means missing the
+capacity target — running hot on disk is recoverable.
+
+**Pinning an image pins its whole closure.** A pin that kept the manifest but let its layers
+go would look intact until someone pulled it.
+
+If the pin or orphan state cannot be read, **GC refuses rather than proceeding**. An absent
+state file legitimately means "nothing is pinned"; an unreadable one means "unknown", and
+collapsing those would silently disarm pin protection inside an unattended loop.
+
+### Docker management endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/_cache/docker/prewarm` | pull an image and its closure ahead of a rollout; returns a job |
+| `GET` | `/_cache/docker/prewarm/{id}` | poll it |
+| `GET` | `/_cache/docker/images` | cached tags, with pin and orphan state |
+| `GET`/`POST`/`DELETE` | `/_cache/docker/pins` | pin an image and its blob closure |
+| `DELETE` | `/_cache/docker/images` | drop a tag; its blobs go on the next sweep |
+| `POST` | `/_cache/docker/gc` | run mark-and-sweep now (`?dry_run=true` to see what would go) |
+
+Prewarm is fire-and-forget, so nobody holds an HTTP connection open across a 30 GB pull.
+**Pass a digest rather than a tag** for anything you intend to reproduce — a tag can move
+mid-pull and assemble a tree from two commits.
+
+### Docker configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `XHC_DOCKER_ENABLED` | `1` | serve `/v2/*` at all |
+| `XHC_DOCKER_DIR` | `/docker` | storage root; use a separate volume |
+| `XHC_DOCKER_MAX_SIZE` | unset | capacity budget for the image cache |
+| `XHC_DOCKER_DEFAULT_UPSTREAM` | `docker.io` | used when the first path segment has no dot |
+| `XHC_DOCKER_TAG_TTL` | `300` | seconds a tag→digest mapping is trusted; `0` never revalidates |
+| `XHC_DOCKER_POLICY` | `open` | `open`, `allowlist` — parity with `XHC_INGEST_POLICY` |
+| `XHC_ALLOW_REGISTRIES` / `XHC_DENY_REGISTRIES` | unset | host globs, **honoured in `open` mode too** |
+| `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |
+| `XHC_DOCKER_MAX_BLOB_BYTES` | unset | refuse an oversized layer before bytes move |
+| `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
+
+> **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing
+> means anyone who can reach the port can pull from **any** registry onto your array. The
+> server warns at boot in that state. Setting `XHC_ALLOW_REGISTRIES` is the cheapest useful
+> hardening and does **not** require flipping the whole policy to `allowlist`.
+
+**Not implemented:** push (a cache that accepts pushes is a registry, with GC, quota and
+durability obligations), and client-facing auth — `XHC_DOCKER_AUTH` is accepted and ignored.
+
 ## Management API
 
 All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer …`.

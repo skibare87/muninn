@@ -106,7 +106,7 @@ app = FastAPI(
         "(parallel range GETs), serves the LAN over plain HTTP (no Xet, no chunk "
         "reassembly). Point clients at this host with HF_ENDPOINT."
     ),
-    version="0.5.0-rc",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
