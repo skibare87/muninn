@@ -27,7 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from . import metrics, ocistore, policy, registry, serving
+from . import metrics, ocigc, ocistore, policy, registry, serving
 from .config import settings
 
 log = logging.getLogger("xhc.oci")
@@ -364,6 +364,11 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
         held = ocistore.load_manifest(ref.upstream, entry["digest"])
         if held is not None:
             ocistore.touch_tag(ref.upstream, ref.repo, reference, accept_fp)
+            # Upstream would not confirm this tag and we are serving a cached
+            # copy: mark it so GC treats it as an orphan under `retain`. Deleted
+            # tags are common in registry land, and the copy here may be the
+            # only one left.
+            ocigc.mark_orphan(ref.upstream, ref.repo, reference)
             metrics.record_docker("RETAINED", "manifest")
             return _manifest_response(held, head)
     return _err(404, "MANIFEST_UNKNOWN", f"manifest {reference} not available")

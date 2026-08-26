@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from . import cachefs, hfcompat, manage, metrics, ocicompat, ocistore, orphans, refs
+from . import cachefs, hfcompat, manage, metrics, ocicompat, ocigc, ocistore, orphans, refs
 from . import registry as ociregistry
 from .config import settings
 from .jobs import manager
@@ -69,11 +69,14 @@ async def lifespan(app: FastAPI):
             )
 
     evictor = asyncio.create_task(cachefs.eviction_loop())
+    docker_gc = asyncio.create_task(ocigc.gc_loop()) if settings.docker_enabled else None
     orphan_sweep = asyncio.create_task(orphans.orphan_loop())
     try:
         yield
     finally:
-        for task in (evictor, orphan_sweep):
+        for task in (evictor, orphan_sweep, docker_gc):
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task
