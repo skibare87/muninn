@@ -177,13 +177,32 @@ def _state_dir() -> Path:
     return d
 
 
-def load_pins() -> set[str]:
+class StateUnavailable(RuntimeError):
+    """A protection state file exists but could not be read.
+
+    The distinction that matters: an ABSENT file legitimately means "nothing is
+    protected"; an UNREADABLE one means "we do not know what is protected", and
+    those must not collapse to the same answer. Any caller that is about to
+    delete something has to treat this as a refusal, because the alternative is
+    a corrupt pins file silently making every pinned model evictable.
+    """
+
+
+def load_pins(strict: bool = False) -> set[str]:
+    """Pinned repo keys.
+
+    `strict=True` raises StateUnavailable rather than returning an empty set
+    when the file exists but cannot be parsed. Every destructive caller must
+    pass it.
+    """
     p = _state_dir() / _PINS_FILE
     if not p.is_file():
         return set()
     try:
         return set(json.loads(p.read_text()))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if strict:
+            raise StateUnavailable(f"pins file unreadable: {exc}") from exc
         log.warning("pins file unreadable, treating as empty", exc_info=True)
         return set()
 
@@ -206,14 +225,22 @@ def save_pins(pins: set[str]) -> None:
 # --------------------------------------------------------------------------
 
 
-def load_orphans() -> dict[str, dict]:
+def load_orphans(strict: bool = False) -> dict[str, dict]:
+    """Repos marked as deleted upstream. See load_pins for `strict`."""
     p = _state_dir() / _ORPHANS_FILE
     if not p.is_file():
         return {}
     try:
         data = json.loads(p.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        if not isinstance(data, dict):
+            if strict:
+                raise StateUnavailable("orphans file is not an object")
+            log.warning("orphans file is not an object, treating as empty")
+            return {}
+        return data
+    except (OSError, ValueError) as exc:
+        if strict:
+            raise StateUnavailable(f"orphans file unreadable: {exc}") from exc
         log.warning("orphans file unreadable, treating as empty", exc_info=True)
         return {}
 
@@ -225,12 +252,16 @@ def save_orphans(orphans: dict[str, dict]) -> None:
     tmp.replace(p)
 
 
-def protected_keys() -> set[str]:
+def protected_keys(strict: bool = False) -> set[str]:
     """Repo keys eviction must not touch: explicit pins, plus orphans when the
-    policy is to retain them."""
-    protected = load_pins()
+    policy is to retain them.
+
+    Pass `strict=True` from anything that deletes. An unreadable state file then
+    raises instead of quietly reporting that nothing is protected.
+    """
+    protected = load_pins(strict=strict)
     if settings.orphan_policy == "retain":
-        protected |= set(load_orphans())
+        protected |= set(load_orphans(strict=strict))
     return protected
 
 
@@ -365,9 +396,22 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
     failure mode for a fleet rollout -- better to run hot on disk than to evict
     the model every node is about to ask for.
     """
-    pins = load_pins()
-    orphans = load_orphans()
-    protected = protected_keys()
+    # strict: if we cannot read what is protected, we must not delete anything.
+    # Running hot on disk is recoverable; evicting a pinned model or a retained
+    # orphan is not -- for an orphan the copy here is the only one left.
+    try:
+        pins = load_pins(strict=True)
+        orphans = load_orphans(strict=True)
+        protected = protected_keys(strict=True)
+    except StateUnavailable as exc:
+        log.error("REFUSING TO EVICT: %s -- cannot tell what is protected", exc)
+        return {
+            "evicted": 0,
+            "freed_bytes": 0,
+            "reached_goal": False,
+            "refused": True,
+            "reason": str(exc),
+        }
     stats = disk_stats()
     capacity = stats["capacity"]
     low = int(capacity * settings.low_water)

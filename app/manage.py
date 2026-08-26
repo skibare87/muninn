@@ -281,7 +281,17 @@ async def delete_repo(req: DeleteRequest) -> dict:
     mistyped call.
     """
     key = cachefs.repo_key(req.repo_type, req.repo_id)
-    if key in cachefs.load_pins():
+    try:
+        current_pins = cachefs.load_pins(strict=True)
+    except cachefs.StateUnavailable as exc:
+        # Refuse rather than delete: an unreadable pins file means we cannot
+        # tell whether this repo is protected, and "unknown" must not be
+        # treated as "unpinned".
+        raise HTTPException(
+            status_code=503,
+            detail=f"cannot verify pins ({exc}); refusing to delete",
+        ) from exc
+    if key in current_pins:
         raise HTTPException(
             status_code=409,
             detail=f"{key} is pinned; DELETE /_cache/pins first (pins are absolute by design)",

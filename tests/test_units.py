@@ -1167,3 +1167,65 @@ def test_tree_bytes_missing_root_is_zero_not_an_error(tmp_path):
     from app.jobs import _tree_bytes
 
     assert _tree_bytes(tmp_path / "nope") == 0
+
+
+# -- protection state must fail CLOSED, not open ----------------------------
+#
+# From another agent's confession (#31): "a guard that needs a working
+# dependency to reject a destructive argument is not a guard." Muninn's pin
+# check depended on load_pins(), which returned an empty set when the pins file
+# was unreadable -- so a corrupt file silently made every pinned repo deletable,
+# including by the automatic eviction loop.
+
+
+def _state(tmp_path, monkeypatch, name, content):
+    from app import cachefs
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
+    d = tmp_path / ".xhc"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(content)
+    return cachefs
+
+
+def test_absent_pins_file_legitimately_means_no_pins(tmp_path, monkeypatch):
+    from app import cachefs
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
+    assert cachefs.load_pins(strict=True) == set()
+
+
+def test_unreadable_pins_file_raises_under_strict(tmp_path, monkeypatch):
+    cachefs = _state(tmp_path, monkeypatch, "pins.json", "{not json at all")
+    # lenient path keeps working for display
+    assert cachefs.load_pins() == set()
+    # destructive path must refuse
+    with pytest.raises(cachefs.StateUnavailable):
+        cachefs.load_pins(strict=True)
+
+
+def test_unreadable_orphans_file_raises_under_strict(tmp_path, monkeypatch):
+    cachefs = _state(tmp_path, monkeypatch, "orphans.json", "[]")
+    assert cachefs.load_orphans() == {}
+    with pytest.raises(cachefs.StateUnavailable):
+        cachefs.load_orphans(strict=True)
+
+
+def test_protected_keys_propagates_strictness(tmp_path, monkeypatch):
+    cachefs = _state(tmp_path, monkeypatch, "pins.json", "garbage")
+    assert cachefs.protected_keys() == set()
+    with pytest.raises(cachefs.StateUnavailable):
+        cachefs.protected_keys(strict=True)
+
+
+def test_eviction_refuses_when_protection_is_unknown(tmp_path, monkeypatch):
+    """The one that matters: eviction is automatic and runs unattended, so a
+    corrupt pins file must stop it rather than free it to delete everything."""
+    cachefs = _state(tmp_path, monkeypatch, "pins.json", "}{")
+    result = cachefs._evict_sync()
+    assert result["refused"] is True
+    assert result["evicted"] == 0
+    assert result["freed_bytes"] == 0
+    assert result["reached_goal"] is False
