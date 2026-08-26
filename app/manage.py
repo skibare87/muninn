@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import cachefs, orphans, policy, refs, viewer
+from . import build, cachefs, orphans, policy, refs, viewer
 from .config import XET_ENV_KEYS, settings
 from .jobs import manager
 
@@ -81,6 +81,7 @@ async def status() -> dict:
     jobs = manager.list()
     active = [j for j in jobs if j.state in ("pending", "running")]
     return {
+        "build": build.info(),
         "cache_dir": settings.cache_dir,
         "upstream": settings.upstream,
         "hf_token_present": bool(settings.hf_token),

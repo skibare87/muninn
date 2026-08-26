@@ -402,3 +402,34 @@ def test_no_v2_path_reaches_the_huggingface_catch_all(client):
     assert r.status_code == 404
     assert r.json()["errors"][0]["code"] == "NOT_FOUND"
     assert r.headers["docker-distribution-api-version"] == "registry/2.0"
+
+
+def test_a_manifest_we_hold_is_not_refetched_over_header_cosmetics(store):
+    """Found live: a freshly prewarmed tag still cost an upstream request on every
+    pull, because prewarm stored it under its own Accept fingerprint and the real
+    client advertised a different set. Fingerprint stays the fast path; media-type
+    compatibility is the fallback."""
+    body = b'{"schemaVersion":2,"manifests":[]}'
+    digest = ocistore.compute_digest(body)
+    media = "application/vnd.oci.image.index.v1+json"
+    ocistore.store_manifest("ghcr.io", digest, body, media)
+    stored_fp = ocistore.accept_fingerprint(f"{media},application/json")
+    ocistore.write_tag("ghcr.io", "org/img", "v1", stored_fp, digest, media)
+
+    # a client advertising a DIFFERENT set that still accepts this media type
+    other = f"{media},application/vnd.docker.distribution.manifest.v2+json"
+    assert ocistore.accept_fingerprint(other) != stored_fp, "fingerprints must differ for the test to mean anything"
+    assert ocistore.read_tag("ghcr.io", "org/img", "v1", ocistore.accept_fingerprint(other)) is None
+    found = ocistore.read_tag_compatible("ghcr.io", "org/img", "v1", other)
+    assert found and found["digest"] == digest
+
+
+def test_a_client_that_does_not_accept_the_stored_type_gets_nothing(store):
+    """The fallback must not serve a media type the client cannot handle."""
+    body = b'{"schemaVersion":2}'
+    digest = ocistore.compute_digest(body)
+    ocistore.store_manifest("ghcr.io", digest, body, "application/vnd.oci.image.index.v1+json")
+    ocistore.write_tag("ghcr.io", "org/img", "v1", "fp", digest,
+                       "application/vnd.oci.image.index.v1+json")
+    assert ocistore.read_tag_compatible(
+        "ghcr.io", "org/img", "v1", "application/vnd.docker.distribution.manifest.v1+json") is None

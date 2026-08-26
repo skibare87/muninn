@@ -334,6 +334,10 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
 
     accept_fp = ocistore.accept_fingerprint(accept)
     entry = ocistore.read_tag(ref.upstream, ref.repo, reference, accept_fp)
+    if entry is None:
+        # Exact fingerprint miss: fall back to any mapping whose media type this
+        # client accepts, rather than going upstream for a manifest we hold.
+        entry = ocistore.read_tag_compatible(ref.upstream, ref.repo, reference, accept)
 
     if entry and ocistore.tag_is_fresh(entry):
         held = ocistore.load_manifest(ref.upstream, entry["digest"])

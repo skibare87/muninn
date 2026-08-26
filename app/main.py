@@ -9,7 +9,18 @@ from pathlib import Path
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from . import cachefs, hfcompat, manage, metrics, ocicompat, ocigc, ocistore, orphans, refs
+from . import (
+    cachefs,
+    hfcompat,
+    manage,
+    metrics,
+    ocicompat,
+    ocigc,
+    ocimanage,
+    ocistore,
+    orphans,
+    refs,
+)
 from . import registry as ociregistry
 from .config import settings
 from .jobs import manager
@@ -160,6 +171,7 @@ app.include_router(manage.router)
 # Before hfcompat: /v2/* is the Docker surface and the HF catch-all would
 # otherwise swallow it.
 if settings.docker_enabled:
+    app.include_router(ocimanage.router)
     app.include_router(ocicompat.router)
 # Must be last: hfcompat owns the catch-all route.
 app.include_router(hfcompat.router)

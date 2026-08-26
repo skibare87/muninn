@@ -214,3 +214,102 @@ def test_capacity_pressure_drops_lru_tags_but_never_pinned_or_orphaned(store, mo
     assert f"{UP}/org/keep-pinned:v1" in remaining, "dropped a PINNED tag"
     assert f"{UP}/org/keep-orphan:v1" in remaining, "dropped a RETAINED ORPHAN"
     assert f"{UP}/org/droppable:v1" not in remaining
+
+
+# -- management API (phase 3) -----------------------------------------------
+
+
+@pytest.fixture
+def api(store):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app)
+
+
+def test_pin_roundtrip_and_listing(api, store):
+    _image("org/app", "v1", [b"L1"])
+    assert api.get("/_cache/docker/pins").json()["pins"] == []
+    api.post("/_cache/docker/pins", json={"image": f"{UP}/org/app:v1"})
+    assert api.get("/_cache/docker/pins").json()["pins"] == [f"{UP}/org/app:v1"]
+    imgs = api.get("/_cache/docker/images").json()["images"]
+    assert any(i["image"] == f"{UP}/org/app:v1" and i["pinned"] for i in imgs)
+    api.request("DELETE", "/_cache/docker/pins", json={"image": f"{UP}/org/app:v1"})
+    assert api.get("/_cache/docker/pins").json()["pins"] == []
+
+
+def test_evict_refuses_a_pinned_image(api, store):
+    """Pins are absolute; unpinning is the deliberate acceptance step."""
+    _image("org/app", "v1", [b"L1"])
+    api.post("/_cache/docker/pins", json={"image": f"{UP}/org/app:v1"})
+    r = api.request("DELETE", "/_cache/docker/images", json={"image": f"{UP}/org/app:v1"})
+    assert r.status_code == 409
+    assert ocigc.list_tags(), "the tag must still be there"
+
+
+def test_evict_drops_the_tag_and_gc_then_reclaims_its_blobs(api, store):
+    """Eviction is top-down: drop the tag, and the blobs go on the next sweep
+    once nothing references them."""
+    _, cfg, layers = _image("org/app", "v1", [b"L1", b"L2"])
+    assert api.request("DELETE", "/_cache/docker/images",
+                       json={"image": f"{UP}/org/app:v1"}).status_code == 200
+    assert ocigc.list_tags() == []
+    res = api.post("/_cache/docker/gc").json()
+    assert res["refused"] is False
+    assert not ocistore.blob_path(UP, cfg).exists()
+    for d in layers:
+        assert not ocistore.blob_path(UP, d).exists()
+
+
+def test_management_endpoints_refuse_when_protection_state_is_unreadable(api, store):
+    _image("org/app", "v1", [b"L1"])
+    (store / ".xhc").mkdir(parents=True, exist_ok=True)
+    (store / ".xhc" / "pins.json").write_text("}{")
+    assert api.get("/_cache/docker/pins").status_code == 503
+    assert api.get("/_cache/docker/images").status_code == 503
+    assert api.request("DELETE", "/_cache/docker/images",
+                       json={"image": f"{UP}/org/app:v1"}).status_code == 503
+    assert api.post("/_cache/docker/gc").json()["refused"] is True
+
+
+def test_gc_dry_run_changes_nothing(api, store):
+    _image("org/app", "v1", [b"L1"])
+    orphan = _blob(b"unreferenced")
+    res = api.post("/_cache/docker/gc?dry_run=true").json()
+    assert res["blobs"] == 1
+    assert ocistore.blob_path(UP, orphan).is_file(), "dry run must not delete"
+
+
+def test_prewarm_refuses_a_denied_registry(api, store, monkeypatch):
+    from app import policy as pol
+
+    monkeypatch.setattr(pol, "load_docker", lambda: {
+        "mode": "open", "registries": [], "allow": [], "deny": ["evil.io/*"],
+        "scope": "ingest", "max_blob_bytes": None, "deny_registries": ["evil.io"]})
+    r = api.post("/_cache/docker/prewarm", json={"image": "evil.io/org/img:v1"})
+    assert r.status_code == 403
+
+
+# -- build provenance (an internal issue) ----------------------------------------------
+
+
+def test_source_fingerprint_is_stable_and_changes_with_source(tmp_path, monkeypatch):
+    from app import build
+
+    a = build.source_fingerprint()
+    assert a == build.source_fingerprint(), "must be stable within a process"
+    assert len(a) == 64
+    build._cached = None
+    assert build.source_fingerprint() == a, "must be stable across recomputation"
+
+
+def test_build_info_does_not_claim_image_provenance():
+    """A container cannot know its own image digest -- the digest is of the image
+    containing the answer. Reporting one would be the adjacent measurement."""
+    from app import build
+
+    info = build.info()
+    assert "source_fingerprint" in info
+    assert info["image_ref"] is None or isinstance(info["image_ref"], str)
+    assert "docker inspect" in info["note"], "must point at the runtime for the image question"

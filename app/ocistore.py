@@ -170,6 +170,42 @@ def read_tag(upstream: str, repo: str, tag: str, accept_fp: str) -> dict | None:
         return None
 
 
+def read_tag_compatible(upstream: str, repo: str, tag: str, accept: str | None) -> dict | None:
+    """Find any stored mapping for this tag whose media type the client accepts.
+
+    Keying purely on an accept FINGERPRINT is too strict. Two clients that would
+    both happily take the same index can hash to different fingerprints simply
+    by advertising different sets, so a manifest fetched for one is a miss for
+    the other -- which showed up live as a freshly prewarmed tag still costing an
+    upstream request on every `docker pull`.
+
+    What actually matters is whether the client accepts the media type we hold.
+    Fingerprint stays the fast path; this is the fallback that stops a correct
+    cached manifest being thrown away over header cosmetics.
+    """
+    d = tag_path(upstream, repo, tag, "x").parent
+    if not d.is_dir():
+        return None
+    wanted = {t.split(";")[0].strip().lower() for t in (accept or "").split(",") if t.strip()}
+    prefix = f"{_safe(tag)}@"
+    best = None
+    for f in sorted(d.glob(f"{prefix}*.json")):
+        try:
+            entry = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not entry.get("digest"):
+            continue
+        media = (entry.get("media_type") or "").split(";")[0].strip().lower()
+        acceptable = not wanted or "*/*" in wanted or media in wanted
+        fresher = best is None or float(entry.get("checked_at") or 0) > float(
+            best.get("checked_at") or 0
+        )
+        if acceptable and fresher:   # prefer the freshest compatible mapping
+            best = entry
+    return best
+
+
 def write_tag(
     upstream: str, repo: str, tag: str, accept_fp: str, digest: str, media_type: str
 ) -> None:
