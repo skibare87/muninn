@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ log = logging.getLogger("xhc.jobs")
 
 JobState = Literal["pending", "running", "done", "error"]
 _HISTORY_LIMIT = 200
+_SNAPSHOT_SAMPLE_S = 5.0
 
 
 @dataclass
@@ -185,13 +187,31 @@ class JobManager:
                 if job.kind == "file":
                     path = await asyncio.to_thread(self._download_file, job)
                 else:
-                    path = await asyncio.to_thread(self._download_snapshot, job)
+                    # Sample the tree while it downloads. Without this a healthy
+                    # prewarm is indistinguishable from a stalled one -- the
+                    # failure direction that makes people intervene in a job that
+                    # is working. Measured once at 192 MB/s while every instrument
+                    # read zero.
+                    watcher = asyncio.create_task(self._watch_snapshot(job))
+                    try:
+                        path = await asyncio.to_thread(self._download_snapshot, job)
+                    finally:
+                        watcher.cancel()
                 job.result_path = str(path)
                 job.state = "done"
-                try:
-                    metrics.record_ingested(Path(path).stat().st_size)
-                except OSError:
-                    pass
+                # NB: for a snapshot, `path` is a DIRECTORY. stat().st_size on it
+                # returns the inode size (a few KB), not the tree -- so this used
+                # to report ~4 KB for a 126 GB prewarm, which is worse than
+                # reporting nothing because it looks like a real measurement.
+                if job.kind == "file":
+                    try:
+                        metrics.record_ingested(Path(path).stat().st_size)
+                    except OSError:
+                        pass
+                else:
+                    fetched = _tree_bytes(Path(path), since=job.started_at or 0)
+                    job.downloaded_bytes = fetched
+                    metrics.record_ingested(fetched)
                 log.info("ingest done %s in %.1fs", job.id, time.time() - (job.started_at or 0))
         except asyncio.CancelledError:
             job.state = "error"
@@ -226,6 +246,17 @@ class JobManager:
             )
         )
 
+    async def _watch_snapshot(self, job: Job) -> None:
+        """Keep job.downloaded_bytes roughly current while a snapshot runs."""
+        root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_type, job.repo_id)
+        started = job.started_at or time.time()
+        try:
+            while True:
+                await asyncio.sleep(_SNAPSHOT_SAMPLE_S)
+                job.downloaded_bytes = await asyncio.to_thread(_tree_bytes, root, started)
+        except asyncio.CancelledError:
+            raise
+
     def _download_snapshot(self, job: Job) -> Path:
         return Path(
             snapshot_download(
@@ -239,6 +270,33 @@ class JobManager:
                 max_workers=8,
             )
         )
+
+
+def _tree_bytes(root: Path, since: float = 0.0) -> int:
+    """Bytes under `root` that were written at or after `since`.
+
+    Symlinks are resolved, because the HF layout points snapshot entries at
+    blobs. The mtime filter is what makes this "ingested" rather than "present":
+    a snapshot that was already half-cached should not report the cached half as
+    freshly pulled. Deduplicated by inode, so two refs to one blob count once.
+    """
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    if not root.exists():
+        return 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))  # follows symlinks
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            if st.st_mtime >= since - 1:
+                total += st.st_size
+    return total
 
 
 manager = JobManager()

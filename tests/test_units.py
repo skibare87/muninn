@@ -1106,3 +1106,64 @@ def test_ds_store_and_load_roundtrip(tmp_path):
         assert viewer.stats()["entries"] == 2
     finally:
         settings.cache_dir = original
+
+
+# -- snapshot ingest accounting (an internal issue) ------------------------------------
+
+
+def test_tree_bytes_sums_files_not_the_directory_inode(tmp_path):
+    """The original bug: a snapshot job recorded Path(dir).stat().st_size, which
+    is the directory inode (a few KB) rather than the tree -- so a 126 GB prewarm
+    reported ~4 KB. A plausible-looking wrong number is worse than none."""
+    from app.jobs import _tree_bytes
+
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "a.bin").write_bytes(b"x" * 1000)
+    (tmp_path / "sub" / "b.bin").write_bytes(b"y" * 2500)
+
+    assert _tree_bytes(tmp_path) == 3500
+    # the thing the old code measured, for contrast
+    assert tmp_path.stat().st_size != 3500
+
+
+def test_tree_bytes_resolves_symlinks_and_dedupes_by_inode(tmp_path):
+    """The HF layout points snapshot entries at blobs via symlink, and two refs
+    to one blob must not be counted twice."""
+    from app.jobs import _tree_bytes
+
+    blobs = tmp_path / "blobs"
+    snap = tmp_path / "snapshots" / "abc"
+    blobs.mkdir()
+    snap.mkdir(parents=True)
+    (blobs / "deadbeef").write_bytes(b"z" * 4096)
+    (snap / "model.safetensors").symlink_to(blobs / "deadbeef")
+    (snap / "alias.safetensors").symlink_to(blobs / "deadbeef")
+
+    # one blob, three paths to it
+    assert _tree_bytes(tmp_path) == 4096
+
+
+def test_tree_bytes_since_excludes_already_cached_files(tmp_path):
+    """`ingested` must mean pulled, not present. A snapshot that was already
+    half-cached should not report the cached half as freshly fetched."""
+    import os
+    import time
+
+    from app.jobs import _tree_bytes
+
+    old = tmp_path / "old.bin"
+    old.write_bytes(b"o" * 5000)
+    long_ago = time.time() - 86400
+    os.utime(old, (long_ago, long_ago))
+
+    new = tmp_path / "new.bin"
+    new.write_bytes(b"n" * 700)
+
+    assert _tree_bytes(tmp_path) == 5700
+    assert _tree_bytes(tmp_path, since=time.time() - 60) == 700
+
+
+def test_tree_bytes_missing_root_is_zero_not_an_error(tmp_path):
+    from app.jobs import _tree_bytes
+
+    assert _tree_bytes(tmp_path / "nope") == 0
