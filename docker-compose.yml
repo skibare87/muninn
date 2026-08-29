@@ -1,7 +1,7 @@
 services:
   muninn:
     build: .
-    image: ghcr.io/skibare87/muninn:0.5.1
+    image: ghcr.io/skibare87/muninn:0.5.2
     container_name: muninn
     restart: unless-stopped
     ports:

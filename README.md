@@ -38,14 +38,14 @@ A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
 NAS does not need a toolchain:
 
 ```bash
-docker pull ghcr.io/skibare87/muninn:0.5.1
+docker pull ghcr.io/skibare87/muninn:0.5.2
 
 docker run -d --name muninn -p 8080:8080 \
   -v /mnt/nvme/hf-cache:/cache \
   -v /var/lib/muninn/xet:/xet \
   -e HF_TOKEN=hf_xxx \
   -e XHC_CACHE_MAX_SIZE=70T \
-  ghcr.io/skibare87/muninn:0.5.1
+  ghcr.io/skibare87/muninn:0.5.2
 ```
 
 Or from source, which is also how you get the compose file's full env set:
@@ -58,14 +58,14 @@ curl -s localhost:8080/_cache/status | jq
 
 To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
-`image: ghcr.io/skibare87/muninn:0.5.1`.
+`image: ghcr.io/skibare87/muninn:0.5.2`.
 
 **Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
 GitHub Actions on every version tag:
 
 | tag | meaning |
 |---|---|
-| `0.5.1` | immutable — **pin this on a fleet** |
+| `0.5.2` | immutable — **pin this on a fleet** |
 | `0.5` | latest patch in the 0.5 line; **moves** |
 | `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
