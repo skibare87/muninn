@@ -70,17 +70,31 @@ GitHub Actions on every version tag:
 | `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
 
-**Only the full `X.Y.Z` tag is immutable.** `X.Y` is not: tagging `v0.5.1`
-re-pointed `0.5` from the 0.5.0 image to the 0.5.1 one. `latest`, `0.5` and
-`edge` all give every node whatever was pushed last, with nothing to roll back
-to when a push goes wrong.
+**Only the full `X.Y.Z` tag is immutable.** `X.Y` is not — publishing a new
+patch re-points it, as `v0.5.1` did to `0.5` and `v0.5.2` did again an hour
+later. `latest`, `X.Y` and `edge` all give every node whatever was pushed last,
+with nothing to roll back to when a push goes wrong.
 
-For a deployment you genuinely cannot have move under you, pin the manifest
-digest instead of the tag:
+For a deployment you genuinely cannot have move under you, pin the **manifest
+digest of the image you actually deployed**:
 
 ```
-ghcr.io/skibare87/muninn@sha256:52fb7c1ae475d6c376268ebf6987c322ae5a502e4abb997e7633212dc741bb44
+ghcr.io/skibare87/muninn@sha256:<digest you pulled>
 ```
+
+Read it back from the running deployment rather than copying it from here:
+
+```bash
+docker inspect --format '{{index .RepoDigests 0}}' muninn
+```
+
+**This README deliberately does not print a concrete digest.** One was here
+briefly and was stale one release later, in the paragraph warning about exactly
+this. A digest in prose is a version pin wearing different clothes — and unlike
+a digest in a compose file, which fails loudly on the next pull, **nothing ever
+validates a digest in documentation.** It rots unread.
+
+Keep concrete digests where they get exercised.
 
 Point edge nodes at it:
 
