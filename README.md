@@ -38,14 +38,14 @@ A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
 NAS does not need a toolchain:
 
 ```bash
-docker pull ghcr.io/skibare87/muninn:0.4.0
+docker pull ghcr.io/skibare87/muninn:0.5.1
 
 docker run -d --name muninn -p 8080:8080 \
   -v /mnt/nvme/hf-cache:/cache \
   -v /var/lib/muninn/xet:/xet \
   -e HF_TOKEN=hf_xxx \
   -e XHC_CACHE_MAX_SIZE=70T \
-  ghcr.io/skibare87/muninn:0.4.0
+  ghcr.io/skibare87/muninn:0.5.1
 ```
 
 Or from source, which is also how you get the compose file's full env set:
@@ -58,19 +58,29 @@ curl -s localhost:8080/_cache/status | jq
 
 To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
-`image: ghcr.io/skibare87/muninn:0.4.0`.
+`image: ghcr.io/skibare87/muninn:0.5.1`.
 
 **Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
 GitHub Actions on every version tag:
 
 | tag | meaning |
 |---|---|
-| `0.4.0`, `0.4` | immutable release — **pin this on a fleet** |
-| `latest` | most recent tagged release; moves |
+| `0.5.1` | immutable — **pin this on a fleet** |
+| `0.5` | latest patch in the 0.5 line; **moves** |
+| `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
 
-Pin the version tag on edge nodes. `latest` and `edge` both give every node
-whatever was pushed last, with nothing to roll back to when a push goes wrong.
+**Only the full `X.Y.Z` tag is immutable.** `X.Y` is not: tagging `v0.5.1`
+re-pointed `0.5` from the 0.5.0 image to the 0.5.1 one. `latest`, `0.5` and
+`edge` all give every node whatever was pushed last, with nothing to roll back
+to when a push goes wrong.
+
+For a deployment you genuinely cannot have move under you, pin the manifest
+digest instead of the tag:
+
+```
+ghcr.io/skibare87/muninn@sha256:54a4197f1f2b03d65488caf1585fc3eaa9b144bef0a20988da94e1b58f986fd9
+```
 
 Point edge nodes at it:
 
@@ -301,6 +311,12 @@ muninn_bytes_ingested_total                  807
 
 Plus gauges for cache bytes, files, repos, capacity, free disk, active ingests,
 orphan count and bytes, scan duration, and ref lookups.
+
+`muninn_ingest_bytes_inflight` is the one worth knowing about: bytes fetched so
+far by ingests that are still running. Without it a healthy prewarm and a
+stalled one look identical on this endpoint — the count of active jobs stays 1
+either way. It rises while an ingest is making progress and goes flat when it
+is not.
 
 The `client` label comes from an optional `X-Muninn-Client` header a node can
 set. It is **attribution, not an audit trail** — it is self-reported, and a node
@@ -810,3 +826,40 @@ MIT — see [LICENSE](LICENSE).
   0.34.4; re-run the verification script after upgrading, or use `redirect`.
 - Not exercised: sustained multi-day load, and a real 100 GbE fabric (all
   throughput numbers above are loopback).
+
+### Two client-side limits that will bite a correct deployment
+
+Neither is a Muninn defect and neither can be fixed on the serving side. Both
+were found in production, and both look like a cache fault when they happen.
+
+- **A single file over ~46.6 GiB cannot be fetched over plain HTTP.**
+  `huggingface_hub` raises before it issues any request:
+
+  ```python
+  # file_download.py
+  elif expected_size and expected_size > constants.MAX_HTTP_DOWNLOAD_SIZE:
+      raise ValueError("The file is too large to be downloaded using the regular
+                        download method. Install `hf_xet` ...")
+  ```
+
+  `MAX_HTTP_DOWNLOAD_SIZE` is a bare module literal, `50 * 1000 * 1000 * 1000`
+  — **decimal, so the real ceiling is 46.57 GiB**, not the 50 the name implies.
+  There is no environment variable for it.
+
+  Muninn reports the true size on `HEAD` and always will: understating it would
+  make `huggingface_hub` reject or silently truncate the result, and a cache
+  whose value is that the bytes are the same bytes cannot make that trade.
+  Muninn serves arbitrary byte ranges, but that does not help — **the refusal
+  happens from metadata alone, before any `GET` is issued.**
+
+  Workaround: fetch that shard outside `snapshot_download` (an ordinary ranged
+  `GET` against Muninn, into the same cache layout) and let
+  `ignore_patterns` take the rest. Do **not** patch the constant: it guards
+  integrity on a path that genuinely cannot be trusted at that size.
+
+- **`HF_HUB_DOWNLOAD_TIMEOUT` defaults to 10 seconds, which is hostile to a
+  pull-through cache.** On a cold miss the first byte cannot arrive until the
+  upstream fetch begins, so **the first node to want a model — the one that is
+  supposed to pay the ingest cost — is the one that times out**, while every
+  later node is served from disk. Set it to `600` on edge nodes. A mid-transfer
+  drop on a large blob is recoverable: `huggingface_hub` resumes.
