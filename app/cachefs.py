@@ -30,6 +30,10 @@ _STATE_DIR = ".xhc"
 _PINS_FILE = "pins.json"
 _ORPHANS_FILE = "orphans.json"
 
+# Cache-root entries huggingface_hub creates and then warns it does not
+# recognise. Exact basenames only -- see the filter in get_view().
+_BENIGN_CACHE_ENTRIES = frozenset({"CACHEDIR.TAG", "version.txt", ".locks"})
+
 # scan_cache_dir() stats every blob, so its cost tracks FILE COUNT, not bytes.
 # Measured: ~36us/file, i.e. 0.55s for 15k files (80TB of large shards) but 12s
 # for 200k files (many small dataset shards at the same total size). A fixed TTL
@@ -331,9 +335,21 @@ def _scan_sync() -> CacheView:
             )
         )
     repos.sort(key=lambda r: r.size_on_disk, reverse=True)
-    # scan_cache_dir flags any directory it does not recognise, including our
-    # own state dir. Drop that one so real warnings stay visible.
-    warnings = [str(w) for w in info.warnings if f"/{_STATE_DIR}" not in str(w)]
+    # scan_cache_dir flags any entry it does not recognise, including our own
+    # state dir and huggingface_hub's OWN cache metadata files, which it creates
+    # itself and then warns about on every scan. Drop the known-benign ones so
+    # REAL warnings stay visible -- an operator who learns that this list is
+    # always noisy stops reading it, which is the same as not having it.
+    #
+    # Matched by exact basename, never by pattern: a broad filter would hide a
+    # genuinely unrecognised entry, and the whole point of this list is the
+    # entries nobody anticipated.
+    warnings = [
+        str(w)
+        for w in info.warnings
+        if f"/{_STATE_DIR}" not in str(w)
+        and not any(str(w).rstrip().endswith(f"/{n}") for n in _BENIGN_CACHE_ENTRIES)
+    ]
     duration = time.time() - started
     view = CacheView(
         scanned_at=time.time(),

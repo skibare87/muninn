@@ -1293,3 +1293,38 @@ def test_uncalled_method_would_have_raised():
     job.state = "running"
     with pytest.raises(TypeError):
         sum(job.downloaded_bytes or 0 for _ in (job,))   # the old expression
+
+
+# -- scan warnings must stay signal, not noise ---------------------------------
+#
+# scan_cache_dir() warns about cache-root entries it does not recognise --
+# including CACHEDIR.TAG and version.txt, which huggingface_hub CREATES ITSELF.
+# Those fired on every scan. An operator who learns the warning list is always
+# noisy stops reading it, which is the same as not having one.
+#
+# Filtered by EXACT BASENAME, never by pattern: a broad filter would hide a
+# genuinely unrecognised entry, and unanticipated entries are the whole point.
+
+
+def test_benign_cache_entries_are_filtered_but_real_warnings_survive():
+    from app.cachefs import _BENIGN_CACHE_ENTRIES, _STATE_DIR
+
+    def keep(w: str) -> bool:
+        return f"/{_STATE_DIR}" not in w and not any(
+            w.rstrip().endswith(f"/{n}") for n in _BENIGN_CACHE_ENTRIES
+        )
+
+    # Noise huggingface_hub generates about its own bookkeeping.
+    assert not keep("Repo path is not a directory: /cache/CACHEDIR.TAG")
+    assert not keep("Repo path is not a directory: /cache/version.txt")
+    assert not keep(f"Repo path is not a directory: /cache/{_STATE_DIR}")
+
+    # Real findings that must NEVER be filtered. The first is a genuinely
+    # broken repo -- a directory with no snapshots -- and six of them were live
+    # on the production cache when this filter was written.
+    assert keep("Snapshots dir doesn't exist in cached repo: /cache/models--a--b/snapshots")
+    assert keep("Repo path is not a directory: /cache/something-nobody-anticipated")
+
+    # Substring must not be enough: a repo that merely CONTAINS a benign name
+    # is still a real warning.
+    assert keep("Repo path is not a directory: /cache/models--org--CACHEDIR.TAG-lookalike")
