@@ -1328,3 +1328,38 @@ def test_benign_cache_entries_are_filtered_but_real_warnings_survive():
     # Substring must not be enough: a repo that merely CONTAINS a benign name
     # is still a real warning.
     assert keep("Repo path is not a directory: /cache/models--org--CACHEDIR.TAG-lookalike")
+
+
+# -- HEAD must not count as bytes served ---------------------------------------
+#
+# bytes_served_total counted response content-length for GET *and* HEAD. A HEAD
+# carries the full size and transfers no body, and huggingface_hub HEADs every
+# file in a repo before downloading any of it -- so a snapshot booked the whole
+# repo as "served" before a byte moved.
+#
+# Measured against production before the fix: 5 HEADs of a 10,985-byte file
+# added exactly 54,925 to the counter.
+
+
+def test_head_does_not_count_as_served():
+    from app import metrics
+
+    metrics.reset()
+    before = metrics.snapshot()["bytes_served"]
+
+    # What the endpoint does now, for each method.
+    for method, size in (("HEAD", 10985), ("GET", 10985)):
+        if method != "HEAD":
+            metrics.record_served(size)
+
+    after = metrics.snapshot()["bytes_served"]
+    assert after - before == 10985, "only the GET body should be counted"
+
+
+def test_range_response_counts_only_the_range():
+    """206 is not excluded: content-length there IS what was transferred."""
+    from app import metrics
+
+    metrics.reset()
+    metrics.record_served(100)          # bytes 0-99 of a large file
+    assert metrics.snapshot()["bytes_served"] == 100

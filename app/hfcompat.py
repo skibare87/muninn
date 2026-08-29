@@ -420,10 +420,21 @@ async def catch_all(full_path: str, request: Request) -> Response:
             response.headers.get("x-xhc-cache", str(response.status_code)),
             request.headers.get("x-muninn-client"),
         )
-        try:
-            metrics.record_served(int(response.headers.get("content-length", 0)))
-        except (TypeError, ValueError):
-            pass
+        # HEAD carries the full content-length and transfers NO BODY. Counting
+        # it inflated bytes_served_total by one whole file size per metadata
+        # probe -- and huggingface_hub HEADs every file in a repo before
+        # downloading any of it, so a 419-file snapshot booked the entire repo
+        # as "served" before a byte moved. Measured: 5 HEADs of a 10,985 B file
+        # added exactly 54,925. Every historical served figure from this cache
+        # is inflated by the metadata traffic that preceded the transfers.
+        #
+        # 206 is NOT excluded: there content-length is the range length, which
+        # is exactly what was sent.
+        if request.method != "HEAD":
+            try:
+                metrics.record_served(int(response.headers.get("content-length", 0)))
+            except (TypeError, ValueError):
+                pass
         return response
 
     # Repo info is the one metadata endpoint we can honestly answer ourselves,

@@ -294,6 +294,31 @@ The service also degrades safely: if it can't find the partial file (the
 between versions), it falls back to `wait` semantics rather than serving
 garbage.
 
+### Only `/healthz` is a health endpoint
+
+Muninn is a transparent pull-through proxy: **everything that is not `/v2/*` or
+`/_cache/*` is forwarded to Hugging Face.** So any other plausible-looking health
+path returns whatever the Hub returns for it — and the Hub returns `200` for a
+lot of things:
+
+```
+/healthz       200   {"ok":true,"free_bytes":...}   <- ours
+/health        404   52 KB of Hub HTML
+/healthcheck   200   74 KB of Hub HTML              <- reads as healthy, always
+/status        200   73 KB of Hub HTML              <- reads as healthy, always
+```
+
+**A monitor pointed at `/healthcheck` or `/status` will report green forever**,
+including through a total Muninn failure, because it is measuring the Hub's
+availability rather than the cache's. This cannot be fixed by shadowing those
+paths — the set of URLs the Hub answers is not enumerable, and shadowing them
+would break the transparency the cache depends on.
+
+**Check the body, not the status code.** `/healthz` returns JSON with `ok` and
+`free_bytes`; a check that asserts `ok == true` cannot be satisfied by a proxied
+HTML page. A status-code-only probe against this service is meaningless on any
+path but `/healthz`.
+
 ## Metrics
 
 `GET /metrics` exposes Prometheus text format. Unauthenticated by design: it
