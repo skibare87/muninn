@@ -1229,3 +1229,67 @@ def test_eviction_refuses_when_protection_is_unknown(tmp_path, monkeypatch):
     assert result["evicted"] == 0
     assert result["freed_bytes"] == 0
     assert result["reached_goal"] is False
+
+
+# -- /metrics must survive a RUNNING ingest job -------------------------------
+#
+# an internal issue. muninn_ingest_bytes_inflight summed `j.downloaded_bytes or 0`, but
+# downloaded_bytes is a METHOD. Uncalled it is a truthy bound method, so `or 0`
+# never fires and sum() raises TypeError: int + method.
+#
+# THE GENERATOR IS GUARDED BY `if j.state == "running"`. With no running job it
+# is empty, sum() returns 0, and the endpoint is fine. So the bug was
+# unreachable in every test and every idle scrape, and fired only while an
+# ingest was actually in flight -- the endpoint was healthy whenever it had
+# nothing to report and 500'd exactly when someone would look at it.
+#
+# Compounding it, three places ASSIGNED an int to job.downloaded_bytes, which
+# shadows the method on the instance. That made its type depend on whether the
+# snapshot watcher had ticked yet, and made to_dict() raise "'int' object is
+# not callable" on a finished snapshot job.
+#
+# These tests fail against the old code and pass against the fix.
+
+
+def test_downloaded_bytes_is_never_shadowed_by_an_attribute():
+    """The method must stay a method through the whole job lifecycle."""
+    from app.jobs import Job
+
+    job = Job(id="j1", kind="snapshot", repo_type="model", repo_id="a/b", revision="main")
+    assert callable(job.downloaded_bytes), "fresh job: downloaded_bytes must be a method"
+    assert job.downloaded_bytes() is None
+
+    # What the watcher and the completion path do now.
+    job.final_bytes = 4096
+    assert callable(job.downloaded_bytes), "after progress: still a method"
+    assert job.downloaded_bytes() == 4096
+
+    job.state = "done"
+    assert job.to_dict()["downloaded_bytes"] == 4096
+
+
+def test_inflight_gauge_sums_ints_not_methods():
+    """The exact expression from main.py, against a RUNNING job."""
+    from app.jobs import Job
+
+    running = Job(id="j2", kind="file", repo_type="model", repo_id="a/b", revision="main")
+    running.state = "running"          # a file job: no watcher ever assigns
+    idle = Job(id="j3", kind="file", repo_type="model", repo_id="c/d", revision="main")
+
+    total = sum((j.downloaded_bytes() or 0) for j in (running, idle) if j.state == "running")
+    assert isinstance(total, int)
+    assert total == 0
+
+    running.final_bytes = 1234
+    total = sum((j.downloaded_bytes() or 0) for j in (running, idle) if j.state == "running")
+    assert total == 1234
+
+
+def test_uncalled_method_would_have_raised():
+    """Pin the ACTUAL defect, so nobody reintroduces it thinking it was harmless."""
+    from app.jobs import Job
+
+    job = Job(id="j4", kind="file", repo_type="model", repo_id="a/b", revision="main")
+    job.state = "running"
+    with pytest.raises(TypeError):
+        sum(job.downloaded_bytes or 0 for _ in (job,))   # the old expression

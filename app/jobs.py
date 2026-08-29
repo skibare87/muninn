@@ -53,6 +53,11 @@ class Job:
     # Set once we know where the in-flight bytes are landing, so a `stream`
     # miss-policy request can tail-follow it.
     incomplete_path: str | None = None
+    # Final measured size for a SNAPSHOT job, set once the tree walk completes.
+    # A separate field on purpose: assigning to `downloaded_bytes` shadowed the
+    # METHOD of the same name on the instance, so a completed snapshot job made
+    # to_dict() raise "'int' object is not callable". See an internal issue.
+    final_bytes: int | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
@@ -63,7 +68,10 @@ class Job:
         return f"snap:{self.repo_type}:{self.repo_id}:{self.revision}:{pats}"
 
     def downloaded_bytes(self) -> int | None:
-        """Best-effort progress for file jobs, from the .incomplete file."""
+        """Best-effort progress. Never assign to this name -- it is a method, and
+        an instance attribute of the same name shadows it (an internal issue)."""
+        if self.final_bytes is not None:
+            return self.final_bytes
         if self.state == "done" and self.expected_size is not None:
             return self.expected_size
         if not self.incomplete_path:
@@ -210,7 +218,7 @@ class JobManager:
                         pass
                 else:
                     fetched = _tree_bytes(Path(path), since=job.started_at or 0)
-                    job.downloaded_bytes = fetched
+                    job.final_bytes = fetched
                     metrics.record_ingested(fetched)
                 log.info("ingest done %s in %.1fs", job.id, time.time() - (job.started_at or 0))
         except asyncio.CancelledError:
@@ -247,13 +255,22 @@ class JobManager:
         )
 
     async def _watch_snapshot(self, job: Job) -> None:
-        """Keep job.downloaded_bytes roughly current while a snapshot runs."""
+        """Keep job.final_bytes roughly current while a snapshot runs.
+
+        NEVER assign to `downloaded_bytes` here: it is a method, and an instance
+        attribute of that name shadows it. This assignment used to make the type
+        of job.downloaded_bytes depend on WHETHER THE WATCHER HAD TICKED YET --
+        a bound method for the first ~5s of a snapshot job, an int afterwards,
+        and a method forever for a file job, which has no watcher at all. That
+        is why /metrics 500'd for the whole life of a file ingest but only
+        briefly for a snapshot one. an internal issue.
+        """
         root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_type, job.repo_id)
         started = job.started_at or time.time()
         try:
             while True:
                 await asyncio.sleep(_SNAPSHOT_SAMPLE_S)
-                job.downloaded_bytes = await asyncio.to_thread(_tree_bytes, root, started)
+                job.final_bytes = await asyncio.to_thread(_tree_bytes, root, started)
         except asyncio.CancelledError:
             raise
 

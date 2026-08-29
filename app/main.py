@@ -137,8 +137,13 @@ async def prometheus_metrics() -> Response:
         "muninn_ingest_jobs_active": sum(1 for j in jobs if j.state in ("pending", "running")),
         # Bytes fetched by in-flight ingests. Without this a running prewarm and
         # a stalled one look identical on this endpoint (an internal issue).
+        # downloaded_bytes is a METHOD. Uncalled it is a truthy bound method, so
+        # `or 0` never fires and sum() raises TypeError -- but ONLY when a job is
+        # actually running, because the generator is otherwise empty. The endpoint
+        # was healthy whenever it had nothing to report and 500'd exactly when a
+        # human would look at it. an internal issue.
         "muninn_ingest_bytes_inflight": sum(
-            j.downloaded_bytes or 0 for j in jobs if j.state == "running"
+            (j.downloaded_bytes() or 0) for j in jobs if j.state == "running"
         ),
         "muninn_orphans": len(orphan_state),
         "muninn_orphan_bytes": sum(o.get("size_on_disk", 0) for o in orphan_state.values()),
