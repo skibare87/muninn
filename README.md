@@ -79,7 +79,7 @@ For a deployment you genuinely cannot have move under you, pin the manifest
 digest instead of the tag:
 
 ```
-ghcr.io/skibare87/muninn@sha256:54a4197f1f2b03d65488caf1585fc3eaa9b144bef0a20988da94e1b58f986fd9
+ghcr.io/skibare87/muninn@sha256:52fb7c1ae475d6c376268ebf6987c322ae5a502e4abb997e7633212dc741bb44
 ```
 
 Point edge nodes at it:
