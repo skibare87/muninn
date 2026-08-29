@@ -36,8 +36,29 @@ ENV HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY=1
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:8080/healthz || exit 1
+# Checks BOTH the liveness endpoint and the observability surface.
+#
+# /healthz alone reported "Up 2 days (healthy)" through a total /metrics outage
+# (an internal issue): /metrics returned 500 for the entire duration of every ingest, and
+# nothing in the container's own health signal noticed. A healthcheck that does
+# not exercise the observability surface will report green through its complete
+# failure.
+#
+# The objection to including it -- that a metrics bug becomes a restart loop --
+# does not hold for plain docker/compose: HEALTHCHECK marks a container
+# unhealthy, it does not restart it. An orchestrator configured to act on health
+# will act, and that is correct: a cache whose operation is judged entirely by
+# its metrics IS degraded when it cannot report them.
+#
+# Cost is bounded: /metrics reads the TTL-cached cache view (adaptive, ~30 s),
+# so a 30 s healthcheck does not add a filesystem scan per probe.
+#
+# Contributed by FLEET, who hit the outage and fixed it in their deployment
+# first rather than waiting for upstream.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/healthz \
+     && curl -fsS -o /dev/null http://localhost:8080/metrics \
+     || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
      "--timeout-keep-alive", "75", "--no-access-log"]
