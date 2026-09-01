@@ -9,6 +9,41 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.6.2 — 2026-09-01
+
+XHC_REGISTRY_AUTH_FILE now actually works. It never had.
+
+Muninn loaded the mounted docker credentials, logged them at startup, held them
+in memory, and never sent them. `_basic_for()` -- the function that turns the
+auth file into an Authorization header -- was reachable from exactly one place:
+authenticating to a bearer TOKEN ENDPOINT. No code path put
+`Authorization: Basic` on a registry request, so a registry speaking plain Basic
+with no token endpoint could never be authenticated to at all.
+
+0.6.1 stopped Basic challenges from wrongly entering the bearer dance and then
+gave up, on the false premise that a Basic challenge was not satisfiable. It is:
+the credentials are right there.
+
+On a 401 whose scheme is Basic, Muninn now retries once with the credentials
+configured for that upstream. Challenge-response rather than preemptive, so an
+auth file cannot leak credentials to a registry that never asked for them. With
+no credentials for that upstream, the registry's own 401 is handed back rather
+than an invented answer.
+
+Verified end-to-end against a real private registry: 401 on 0.6.1, 200 with this
+change, same credential file.
+
+WHAT THIS IS NOT. Muninn authenticates as ITSELF, using credentials the operator
+mounts -- `docker login` on the cache host. It does not forward a client's
+Authorization header upstream, and it never will: a cached hit consults no
+credentials at all, so per-client authorization would be enforced on the miss
+and silently absent on every hit after it. Anything that can reach the cache can
+pull anything the cache holds. That is the trust model, deliberately.
+
+Known: every request to a Basic upstream now costs a 401 and a retry.
+Remembering the scheme per upstream is a separate change.
+
+
 ## v0.6.1 — 2026-09-01
 
 A Basic auth challenge is no longer mistaken for a Bearer one.
