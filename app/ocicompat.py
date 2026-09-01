@@ -57,6 +57,82 @@ def _err(status: int, code: str, message: str, headers: dict | None = None) -> J
     )
 
 
+def _unavailable(ref: registry.Ref, upstream_status: int | None,
+                 reference: str, kind: str) -> JSONResponse:
+    """Terminal answer when upstream would not serve and nothing is cached.
+
+    THREE DISTINCT STATES used to render as one 404 MANIFEST_UNKNOWN, and they
+    have three different fixes and potentially three different owners:
+
+        upstream 401, no credentials configured  -> docker login on the host
+        upstream 401, credentials rejected       -> wrong/expired/unscoped creds
+        upstream 404                             -> genuinely not there
+
+    The second only became reachable in v0.6.2. Before that nothing was ever
+    sent, so every 401 was the first case.
+
+    STATUS CODES, DECIDED BY MEASUREMENT RATHER THAN BY SEMANTICS:
+
+      404 -> genuinely absent. Correct, and the client can act on it.
+      502 -> the CACHE could not authenticate to upstream. Muninn is a gateway
+             and did not obtain a valid response from it.
+      401 -> RESERVED for Muninn's own client-facing auth (an internal issue). Never used
+             for an upstream failure, because "authenticate to the cache" and
+             "the cache cannot authenticate upstream" are different actors with
+             different fixes.
+
+    THE DOCKER CLI DISCARDS THE BODY AND HEADERS AND PRINTS ONLY THE STATUS, so
+    a 404 carrying a perfect explanation is invisible to the person running the
+    pull. Measured against docker 29.5.1:
+
+      404 -> "not found"                              <- the status is ERASED
+      401 -> "unexpected status ...: 401 Unauthorized"
+      502 -> "unexpected status ...: 502 Bad Gateway"
+      403 -> "unexpected status ...: 403 Forbidden"
+
+    404 is the only status that hides itself. That is why an auth failure must
+    not wear one -- a colleague hit exactly this, read "not found", and went looking
+    for a missing image on a registry they could see the image in.
+
+    Their stated objection to 502 -- that it might trigger client retry with
+    backoff where 404 fails fast -- was measured and does not occur: 404, 401
+    and 502 all fail in ~32ms.
+
+    This never emits a WWW-Authenticate, and upstream's own is deliberately not
+    forwarded: it points at a realm Muninn does not proxy, which is a retry loop
+    with no exit, and after an internal issue it would be indistinguishable from Muninn's
+    own challenge. An error is a routing instruction for whoever reads it next
+    (a colleague, an internal issue).
+
+    Only reached with nothing cached. The fail-open path is untouched: while a
+    copy is held, an upstream 401 or 404 still serves it, because losing it the
+    moment upstream stops answering is the irreversible loss orphan retention
+    exists to prevent.
+    """
+    unknown = "MANIFEST_UNKNOWN" if kind == "manifest" else "BLOB_UNKNOWN"
+    if upstream_status != 401:
+        return _err(404, unknown, f"{kind} {reference} not available",
+                    {"x-xhc-upstream-status": str(upstream_status or "none"),
+                     "x-xhc-upstream-auth": "n/a"})
+
+    configured = registry.has_credentials(ref.upstream)
+    metrics.record_docker("UPSTREAM_AUTH", kind)
+    if configured:
+        detail = (f"{ref.upstream} rejected the credentials this cache holds for it. "
+                  "They are wrong, expired, or lack scope for this repository. "
+                  "Re-authenticate on the cache host.")
+        state = "rejected"
+    else:
+        detail = (f"this cache is not authenticated to {ref.upstream} and holds no "
+                  f"copy of {reference}. Run `docker login {ref.upstream}` on the "
+                  "cache host and mount its config.json via XHC_REGISTRY_AUTH_FILE. "
+                  "Muninn authenticates as itself; it does not forward your "
+                  "credentials upstream.")
+        state = "unconfigured"
+    return _err(502, "UNAVAILABLE", detail,
+                {"x-xhc-upstream-status": "401", "x-xhc-upstream-auth": state})
+
+
 def _denied(reason: str, kind: str) -> JSONResponse:
     metrics.record_docker("DENIED", kind)
     # Deliberately NOT a registry auth error: answering 401 here would send
@@ -204,11 +280,12 @@ async def _ensure_blob(ref: registry.Ref, digest: str) -> BlobJob:
 
     metrics.record_docker_upstream(ref.upstream, resp.status_code)
     if resp.status_code != 200:
+        # Deliberately NOT forwarding upstream's www-authenticate. It invites the
+        # client to authenticate against a realm Muninn does not proxy and cannot
+        # satisfy -- a retry loop with no exit -- and once Muninn has client-facing
+        # auth of its own (an internal issue) a forwarded challenge is indistinguishable from
+        # Muninn's own. The diagnosis goes in headers a human reads instead.
         hdrs = {}
-        if resp.status_code == 401 and "www-authenticate" in resp.headers:
-            # No usable credentials for this registry: hand the client the
-            # registry's own challenge rather than inventing an answer.
-            hdrs["www-authenticate"] = resp.headers["www-authenticate"]
         await resp.aclose()
         await _abandon(
             UpstreamError(resp.status_code, f"upstream returned {resp.status_code}", hdrs)
@@ -253,7 +330,13 @@ def _resolve_or_error(name: str):
         return None, _err(400, "NAME_INVALID", str(exc))
 
 
-async def _revalidate_tag(ref: registry.Ref, tag: str, accept: str | None, accept_fp: str):
+async def _revalidate_tag(
+    ref: registry.Ref,
+    tag: str,
+    accept: str | None,
+    accept_fp: str,
+    out: dict | None = None,
+):
     """Fetch the current tag->digest mapping, storing the manifest if it moved.
 
     Fails OPEN: unreachable, rate-limited, 401 or 404 upstream all mean keep
@@ -269,6 +352,8 @@ async def _revalidate_tag(ref: registry.Ref, tag: str, accept: str | None, accep
         log.info("tag revalidation failed for %s:%s (%s) -- serving cached", ref.key, tag, exc)
         return None
     metrics.record_docker_upstream(ref.upstream, r.status_code)
+    if out is not None:
+        out["status"] = r.status_code
     if r.status_code != 200:
         log.info(
             "tag revalidation got %s for %s:%s -- serving cached if held",
@@ -318,6 +403,12 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
     if not verdict.allowed and enforce_on_hit:
         return _denied(verdict.reason, "manifest")
 
+    # Carries the upstream status out of _revalidate_tag, which otherwise
+    # returns a bare None for every non-200 and discards WHY. Bound here rather
+    # than at either call site so the terminal answer at the end of the function
+    # cannot read an unbound name on a path that never revalidated.
+    up: dict = {}
+
     # A digest reference is immutable: never revalidated, at zero cost.
     if ocistore.DIGEST_RE.match(reference):
         held = ocistore.load_manifest(ref.upstream, reference)
@@ -326,9 +417,9 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             return _manifest_response(held, head)
         if not verdict.allowed:
             return _denied(verdict.reason, "manifest")
-        fetched = await _revalidate_tag(ref, reference, accept, "immutable")
+        fetched = await _revalidate_tag(ref, reference, accept, "immutable", up)
         if fetched is None:
-            return _err(404, "MANIFEST_UNKNOWN", f"manifest {reference} not available")
+            return _unavailable(ref, up.get("status"), reference, "manifest")
         metrics.record_docker("MISS", "manifest")
         return _manifest_response(fetched, head)
 
@@ -357,7 +448,7 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             if held is not None:
                 metrics.record_docker("HIT", "manifest")
                 return _manifest_response(held, head)
-        fresh = await _revalidate_tag(ref, reference, accept, accept_fp)
+        fresh = await _revalidate_tag(ref, reference, accept, accept_fp, up)
 
     if fresh is not None:
         metrics.record_docker("MISS", "manifest")
@@ -375,7 +466,7 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             ocigc.mark_orphan(ref.upstream, ref.repo, reference)
             metrics.record_docker("RETAINED", "manifest")
             return _manifest_response(held, head)
-    return _err(404, "MANIFEST_UNKNOWN", f"manifest {reference} not available")
+    return _unavailable(ref, up.get("status"), reference, "manifest")
 
 
 @router.api_route("/v2/{name:path}/blobs/{digest}", methods=["GET", "HEAD"])
@@ -417,7 +508,7 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         if exc.status == 404:
             return _err(404, "BLOB_UNKNOWN", f"blob {digest} not found upstream")
         if exc.status == 401:
-            return _err(401, "UNAUTHORIZED", exc.message, exc.headers)
+            return _unavailable(ref, 401, digest, "blob")
         return _err(502, "UNAVAILABLE", exc.message)
     except httpx.HTTPError as exc:
         metrics.record_docker_upstream(ref.upstream, None)

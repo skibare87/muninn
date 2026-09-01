@@ -145,6 +145,17 @@ def reset_credentials() -> None:
     _creds_cache = None
 
 
+def has_credentials(upstream: str) -> bool:
+    """Whether credentials are configured for this upstream.
+
+    Public because ocicompat needs it to tell "the cache is not logged in to
+    that registry" from "the credentials it has were rejected". Those have
+    different fixes and different owners, and before an internal issue both rendered as
+    404 MANIFEST_UNKNOWN along with "genuinely not there".
+    """
+    return _basic_for(upstream) is not None
+
+
 def _basic_for(upstream: str) -> str | None:
     creds = _load_credentials().get(upstream)
     return base64.b64encode(creds.encode()).decode() if creds else None
