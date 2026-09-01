@@ -386,6 +386,15 @@ garbage.
 
 ### Only `/healthz` is a health endpoint
 
+> **The `/healthz` response body is part of the contract, not an implementation
+> detail.** It returns `{"ok": true, "free_bytes": N}`, and blackbox probes
+> commonly match on the body rather than only the status — a 200 with a broken
+> cache underneath is exactly what such a probe exists to catch. Changing the
+> shape silently stops those probes alarming, and **an alert that stops firing
+> looks identical to one that has nothing to report.** Treat it as a stable
+> interface.
+
+
 Muninn is a transparent pull-through proxy: **everything that is not `/v2/*` or
 `/_cache/*` is forwarded to Hugging Face.** So any other plausible-looking health
 path returns whatever the Hub returns for it — and the Hub returns `200` for a
