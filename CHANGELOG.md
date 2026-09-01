@@ -9,6 +9,55 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.7.0 — 2026-09-01
+
+Optional client auth on the pull surface. OFF BY DEFAULT.
+
+  XHC_DOCKER_AUTH=basic
+  XHC_DOCKER_HTPASSWD=/auth/htpasswd     (bcrypt only; htpasswd -B)
+
+Then `docker login <cache-host>` works as usual. XHC_DOCKER_AUTH previously
+existed as a knob that was parsed, validated to reject anything but none|basic,
+and read by no code path -- a validating no-op reads as implemented. It is now
+implemented.
+
+IT IS A GATE, NOT PER-CLIENT ISOLATION, and it will not pretend otherwise.
+Everyone who authenticates sees everything the cache holds. A cached hit
+consults no credentials at all: it checks the fleet-wide policy and serves off
+disk, and the store is keyed by upstream, repo and digest with no principal in
+it. Any scheme promising "A cannot read what B pulled" would be enforced on the
+miss and silently absent on every hit after it, and be false from the first
+cache fill.
+
+Per-host credentials rather than one shared secret, because a `docker pull`
+cannot send an identifying header and the OCI path records no principal --
+credentials are the only mechanism by which a cache can know which node pulled
+what. A shared secret does not defer that, it forecloses it.
+
+FAILS CLOSED. `basic` with a missing, unreadable, empty or non-bcrypt htpasswd
+file refuses to start. An absent config means no auth was asked for; an
+unreadable one when it was is UNKNOWN, and resolving unknown to permissive is
+how a cache silently reopens itself. Distribute credentials first, then enable.
+
+bcrypt only. Apache's other htpasswd formats are unsalted or broken, and
+accepting one silently would make a weak file look configured.
+
+GATES /v2/* AND NOTHING ELSE. /healthz and /metrics stay unauthenticated by
+design; /_cache keeps its own XHC_MANAGE_TOKEN and is not opened by a pull
+credential. That boundary is asserted by test, and it is the advantage over a
+blanket reverse-proxy rule, which swallows the health endpoints unless carved
+out by hand.
+
+A Muninn 401 carries WWW-Authenticate: Basic realm="muninn". An upstream auth
+failure is a 502 with x-xhc-upstream-auth and never a challenge, so the two are
+distinguishable from outside without reading a body.
+
+Unknown usernames are compared against a dummy hash, so a bad username and a bad
+password cost the same time and latency cannot enumerate valid names.
+
+New runtime dependency: bcrypt==5.0.0.
+
+
 ## v0.6.3 — 2026-09-01
 
 An upstream auth failure no longer says "not found".
