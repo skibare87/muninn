@@ -56,7 +56,7 @@ def annotation(tag: str) -> tuple[str, str]:
     # Drop a leading repetition of the version -- `git tag -a v0.6.0 -m "v0.6.0\n\n..."`
     # is a natural way to write one and renders as a duplicated heading here.
     # Matches with or without the leading v.
-    body = re.sub(r"^v?%s\s*\n+" % re.escape(tag.lstrip("v")), "", body)
+    body = re.sub(rf"^v?{re.escape(tag.lstrip('v'))}\s*\n+", "", body)
     body = body.split("-----BEGIN PGP SIGNATURE-----")[0].strip()
     return date, body
 
