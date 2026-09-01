@@ -38,14 +38,14 @@ A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
 NAS does not need a toolchain:
 
 ```bash
-docker pull ghcr.io/skibare87/muninn:0.5.3
+docker pull ghcr.io/skibare87/muninn:0.6.0
 
 docker run -d --name muninn -p 8080:8080 \
   -v /mnt/nvme/hf-cache:/cache \
   -v /var/lib/muninn/xet:/xet \
   -e HF_TOKEN=hf_xxx \
   -e XHC_CACHE_MAX_SIZE=70T \
-  ghcr.io/skibare87/muninn:0.5.3
+  ghcr.io/skibare87/muninn:0.6.0
 ```
 
 Or from source, which is also how you get the compose file's full env set:
@@ -58,15 +58,15 @@ curl -s localhost:8080/_cache/status | jq
 
 To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
-`image: ghcr.io/skibare87/muninn:0.5.3`.
+`image: ghcr.io/skibare87/muninn:0.6.0`.
 
 **Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
 GitHub Actions on every version tag:
 
 | tag | meaning |
 |---|---|
-| `0.5.3` | immutable — **pin this on a fleet** |
-| `0.5` | latest patch in the 0.5 line; **moves** |
+| `0.6.0` | immutable — **pin this on a fleet** |
+| `0.6` | latest patch in the 0.6 line; **moves** |
 | `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
 
@@ -269,6 +269,77 @@ It only coalesces the *ingest* — the clients themselves still each hit the WAN
 which is the exact traffic multiplication the cache exists to prevent.
 
 If you prewarm properly, misses are rare and this choice barely matters.
+
+## Two request headers: prewarm, and local-only
+
+Both are opt-in headers on the ordinary resolve path. **No management token, no
+rewritten URL** — a caller that can already pull through the cache can use them.
+
+Deliberately headers rather than query parameters: a query string changes the
+URL, and the URL is the cache key the client and every proxy between you and the
+cache agree on. These ask for different *handling* of the same resource.
+
+### `X-Muninn-Prewarm: 1` — ingest it, do not send it to me
+
+```bash
+curl -sS -D- -o /dev/null -H 'X-Muninn-Prewarm: 1' \
+  http://cache:8080/org/model/resolve/main/model-00001-of-00004.safetensors
+```
+
+| response | meaning |
+|---|---|
+| `202` + `x-xhc-cache: MISS-PREWARM` + `x-xhc-job` | ingest started (or joined an in-flight one); poll the job |
+| `204` + `x-xhc-cache: HIT` | already cached, nothing to do |
+
+The body is always empty. This is the only branch that ignores `XHC_MISS_POLICY`,
+because the miss policy answers *"how do we serve this request"* and prewarm has
+already said *"do not serve it to me"*.
+
+It joins the existing single-flight, so a prewarm racing a real pull for the same
+file starts one ingest, not two.
+
+### `X-Muninn-Local-Only: 1` — answer from disk, or not at all
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %header{x-xhc-cache}\n' \
+  -H 'X-Muninn-Local-Only: 1' http://cache:8080/org/model/resolve/main/config.json
+```
+
+| response | meaning |
+|---|---|
+| `200` + `x-xhc-cache: HIT-LOCAL` + `x-xhc-local-only: 1` | served from disk, **not revalidated** |
+| `404` + `x-xhc-cache: MISS-LOCAL` | not on disk. **The Hub was never asked** |
+
+**It never contacts upstream, on any path.** There are three upstream calls the
+resolve path can make and all three are suppressed: ref revalidation
+(`refs.is_stale`), the etag backfill when a cached blob has no symlink, and the
+metadata fetch on a miss. A local-only check that still asks the Hub is not
+local-only — it is a slower miss with a promise attached, and it fails when the
+Hub is unreachable, which is exactly when you most want to know what is on disk.
+
+**The trade is explicit: a certainly-local answer rather than a certainly-current
+one.** A mutable ref may have moved upstream and this will not tell you. The
+response says so — `HIT-LOCAL` rather than `HIT`, plus `x-xhc-local-only: 1` — so
+an answer cannot be mistaken for a revalidated one later. If you need currency,
+do not use this header.
+
+`404` here means *not cached*, not *does not exist*. It is `cache-control:
+no-store`, because the answer is true of this cache at this instant and of
+nothing else.
+
+### Together
+
+`X-Muninn-Local-Only` + `X-Muninn-Prewarm` is a **`400`**. A prewarm needs
+upstream metadata and local-only forbids it, so it is a contradiction rather than
+a precedence question — and guessing which one wins would be a silent choice
+about network access.
+
+**They compose across requests, which is the point:** prewarm a set of files,
+then poll each with local-only to find out what actually landed, without a
+management token and without a single upstream request in the polling loop.
+
+**Scope:** the Hugging Face resolve path. The `/v2/*` OCI surface does not
+implement these; use `POST /_cache/docker/prewarm`.
 
 ## Verifying sequential writes
 

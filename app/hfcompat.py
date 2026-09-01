@@ -378,6 +378,20 @@ async def fetch_metadata(repo_type: str, repo_id: str, revision: str, filename: 
     return await asyncio.to_thread(get_hf_file_metadata, url, token=settings.hf_token)
 
 
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def _flag(request: Request, name: str) -> bool:
+    """A request-scoped opt-in header. Absent or unrecognised means off.
+
+    Deliberately not a query parameter: a query string changes the URL, and the
+    URL is the cache key the client and every proxy between us agree on. A
+    header asks for different HANDLING of the same resource, which is what these
+    two do.
+    """
+    return (request.headers.get(name) or "").strip().lower() in _TRUE
+
+
 def _cache_headers(commit: str, etag: str | None, extra: dict | None = None) -> dict[str, str]:
     hdrs: dict[str, str] = {"x-repo-commit": commit}
     if etag:
@@ -682,7 +696,13 @@ async def _hit_response(
     range_header: str | None,
 ) -> Response:
     etag = local.etag
-    if etag is None:
+    if etag is None and _flag(request, "x-muninn-local-only"):
+        # local-only promises NO upstream call, and that promise has to hold on
+        # the hit path too. Without it this branch would reach the Hub for an
+        # etag on a cached file -- the one case a caller using this header is
+        # least expecting it, because the answer was on disk the whole time.
+        log.debug("local-only: serving %s/%s without an etag", repo_id, filename)
+    elif etag is None:
         # No symlink to read the etag from (copy-mode cache, or an odd
         # filesystem). huggingface_hub refuses to download without an ETag, so
         # pay for one upstream HEAD rather than serving an unusable response.
@@ -692,7 +712,12 @@ async def _hit_response(
         except Exception as exc:  # noqa: BLE001 - degrade to no-etag, do not fail the hit
             log.warning("hit for %s/%s but no etag available: %s", repo_id, filename, exc)
 
-    headers = _cache_headers(local.commit, etag, {"x-xhc-cache": "HIT"})
+    extra = {"x-xhc-cache": "HIT"}
+    if _flag(request, "x-muninn-local-only"):
+        # Self-describing: this answer was not revalidated against upstream.
+        extra["x-xhc-local-only"] = "1"
+        extra["x-xhc-cache"] = "HIT-LOCAL"
+    headers = _cache_headers(local.commit, etag, extra)
 
     # Conditional request: if the client already holds this exact blob, say so
     # instead of resending it. Deliberately no If-Modified-Since -- blob mtimes
@@ -704,6 +729,13 @@ async def _hit_response(
         if "*" in candidates or quoted in candidates or etag in candidates:
             headers["x-xhc-cache"] = "HIT-304"
             return Response(status_code=304, headers=headers)
+
+    # A prewarm on something already cached is a no-op, and saying "204, already
+    # here" is more useful than streaming the file to a caller who asked us NOT
+    # to send it.
+    if _flag(request, "x-muninn-prewarm"):
+        headers["content-length"] = "0"
+        return Response(status_code=204, headers=headers)
 
     if request.method == "HEAD":
         headers["content-length"] = str(local.size)
@@ -731,12 +763,38 @@ async def serve_file(
         # A mutable ref may have moved upstream. This is a ref-level check with
         # a TTL, not a per-file HEAD -- inside the TTL, and always for
         # sha-pinned requests, it costs nothing and the hit stays a disk read.
-        if await refs.is_stale(repo_type, repo_id, revision, local.commit):
+        # refs.is_stale asks the Hub whether a mutable ref has moved. local-only
+        # must not, so it serves what is on disk WITHOUT revalidating and says so
+        # in the response. That is the trade the header buys: an answer that is
+        # certainly local, rather than one that is certainly current. A caller
+        # who needs currency should not be using this header.
+        if _flag(request, "x-muninn-local-only"):
+            pass
+        elif await refs.is_stale(repo_type, repo_id, revision, local.commit):
             local = None  # fall through and ingest the new commit
         else:
             return await _hit_response(
                 local, repo_type, repo_id, revision, filename, request, range_header
             )
+
+    # --- local-only: answer from disk, or not at all -------------------------
+    # Placed HERE, before the upstream metadata fetch, because that fetch is the
+    # thing the header exists to avoid. A local-only check that still asks the
+    # Hub is not local-only -- it is a slower miss with a promise attached, and
+    # it fails when the Hub is unreachable, which is exactly when a caller most
+    # wants to know what is on disk.
+    if _flag(request, "x-muninn-local-only"):
+        if _flag(request, "x-muninn-prewarm"):
+            raise HTTPException(
+                status_code=400,
+                detail="X-Muninn-Local-Only and X-Muninn-Prewarm are mutually exclusive: "
+                "a prewarm requires upstream metadata, which local-only forbids",
+            )
+        return JSONResponse(
+            {"detail": f"not cached locally: {repo_id}/{filename}", "revision": revision},
+            status_code=404,
+            headers={"x-xhc-cache": "MISS-LOCAL", "cache-control": "no-store"},
+        )
 
     # --- miss: ask upstream what this actually is --------------------------
     cached_miss = _negative_cache_get(repo_type, repo_id, revision, filename)
@@ -817,6 +875,15 @@ async def serve_file(
             "x-xhc-miss-policy": settings.miss_policy,
         },
     )
+
+    # Prewarm: the ingest is running; the caller explicitly does not want the
+    # bytes. Return the job so they can poll, and send no body. This is the only
+    # branch that ignores miss_policy, because miss_policy answers "how do we
+    # serve this request" and prewarm has already said "do not serve it to me".
+    if _flag(request, "x-muninn-prewarm"):
+        headers["x-xhc-cache"] = "MISS-PREWARM"
+        headers["content-length"] = "0"
+        return Response(status_code=202, headers=headers)
 
     if settings.miss_policy == "redirect":
         # Client pulls from HF with its own hf_xet at full fan-out speed -- no

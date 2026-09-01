@@ -1,6 +1,6 @@
 [project]
 name = "muninn"
-version = "0.5.3"
+version = "0.6.0"
 description = "Muninn - Hugging Face edge cache: ingests over the WAN with native Xet, serves the LAN as plain HTTP"
 readme = "README.md"
 license = { file = "LICENSE" }
