@@ -24,6 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -40,6 +41,11 @@ _HUB_CANONICAL = "docker.io"
 _HUB_API = "https://registry-1.docker.io"
 
 _CHALLENGE_RE = re.compile(r'(\w+)="([^"]*)"')
+# The scheme is a bare token with no ="value", so _CHALLENGE_RE cannot capture
+# it. Matching it separately is the whole point: a Basic challenge carries a
+# realm exactly like a Bearer one, and telling them apart is the only job the
+# guard in _authed_request has (an internal issue).
+_SCHEME_RE = re.compile(r"^\s*([A-Za-z]+)")
 
 _client: httpx.AsyncClient | None = None
 _tokens: dict[tuple[str, str], tuple[str, float]] = {}
@@ -145,12 +151,30 @@ def _basic_for(upstream: str) -> str | None:
 
 
 def _parse_challenge(header: str) -> dict:
-    return dict(_CHALLENGE_RE.findall(header or ""))
+    """Parse a WWW-Authenticate header into its params, plus a `_scheme` key.
+
+    `_scheme` is underscore-prefixed so it cannot collide with a real parameter
+    name from a registry we have not met.
+    """
+    parsed = dict(_CHALLENGE_RE.findall(header or ""))
+    m = _SCHEME_RE.match(header or "")
+    if m:
+        parsed["_scheme"] = m.group(1).lower()
+    return parsed
 
 
 async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
     realm = challenge.get("realm")
     if not realm:
+        return None
+    # The realm is registry-controlled text, not necessarily a URL. One registry
+    # sends `Basic realm="Authorization Required"`, and httpx treats that as a
+    # RELATIVE url, then raises ValueError from urllib inside its cookie
+    # handling -- which `except httpx.HTTPError` does not catch, so it escaped
+    # as a 500. Validate before requesting rather than widening the except and
+    # calling it handled. an internal issue.
+    if urlparse(realm).scheme not in ("http", "https") or not urlparse(realm).netloc:
+        log.warning("ignoring non-URL auth realm %r from %s", realm, ref.upstream)
         return None
     params = {k: v for k, v in challenge.items() if k in ("service", "scope") and v}
     params.setdefault("scope", f"repository:{ref.repo}:pull")
@@ -160,7 +184,9 @@ async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
         headers["authorization"] = f"Basic {basic}"
     try:
         r = await _get_client().get(realm, params=params, headers=headers)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError as well: httpx raises it out of urllib for a malformed URL
+        # rather than as an httpx error. Belt and braces behind the check above.
         log.warning("token fetch failed for %s: %s", ref.upstream, exc)
         return None
     if r.status_code != 200:
@@ -215,9 +241,15 @@ async def _authed_request(
     else:
         await r.aread()
 
-    if (challenge.get("Bearer") is None) and "realm" not in challenge:
+    if challenge.get("_scheme") != "bearer" or "realm" not in challenge:
         # Not a bearer challenge we can satisfy (e.g. Basic). Hand the client
         # the registry's own answer rather than inventing one.
+        #
+        # This previously tested `challenge.get("Bearer") is None`, which was
+        # always true because the scheme token is never captured as a key=value
+        # pair -- so the condition collapsed to "has a realm" and EVERY Basic
+        # challenge entered the bearer dance. That is what produced a 500 on one
+        # registry and a misleading 404 on another. an internal issue.
         return r
 
     lock = _token_locks.setdefault((ref.upstream, ref.repo), asyncio.Lock())
