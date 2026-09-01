@@ -241,9 +241,38 @@ async def _authed_request(
     else:
         await r.aread()
 
+    if challenge.get("_scheme") == "basic":
+        # A Basic challenge IS satisfiable when the operator has mounted
+        # credentials for this upstream -- that is the entire point of
+        # XHC_REGISTRY_AUTH_FILE, and it did not work.
+        #
+        # _basic_for() existed and was called from exactly one place: inside
+        # _fetch_token, to authenticate to a BEARER TOKEN ENDPOINT. No code path
+        # ever put Authorization: Basic on a registry request. So against a
+        # registry that speaks plain Basic and has no token endpoint, the
+        # credentials loaded, logged at startup, sat in memory and were never
+        # sent. A stated feature that had never worked on any release.
+        #
+        # The comment that used to be here said "not a bearer challenge we can
+        # satisfy (e.g. Basic)", which encoded the false belief that Basic could
+        # not be satisfied at all. It can. an internal issue.
+        #
+        # Challenge-response rather than preemptive: credentials go only to an
+        # upstream that actually asked for them, so configuring an auth file
+        # cannot leak them to a registry that never challenges.
+        basic = _basic_for(ref.upstream)
+        if not basic:
+            # Challenged for Basic and we hold nothing for this upstream. Hand
+            # back the registry's own answer; inventing one would hide the fact
+            # that the operator has not configured credentials for it.
+            log.info("basic challenge from %s and no credentials for it", ref.upstream)
+            return r
+        hdrs["authorization"] = f"Basic {basic}"
+        return await send(hdrs)
+
     if challenge.get("_scheme") != "bearer" or "realm" not in challenge:
-        # Not a bearer challenge we can satisfy (e.g. Basic). Hand the client
-        # the registry's own answer rather than inventing one.
+        # Neither Basic nor a usable Bearer challenge. Hand the client the
+        # registry's own answer rather than inventing one.
         #
         # This previously tested `challenge.get("Bearer") is None`, which was
         # always true because the scheme token is never captured as a key=value

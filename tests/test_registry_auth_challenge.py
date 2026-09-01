@@ -97,3 +97,125 @@ def test_realm_must_be_an_absolute_http_url():
     assert not usable("")
     assert usable("https://auth.docker.io/token")
     assert usable("http://registry.internal:5000/token")
+
+
+# --------------------------------------------------------------------------
+# The Basic RETRY (an internal issue, second half).
+#
+# Telling Basic from Bearer was only half the defect. `_basic_for()` -- the
+# function that turns a mounted XHC_REGISTRY_AUTH_FILE into an Authorization
+# header -- was called from exactly ONE place: inside _fetch_token, to
+# authenticate to a bearer TOKEN ENDPOINT. No code path ever put
+# `Authorization: Basic` on a registry request.
+#
+# So against a registry speaking plain Basic with no token endpoint, the
+# credentials loaded, logged at startup, sat in memory, and were never sent.
+# A documented feature that had never worked on any release. Verified
+# end-to-end against the real upstream: 401 on v0.6.1, 200 with the retry,
+# same credential file.
+#
+# These drive coroutines with asyncio.run rather than pytest-asyncio, matching
+# tests/test_request_flags.py -- bare `async def` tests are SKIPPED with a
+# warning, which is a green run that asserted nothing.
+# --------------------------------------------------------------------------
+
+import asyncio
+import types
+
+
+class _FakeResponse:
+    def __init__(self, status_code, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    async def aread(self):
+        return b""
+
+    async def aclose(self):
+        return None
+
+
+class _FakeClient:
+    """Answers 401+challenge once, then echoes whatever auth arrived next."""
+
+    def __init__(self, challenge):
+        self.challenge = challenge
+        self.sent = []
+
+    def build_request(self, method, url, headers=None):
+        return types.SimpleNamespace(method=method, url=url, headers=headers or {})
+
+    async def send(self, req, stream=False):
+        self.sent.append(dict(req.headers))
+        if len(self.sent) == 1:
+            return _FakeResponse(401, {"www-authenticate": self.challenge})
+        return _FakeResponse(200)
+
+
+def _run_authed(monkeypatch, challenge, creds):
+    client = _FakeClient(challenge)
+    monkeypatch.setattr(registry, "_get_client", lambda: client)
+    monkeypatch.setattr(registry, "_basic_for", lambda upstream: creds)
+    monkeypatch.setattr(registry, "_cached_token", lambda ref: None)
+    ref = registry.Ref(
+        upstream="registry.example.com",
+        api="https://registry.example.com",
+        repo="team/image",
+    )
+    resp = asyncio.run(
+        registry._authed_request("GET", f"{ref.api}/v2/{ref.repo}/manifests/latest",
+                                 ref, {}, stream=False)
+    )
+    return resp, client.sent
+
+
+def test_basic_challenge_is_retried_with_credentials(monkeypatch):
+    """The defect in one assertion: a second request, carrying Basic."""
+    resp, sent = _run_authed(monkeypatch, 'Basic realm="Authorization Required"', "Zm9vOmJhcg==")
+    assert resp.status_code == 200
+    assert len(sent) == 2, "no retry was attempted"
+    assert sent[1].get("authorization") == "Basic Zm9vOmJhcg=="
+
+
+def test_basic_retry_works_when_the_realm_is_not_a_url(monkeypatch):
+    """The realm is irrelevant to Basic -- it must not gate the retry.
+
+    A realm that is not a URL is what crashed the bearer path. It must not now
+    prevent the Basic path from working.
+    """
+    resp, sent = _run_authed(monkeypatch, 'Basic realm="Authorization Required"', "eDp5")
+    assert resp.status_code == 200 and len(sent) == 2
+
+
+def test_no_credentials_means_hand_back_the_registrys_own_401(monkeypatch):
+    """Absent credentials must not be papered over with an invented answer."""
+    resp, sent = _run_authed(monkeypatch, 'Basic realm="whatever"', None)
+    assert resp.status_code == 401
+    assert len(sent) == 1, "retried without credentials to send"
+
+
+def test_credentials_are_never_sent_unasked(monkeypatch):
+    """Challenge-response, not preemptive.
+
+    Configuring an auth file must not leak credentials to an upstream that
+    never challenged. The FIRST request carries no authorization.
+    """
+    _, sent = _run_authed(monkeypatch, 'Basic realm="x"', "c2VjcmV0")
+    assert "authorization" not in sent[0]
+
+
+def test_a_bearer_challenge_does_not_take_the_basic_path(monkeypatch):
+    """Guards the over-correction: Bearer must still do the token dance.
+
+    _fetch_token is stubbed to fail, so a Bearer challenge yields the original
+    401. If Bearer wrongly fell into the Basic branch this would be a 200.
+    """
+    async def _no_token(ref, challenge):
+        return None
+
+    monkeypatch.setattr(registry, "_fetch_token", _no_token)
+    resp, sent = _run_authed(
+        monkeypatch, 'Bearer realm="https://auth.example.com/token"', "Zm9vOmJhcg=="
+    )
+    assert resp.status_code == 401
+    assert len(sent) == 1
