@@ -9,6 +9,38 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.6.1 — 2026-09-01
+
+A Basic auth challenge is no longer mistaken for a Bearer one.
+
+Muninn returned 500 for a private registry whose challenge is
+`Basic realm="Authorization Required"`, and a misleading 404 for another whose
+realm happens to be a URL -- on identical inputs, both upstreams answering 401.
+
+The guard meant to tell the two schemes apart could never do so. It tested
+`challenge.get("Bearer") is None`, but the challenge parser matched only
+key="value" pairs and the scheme token has no ="value", so it was never present
+and the condition collapsed to "has a realm". Every Basic challenge entered the
+bearer token dance. Where the realm was a URL that merely wasted a request;
+where it was free text, httpx read it as a relative URL and urllib raised
+ValueError from inside httpx's cookie handling -- which `except httpx.HTTPError`
+does not catch.
+
+The scheme is now parsed and matched case-insensitively per RFC 7235, and a
+realm that is not an absolute http(s) URL is refused before it reaches httpx
+rather than caught afterwards.
+
+Unchanged and deliberate: an upstream 401 with nothing cached still renders as
+404 MANIFEST_UNKNOWN. That is the fail-open behaviour orphan retention depends
+on, and altering it is client-visible.
+
+Muninn still cannot pull from registries requiring per-client credentials, by
+design. This is about answering correctly when it cannot.
+
+Found by a colleague while testing whether Muninn could front the private registries;
+that question is settled separately as no.
+
+
 ## v0.6.0 — 2026-09-01
 
 X-Muninn-Prewarm: warm the cache without receiving the bytes. 202 + job id, or
