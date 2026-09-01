@@ -6,11 +6,12 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Response
+from fastapi import Depends, FastAPI, Response
 from fastapi.responses import JSONResponse
 
 from . import (
     cachefs,
+    dockerauth,
     hfcompat,
     manage,
     metrics,
@@ -77,6 +78,24 @@ async def lifespan(app: FastAPI):
                 "docker policy is `open` with no registry allowlist: any client "
                 "may pull from any upstream registry through this cache. Set "
                 "XHC_ALLOW_REGISTRIES to restrict it."
+            )
+
+        # Raises rather than degrading to open. An ABSENT config means the
+        # operator did not ask for auth; an UNREADABLE credential file when they
+        # DID ask is unknown, and resolving unknown to permissive is what
+        # disarmed pin protection in an internal issue. Losing a password file must not
+        # silently reopen the cache.
+        dockerauth.load()
+        if settings.docker_auth == "basic":
+            log.warning(
+                "client auth is `basic`: credentials are sent in clear unless "
+                "something terminates TLS in front of this cache. Muninn cannot "
+                "see its own front, so this is a warning and not a refusal."
+            )
+            log.warning(
+                "client auth is a GATE, not per-client isolation: everyone who "
+                "authenticates sees everything this cache holds. A cached hit "
+                "consults no credentials at all."
             )
 
     evictor = asyncio.create_task(cachefs.eviction_loop())
@@ -177,6 +196,13 @@ app.include_router(manage.router)
 # otherwise swallow it.
 if settings.docker_enabled:
     app.include_router(ocimanage.router)
-    app.include_router(ocicompat.router)
+    # Every route on ocicompat's router is /v2/*, so gating it here gates
+    # exactly the pull surface and nothing else. /healthz and /metrics live on
+    # other routers and stay unauthenticated by design; /_cache keeps its own
+    # XHC_MANAGE_TOKEN. Two credentials, two surfaces, no crossover.
+    app.include_router(
+        ocicompat.router,
+        dependencies=[Depends(dockerauth.require_pull_auth)],
+    )
 # Must be last: hfcompat owns the catch-all route.
 app.include_router(hfcompat.router)

@@ -616,9 +616,58 @@ mid-pull and assemble a tree from two commits.
 > what the cache holds** and is deliberate; this one is about **which upstreams anyone may
 > make the cache fetch from**, which is worth narrowing even on a network you trust.
 
-**Not implemented:** push (a cache that accepts pushes is a registry, with GC, quota and
-durability obligations), and client-facing auth — `XHC_DOCKER_AUTH` is parsed and validated
-but **never read by any code path**. Setting it to `basic` does nothing.
+**Not implemented:** push. A cache that accepts pushes is a registry, with GC, quota
+and durability obligations.
+
+### Optional client auth on the pull surface
+
+Off by default. Nothing changes unless you turn it on.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `XHC_DOCKER_AUTH` | `none` | `none`, `basic` |
+| `XHC_DOCKER_HTPASSWD` | unset | path to a bcrypt htpasswd file; **required** when `basic` |
+
+```bash
+htpasswd -B -c ./htpasswd hiro      # bcrypt; -B is not optional
+htpasswd -B    ./htpasswd mimir
+```
+
+```yaml
+environment:
+  XHC_DOCKER_AUTH: basic
+  XHC_DOCKER_HTPASSWD: /auth/htpasswd
+volumes:
+  - ./htpasswd:/auth/htpasswd:ro
+```
+
+Then `docker login <cache-host>` as usual. **bcrypt only** — Apache's other formats are
+unsalted or broken, and silently accepting one would make a weak file look configured, so
+they are refused at startup with the line number.
+
+> **This is a GATE, not per-client isolation.** Everyone who authenticates sees
+> **everything the cache holds**. Per-client authorization is not possible here and Muninn
+> will not pretend otherwise: a cached hit consults no credentials at all, so any such
+> scheme would be enforced on the miss and silently absent on every hit after it — false
+> from the first cache fill. See *The trust boundary is the network* above.
+
+**It gates `/v2/*` and nothing else.** `/healthz` and `/metrics` stay unauthenticated by
+design, and `/_cache` keeps its own separate `XHC_MANAGE_TOKEN` — a pull credential does not
+open the management API. This is the main advantage over a blanket reverse-proxy rule, which
+swallows the health and metrics endpoints unless you carve them out by hand.
+
+**It fails closed.** `basic` with a missing, unreadable, empty or non-bcrypt htpasswd file
+**refuses to start**. An absent config means you did not ask for auth; an unreadable one when
+you *did* means unknown, and resolving unknown to permissive is how a cache silently reopens
+itself after someone loses a file.
+
+Basic auth sends credentials in clear, so put TLS in front. Muninn cannot see its own front,
+so it warns at boot rather than refusing.
+
+*Why per-host credentials rather than one shared secret:* a `docker pull` cannot send an
+identifying header and Muninn's OCI path records no principal, so credentials are the only
+mechanism by which this cache can ever know which node pulled what. A shared secret does not
+defer that, it forecloses it — and revoking one node becomes impossible.
 
 ### Private registries: the cache authenticates as itself
 
