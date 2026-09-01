@@ -9,6 +9,49 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.6.3 — 2026-09-01
+
+An upstream auth failure no longer says "not found".
+
+Upstream 401 and upstream 404 both rendered as 404 MANIFEST_UNKNOWN. Since 0.6.2
+there are three states, not two, and they have three different fixes:
+
+  upstream 401, no credentials configured  -> docker login on the CACHE host
+  upstream 401, credentials rejected       -> wrong, expired or unscoped creds
+  upstream 404                             -> genuinely not there
+
+The middle state only became reachable when credentials started being sent, so
+the fix that made the feature work also created a failure indistinguishable from
+the other two.
+
+The status code was chosen by measurement rather than by semantics, because the
+docker CLI discards the body and the headers and prints only the status:
+
+  404 -> "not found"                                <- the status is ERASED
+  401 -> "unexpected status ...: 401 Unauthorized"
+  502 -> "unexpected status ...: 502 Bad Gateway"
+  403 -> "unexpected status ...: 403 Forbidden"
+
+404 is the only status that hides itself, so an auth failure must not wear one.
+An upstream auth failure is now 502 -- Muninn is a gateway that did not obtain a
+valid response -- carrying x-xhc-upstream-status and x-xhc-upstream-auth
+(unconfigured | rejected | n/a) for logs and curl. Failure is as fast as before:
+404, 401 and 502 all fail in about 32ms, with no client retry.
+
+401 is reserved for Muninn's own client-facing auth. "Authenticate to the cache"
+and "the cache cannot authenticate upstream" are different actors with different
+fixes.
+
+ALSO FIXED: blobs and manifests disagreed. The blob path returned 401 for an
+upstream 401 and FORWARDED UPSTREAM'S WWW-AUTHENTICATE, pointing a client at a
+realm Muninn does not proxy -- a retry loop with no exit, present in every
+release until now. Both paths now share one terminal answer and no challenge is
+ever emitted.
+
+Unchanged: the fail-open path. While a cached copy is held, an upstream 401 or
+404 still serves it.
+
+
 ## v0.6.2 — 2026-09-01
 
 XHC_REGISTRY_AUTH_FILE now actually works. It never had.
