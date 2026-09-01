@@ -38,14 +38,14 @@ A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
 NAS does not need a toolchain:
 
 ```bash
-docker pull ghcr.io/skibare87/muninn:0.5.2
+docker pull ghcr.io/skibare87/muninn:0.5.3
 
 docker run -d --name muninn -p 8080:8080 \
   -v /mnt/nvme/hf-cache:/cache \
   -v /var/lib/muninn/xet:/xet \
   -e HF_TOKEN=hf_xxx \
   -e XHC_CACHE_MAX_SIZE=70T \
-  ghcr.io/skibare87/muninn:0.5.2
+  ghcr.io/skibare87/muninn:0.5.3
 ```
 
 Or from source, which is also how you get the compose file's full env set:
@@ -58,14 +58,14 @@ curl -s localhost:8080/_cache/status | jq
 
 To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
-`image: ghcr.io/skibare87/muninn:0.5.2`.
+`image: ghcr.io/skibare87/muninn:0.5.3`.
 
 **Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
 GitHub Actions on every version tag:
 
 | tag | meaning |
 |---|---|
-| `0.5.2` | immutable — **pin this on a fleet** |
+| `0.5.3` | immutable — **pin this on a fleet** |
 | `0.5` | latest patch in the 0.5 line; **moves** |
 | `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
@@ -362,6 +362,45 @@ set. It is **attribution, not an audit trail** — it is self-reported, and a no
 can claim to be anything. Label cardinality is capped (200, overflowing to
 `__other__`) so a client sending a unique value per request cannot blow up a
 scrape.
+
+### Counters are volatile; cache gauges are not
+
+`muninn_bytes_served_total`, `muninn_bytes_ingested_total` and
+`muninn_requests_total` are process counters and **reset on every restart**.
+`muninn_cache_bytes`, `muninn_cache_repos` and `muninn_cache_files` are read
+from the filesystem and survive.
+
+**"Zero since process start" and "never" are different claims.** A cache holding
+terabytes will report zero bytes served immediately after a restart, and that is
+not a fault. If you need to know whether it has ever worked, ask the durable
+gauges — a non-zero `muninn_cache_bytes` cannot exist without ingestion.
+
+### Every `bytes_served_total` figure from before 0.5.2 is inflated
+
+Before 0.5.2 the served counter incremented on **`HEAD` as well as `GET`**, using
+the response `content-length`. A `HEAD` carries the full size and transfers no
+body — and `huggingface_hub` **issues a `HEAD` for every file in a repo before
+downloading any of it**, so a snapshot booked the entire repo as *served* before
+a byte left the disk.
+
+Fixed in 0.5.2. `206` responses are still counted, deliberately: there
+`content-length` is the range length, which is exactly what was sent.
+
+**Do not compare a served figure across the 0.5.2 boundary.** Post-fix readings
+read *lower* for identical traffic — that is the fix, not a regression.
+`bytes_ingested_total` was never affected.
+
+### Amplification is a derived ratio
+
+Served-per-byte-ingested is the number this cache exists to justify, which is
+exactly why it deserves the most scrutiny and not the least. **Publish the raw
+counters beside it** so a reader can re-derive it when an input is retracted, and
+**do not quote it off a small sample** — a handful of large cached objects
+produces any ratio you like.
+
+For a figure that is immune to this whole class, use `muninn_cache_bytes`: read
+off the filesystem, durable across restarts, and not inflatable by request
+accounting.
 
 ## Dataset metadata
 
