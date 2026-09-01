@@ -611,9 +611,67 @@ mid-pull and assemble a tree from two commits.
 > means anyone who can reach the port can pull from **any** registry onto your array. The
 > server warns at boot in that state. Setting `XHC_ALLOW_REGISTRIES` is the cheapest useful
 > hardening and does **not** require flipping the whole policy to `allowlist`.
+>
+> This is a separate concern from the trust boundary below. That one is about **who may read
+> what the cache holds** and is deliberate; this one is about **which upstreams anyone may
+> make the cache fetch from**, which is worth narrowing even on a network you trust.
 
 **Not implemented:** push (a cache that accepts pushes is a registry, with GC, quota and
-durability obligations), and client-facing auth — `XHC_DOCKER_AUTH` is accepted and ignored.
+durability obligations), and client-facing auth — `XHC_DOCKER_AUTH` is parsed and validated
+but **never read by any code path**. Setting it to `basic` does nothing.
+
+### Private registries: the cache authenticates as itself
+
+Mount the host's Docker credentials and point `XHC_REGISTRY_AUTH_FILE` at them. Whatever
+the cache host is logged into, the cache can pull:
+
+```bash
+docker login registry.example.com          # on the Muninn host
+```
+
+```yaml
+services:
+  muninn:
+    environment:
+      XHC_REGISTRY_AUTH_FILE: /auth/config.json
+    volumes:
+      - ~/.docker/config.json:/auth/config.json:ro
+```
+
+It reads the standard `~/.docker/config.json` that `docker login` already produces, so
+there is no bespoke credential format, and mounting it read-only as a secret keeps the
+values out of `docker inspect`. Both auth schemes are supported: a Bearer challenge takes
+the token dance, a Basic challenge is answered with the mounted credentials.
+
+Credentials are sent **only in response to a challenge**, never preemptively — configuring
+an auth file cannot leak credentials to a registry that never asked for them. If an upstream
+challenges and no credentials are configured for it, its own `401` is passed back rather
+than an invented answer.
+
+> **This worked for the first time in 0.6.2.** Before that, credentials were loaded, logged
+> at startup and never attached to a request; a registry using plain Basic auth could not be
+> reached at all. If you are on an earlier version, the feature is documented but absent.
+
+### The trust boundary is the network, deliberately
+
+**Anything that can reach this cache can pull anything the cache holds.** That is the design,
+not an oversight, and it follows from what a pull-through cache is:
+
+- A cached hit consults **no credentials at all**. It checks the fleet-wide allow/deny policy
+  and then serves off disk. The store is keyed by upstream, repo and digest — there is no
+  principal anywhere in it.
+- So per-client authorization is not something that can be bolted on. It would be enforced on
+  the **miss** and silently absent on every **hit** after it, and the first client to pull a
+  private image would make it readable by everyone. A control that looks present and is not
+  is worse than none.
+
+For that reason Muninn does **not** forward a client's `Authorization` header upstream, and
+will not. It authenticates as itself, with credentials you mount.
+
+Run it where you would run an NFS server: on a network whose reachability you already control.
+If you need a door on it, put one in front — a reverse proxy doing basic auth works with
+`docker login` today, at the cost of carving out `/healthz` and `/metrics`, which are
+unauthenticated by design.
 
 ## Management API
 
