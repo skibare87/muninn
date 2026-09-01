@@ -60,6 +60,11 @@ To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
 `image: ghcr.io/skibare87/muninn:0.6.0`.
 
+Release notes for every version are in [CHANGELOG.md](CHANGELOG.md) and on the
+[Releases page](https://github.com/skibare87/muninn/releases). Both are rendered
+from the annotated git tag, which is written at release time and is the source of
+truth — the changelog is regenerated, never hand-edited.
+
 **Published tags** (multi-arch, `linux/amd64` + `linux/arm64`), built by
 GitHub Actions on every version tag:
 
