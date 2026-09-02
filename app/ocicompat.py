@@ -116,6 +116,35 @@ def _unavailable(ref: registry.Ref, up: dict | int | None,
         token_state = up.get("token")
     else:
         upstream_status, authenticated, token_state = up, False, None
+    # A NON-401 IS NOT AUTOMATICALLY "NOT FOUND". Every upstream status used to
+    # render as 404 here, which is the answer most likely to STOP someone
+    # looking -- and it is wrong for most of them.
+    #
+    # The one that bit: a registry answering 400 MANIFEST_INVALID to a content
+    # negotiation it could not satisfy. The client was told the image does not
+    # exist when the REQUEST was the problem, and a reader reasonably concluded
+    # "the manifest endpoint refuses a tag the listing advertises".
+    #
+    # 400 is an answer about the REQUEST. 404 is an answer about the RESOURCE.
+    # Neither is "the cache is broken". Pass the upstream's own status through
+    # where it means something to the caller, and reserve 502 for the cases
+    # where this cache genuinely could not get an answer.
+    if upstream_status in (400, 406):
+        return _err(upstream_status, "MANIFEST_INVALID",
+                    f"{ref.upstream} rejected the request for {reference}: it could not "
+                    "satisfy the Accept types offered. This is a content-negotiation "
+                    "failure, not a missing image.",
+                    {"x-xhc-upstream-status": str(upstream_status),
+                     "x-xhc-upstream-auth": "n/a"})
+    if upstream_status == 429:
+        return _err(429, "TOOMANYREQUESTS",
+                    f"{ref.upstream} is rate-limiting this cache for {reference}",
+                    {"x-xhc-upstream-status": "429", "x-xhc-upstream-auth": "n/a"})
+    if upstream_status is not None and upstream_status >= 500:
+        return _err(502, "UNAVAILABLE",
+                    f"{ref.upstream} returned {upstream_status} for {reference}",
+                    {"x-xhc-upstream-status": str(upstream_status),
+                     "x-xhc-upstream-auth": "n/a"})
     if upstream_status != 401:
         return _err(404, unknown, f"{kind} {reference} not available",
                     {"x-xhc-upstream-status": str(upstream_status or "none"),
@@ -455,6 +484,33 @@ async def v2_root() -> Response:
     return JSONResponse({}, headers=dict(_API_VERSION))
 
 
+def _accept_header(request: Request) -> str | None:
+    """Every Accept value the client sent, joined into one header.
+
+    HTTP allows a repeated header, and `Headers.get()` returns only the FIRST
+    occurrence -- so reading it that way silently discards the rest.
+
+    regctl sends SEVEN separate `Accept:` lines (both OCI types, four docker
+    types, and the OCI artifact type). Reading only the first forwarded
+    `application/vnd.oci.image.index.v1+json` alone, and a registry holding a
+    DOCKER manifest list then has nothing acceptable to return. nvcr answers
+    that with `400 MANIFEST_INVALID: Schema 2 manifest not supported by client`
+    -- a content-negotiation refusal that was entirely of this cache's making.
+
+    Measured: regctl direct to that registry sends all seven and gets 200;
+    through the cache it got 404. curl and docker send ONE comma-joined Accept
+    line, which is why every hand-run probe worked and only regctl failed.
+
+    A dropped Accept value is invisible from both ends -- the client sees a
+    plausible answer about the image, and the registry sees a request that
+    genuinely does not accept what it holds.
+    """
+    values = [v for v in request.headers.getlist("accept") if v.strip()]
+    if not values:
+        return None
+    return ", ".join(values)
+
+
 def _resolve_or_error(name: str):
     try:
         return registry.resolve(name), None
@@ -529,7 +585,7 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
     if err:
         return err
     head = request.method == "HEAD"
-    accept = request.headers.get("accept")
+    accept = _accept_header(request)
 
     verdict = policy.check_docker(ref.upstream, ref.repo)
     enforce_on_hit = policy.docker_enforced_on_hits()
