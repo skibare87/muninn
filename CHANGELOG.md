@@ -9,6 +9,26 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.8.1 — 2026-09-01
+
+store-forward with XHC_DOCKER_CACHE_ON_PUSH=0 is an EPHEMERAL store.
+
+0.8.0 treated that combination as incoherent, kept the content anyway, and
+logged that the setting was ignored. It is not incoherent. The two settings
+answer different questions:
+
+  XHC_DOCKER_PUSH_MODE        when the client is answered
+  XHC_DOCKER_CACHE_ON_PUSH    whether the copy is kept afterwards
+
+With both set, content is held only long enough to be forwarded and is deleted
+once upstream confirms -- absorb the upload, push behind, and do not let pushed
+images occupy the cache. Deleting before the push would leave nothing to
+forward; deleting after was always the right answer.
+
+The deletion is in the success path only, so a push that fails or is cancelled
+still keeps its content, pinned and visible.
+
+
 ## v0.8.0 — 2026-09-01
 
 Push-through. OFF BY DEFAULT (XHC_DOCKER_PUSH=1).
