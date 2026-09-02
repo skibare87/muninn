@@ -586,6 +586,38 @@ If the pin or orphan state cannot be read, **GC refuses rather than proceeding**
 state file legitimately means "nothing is pinned"; an unreadable one means "unknown", and
 collapsing those would silently disarm pin protection inside an unattended loop.
 
+### What a failed pull means, by status
+
+The docker CLI **discards the body and headers and prints only the status**, so the status is
+the entire message most people ever see. Measured on docker 29.5.1: `404` renders as
+`not found` and nothing else, while `401`, `403` and `502` all render as
+`unexpected status ...: <code> <reason>`. **404 is the only status that hides itself**, which
+is why an auth failure must not wear one.
+
+| status | means | who fixes it |
+| --- | --- | --- |
+| `404` | not in the cache and the upstream does not have it — including a mistyped image name, and a private repo the cache holds no credentials for | whoever ran the pull |
+| `403` | refused by this cache's own policy (`XHC_DOCKER_POLICY`, allow/deny lists) | the cache operator |
+| `502` | the cache could not authenticate to the upstream — credentials missing, wrong, expired, or lacking scope | the cache operator |
+| `401` | authenticate **to the cache** (only when `XHC_DOCKER_AUTH=basic`) | whoever ran the pull |
+
+`401` is reserved for the cache's own client-facing auth and is never used for an upstream
+failure: *"authenticate to the cache"* and *"the cache cannot authenticate upstream"* are
+different actors with different fixes.
+
+Every failure carries diagnostic headers for logs and `curl`, since the CLI will not show them:
+`x-xhc-upstream-status`, `x-xhc-upstream-auth` (`unconfigured`, `rejected`, `anonymous-refused`
+or `n/a`), and `x-xhc-hint` where an explanation helps.
+
+**Why a nonexistent repo is a `404` even though the upstream said `401`.** Docker Hub and ghcr
+refuse to leak existence: for a repo that does not exist they issue a valid anonymous token and
+then answer `401` to the request carrying it. So *"you mistyped the name"* and *"this is private
+and you cannot see it"* arrive as the same response, and neither is a fault of the cache. The
+cache distinguishes **being refused after authenticating** — an answer, rendered `404` — from
+**being unable to authenticate at all**, which is a genuine gateway problem and stays `502`.
+Rendering the first as `502` told users the infrastructure was broken when they had simply
+mistyped an image name.
+
 ### Docker management endpoints
 
 | Method | Path | Purpose |

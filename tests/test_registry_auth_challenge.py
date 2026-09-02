@@ -291,3 +291,67 @@ def test_clearing_tokens_also_forgets_basic_upstreams():
     registry._basic_upstreams.add("x.example.com")
     registry.clear_tokens()
     assert not registry._basic_upstreams
+
+
+# ---------------------------------------------------------------------------
+# Docker Hub refuses to leak existence: for a repo that does NOT exist it
+# issues a perfectly valid anonymous token, then answers 401 to the request
+# carrying it. `out["authenticated"]` is what lets the caller tell that
+# answer apart from "the cache could not authenticate at all".
+# ---------------------------------------------------------------------------
+
+
+class _RefusingClient(_FakeClient):
+    """Challenges, then refuses again even with a valid token -- the shape a
+    registry uses to avoid confirming whether a private repo exists."""
+
+    async def send(self, req, stream=False):
+        self.sent.append(dict(req.headers))
+        return _FakeResponse(401, {"www-authenticate": self.challenge})
+
+
+def test_anonymous_token_then_401_still_counts_as_authenticated(monkeypatch):
+    """The wiring, not the rendering. _unavailable can only tell a typo from a
+    broken cache if this flag is actually set on the real bearer path."""
+    client = _RefusingClient('Bearer realm="https://auth.docker.io/token",service="registry.docker.io"')
+    monkeypatch.setattr(registry, "_get_client", lambda: client)
+    monkeypatch.setattr(registry, "_cached_token", lambda ref: None)
+    monkeypatch.setattr(registry, "_basic_for", lambda upstream: None)
+
+    async def _token(ref, challenge):
+        return "an-anonymous-token"
+
+    monkeypatch.setattr(registry, "_fetch_token", _token)
+    ref = registry.Ref(upstream="docker.io",
+                       api="https://registry-1.docker.io",
+                       repo="library/definitely-not-real-xyzzy")
+    out: dict = {}
+    resp = asyncio.run(
+        registry._authed_request("GET", f"{ref.api}/v2/{ref.repo}/manifests/latest",
+                                 ref, {}, stream=False, out=out)
+    )
+    assert resp.status_code == 401, "the registry refused even with the token"
+    assert len(client.sent) == 2, "the token was never presented"
+    assert client.sent[1].get("authorization") == "Bearer an-anonymous-token"
+    assert out["authenticated"] is True, (
+        "a token was obtained and presented; the 401 is the registry's ANSWER, "
+        "and reporting it as a gateway failure is what made a typo'd image "
+        "name render as 502 Bad Gateway"
+    )
+
+
+def test_unsatisfiable_challenge_leaves_authenticated_false(monkeypatch):
+    """No token, no credentials: the cache really could not authenticate."""
+    client = _FakeClient('Basic realm="whatever"')
+    monkeypatch.setattr(registry, "_get_client", lambda: client)
+    monkeypatch.setattr(registry, "_basic_for", lambda upstream: None)
+    monkeypatch.setattr(registry, "_cached_token", lambda ref: None)
+    ref = registry.Ref(upstream="r.example.com", api="https://r.example.com",
+                       repo="team/image")
+    out: dict = {}
+    resp = asyncio.run(
+        registry._authed_request("GET", f"{ref.api}/v2/{ref.repo}/manifests/latest",
+                                 ref, {}, stream=False, out=out)
+    )
+    assert resp.status_code == 401
+    assert out["authenticated"] is False

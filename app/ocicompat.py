@@ -57,7 +57,7 @@ def _err(status: int, code: str, message: str, headers: dict | None = None) -> J
     )
 
 
-def _unavailable(ref: registry.Ref, upstream_status: int | None,
+def _unavailable(ref: registry.Ref, up: dict | int | None,
                  reference: str, kind: str) -> JSONResponse:
     """Terminal answer when upstream would not serve and nothing is cached.
 
@@ -110,12 +110,48 @@ def _unavailable(ref: registry.Ref, upstream_status: int | None,
     exists to prevent.
     """
     unknown = "MANIFEST_UNKNOWN" if kind == "manifest" else "BLOB_UNKNOWN"
+    if isinstance(up, dict):
+        upstream_status = up.get("status")
+        authenticated = bool(up.get("authenticated"))
+    else:
+        upstream_status, authenticated = up, False
     if upstream_status != 401:
         return _err(404, unknown, f"{kind} {reference} not available",
                     {"x-xhc-upstream-status": str(upstream_status or "none"),
                      "x-xhc-upstream-auth": "n/a"})
 
     configured = registry.has_credentials(ref.upstream)
+
+    # A 401 AFTER WE SUCCESSFULLY AUTHENTICATED IS AN ANSWER, NOT A GATEWAY
+    # FAILURE, and with no credentials configured it is the ordinary way a
+    # registry says "no such repository".
+    #
+    # Docker Hub and ghcr refuse to leak existence: they issue a valid
+    # anonymous token for a repo that does not exist, then answer 401 to the
+    # request carrying it. So "typo'd image name" and "private repo you cannot
+    # see" are THE SAME RESPONSE from upstream, and neither is a fault of the
+    # cache or the registry.
+    #
+    # Rendering that as 502 was actively misleading. The most common mistake a
+    # user makes is mistyping an image name, and 502 Bad Gateway tells them the
+    # infrastructure is broken -- so they go and check whether the cache is up,
+    # whether the host is up, whether Docker Hub is having an incident. The one
+    # thing it does not say is "look at what you typed". An error is a routing
+    # instruction for whoever reads it next, and this one routed every typo into
+    # an infrastructure investigation. Found by an operator whose controls also
+    # showed a documented smoke test (a bogus repo name must 404) failing.
+    #
+    # 502 is kept for the two cases where the CACHE really is the problem:
+    # credentials configured and refused, or no way to authenticate at all.
+    if authenticated and not configured:
+        return _err(404, unknown, f"{kind} {reference} not available",
+                    {"x-xhc-upstream-status": "401",
+                     "x-xhc-upstream-auth": "anonymous-refused",
+                     "x-xhc-hint": (f"{ref.upstream} refused an authenticated anonymous "
+                                    "request. The repository does not exist, or it is "
+                                    "private and this cache holds no credentials for "
+                                    f"{ref.upstream}.")})
+
     metrics.record_docker("UPSTREAM_AUTH", kind)
     if configured:
         detail = (f"{ref.upstream} rejected the credentials this cache holds for it. "
@@ -346,7 +382,8 @@ async def _revalidate_tag(
     to prevent.
     """
     try:
-        r = await registry.get(ref, f"manifests/{tag}", {"accept": accept or "*/*"})
+        r = await registry.get(ref, f"manifests/{tag}", {"accept": accept or "*/*"},
+                               out=out)
     except httpx.HTTPError as exc:
         metrics.record_docker_upstream(ref.upstream, None)
         log.info("tag revalidation failed for %s:%s (%s) -- serving cached", ref.key, tag, exc)
@@ -419,7 +456,7 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             return _denied(verdict.reason, "manifest")
         fetched = await _revalidate_tag(ref, reference, accept, "immutable", up)
         if fetched is None:
-            return _unavailable(ref, up.get("status"), reference, "manifest")
+            return _unavailable(ref, up, reference, "manifest")
         metrics.record_docker("MISS", "manifest")
         return _manifest_response(fetched, head)
 
@@ -466,7 +503,7 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             ocigc.mark_orphan(ref.upstream, ref.repo, reference)
             metrics.record_docker("RETAINED", "manifest")
             return _manifest_response(held, head)
-    return _unavailable(ref, up.get("status"), reference, "manifest")
+    return _unavailable(ref, up, reference, "manifest")
 
 
 @router.api_route("/v2/{name:path}/blobs/{digest}", methods=["GET", "HEAD"])
@@ -521,6 +558,11 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         if exc.status == 404:
             return _err(404, "BLOB_UNKNOWN", f"blob {digest} not found upstream")
         if exc.status == 401:
+            # Deliberately NOT the anonymous-refused case. A blob is only
+            # fetched after its manifest was served, so access to this
+            # repository is already established -- a 401 here is a real auth
+            # anomaly rather than the registry declining to admit a repo
+            # exists. Passing a bare status keeps `authenticated` false.
             return _unavailable(ref, 401, digest, "blob")
         return _err(502, "UNAVAILABLE", exc.message)
     except httpx.HTTPError as exc:

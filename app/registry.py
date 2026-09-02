@@ -240,11 +240,23 @@ async def _authed_request(
     *,
     stream: bool,
     content=None,
+    out: dict | None = None,
 ):
     """Issue a request, performing the bearer dance once on a 401.
 
     Returns an httpx.Response. When `stream` is True the caller owns closing it.
+
+    `out`, when given, records `authenticated`: whether we actually presented
+    credentials on the request whose response is returned. A 401 means two very
+    different things depending on it. If we never authenticated, the cache could
+    not talk to the registry. If we DID -- an anonymous bearer token counts,
+    because the registry issued it -- then the registry understood us and said
+    no, which is an ANSWER rather than a gateway failure. Registries that refuse
+    to leak existence answer 401 for a repo that does not exist, so without this
+    flag a typo'd image name is indistinguishable from a broken cache.
     """
+    if out is not None:
+        out["authenticated"] = False
     client = _get_client()
     hdrs = dict(headers)
     token = _cached_token(ref)
@@ -273,6 +285,8 @@ async def _authed_request(
         basic = _basic_for(ref.upstream)
         if basic:
             hdrs["authorization"] = f"Basic {basic}"
+            if out is not None:
+                out["authenticated"] = True
 
     async def send(h):
         # `content` is a CALLABLE returning a fresh body, not a body. The auth
@@ -327,6 +341,8 @@ async def _authed_request(
             log.info("basic challenge from %s and no credentials for it", ref.upstream)
             return r
         hdrs["authorization"] = f"Basic {basic}"
+        if out is not None:
+            out["authenticated"] = True
         _t = time.monotonic()
         try:
             return await send(hdrs)
@@ -357,13 +373,19 @@ async def _authed_request(
     if not token:
         return r
     hdrs["authorization"] = f"Bearer {token}"
+    if out is not None:
+        # An ANONYMOUS token counts. The registry issued it, so it understood
+        # the request; a 401 after presenting it is the registry's answer about
+        # this repository, not a failure to authenticate.
+        out["authenticated"] = True
     return await send(hdrs)
 
 
-async def get(ref: Ref, path: str, headers: dict | None = None, *, method: str = "GET"):
+async def get(ref: Ref, path: str, headers: dict | None = None, *,
+              method: str = "GET", out: dict | None = None):
     """Non-streaming request against `<api>/v2/<repo>/<path>`; body is read."""
     url = f"{ref.api}/v2/{ref.repo}/{path}"
-    r = await _authed_request(method, url, ref, headers or {}, stream=False)
+    r = await _authed_request(method, url, ref, headers or {}, stream=False, out=out)
     if not hasattr(r, "_content_read"):
         await r.aread()
     return r

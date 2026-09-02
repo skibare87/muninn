@@ -135,3 +135,50 @@ def test_upstream_status_is_always_reported_for_logs_and_curl():
     assert r.headers["x-xhc-upstream-status"] == "404"
     r = ocicompat._unavailable(_ref(), None, "latest", "manifest")
     assert r.headers["x-xhc-upstream-status"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# A registry that refuses to leak existence answers 401 for a repo that does
+# not exist. Before this, that rendered as 502 Bad Gateway -- so the single
+# most common user error, a typo'd image name, accused the infrastructure.
+# ---------------------------------------------------------------------------
+
+
+def test_authenticated_then_refused_is_404_not_502():
+    """Docker Hub issues a valid anonymous token for a nonexistent repo, then
+    401s the request carrying it. We authenticated fine; the registry answered.
+    That is 'not there', not 'the gateway is broken'."""
+    ref = registry.resolve("library/definitely-not-real-xyzzy")
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": True}, "latest", "manifest")
+    assert r.status_code == 404
+    assert r.headers["x-xhc-upstream-auth"] == "anonymous-refused"
+
+
+def test_credentials_configured_and_refused_is_still_502(monkeypatch):
+    """The case the three-state work exists for must not regress: we sent real
+    credentials and they were rejected, which the operator fixes on the host."""
+    ref = registry.resolve("library/something")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: True)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": True}, "latest", "manifest")
+    assert r.status_code == 502
+    assert r.headers["x-xhc-upstream-auth"] == "rejected"
+
+
+def test_never_authenticated_is_still_502(monkeypatch):
+    """Challenged and we could not answer at all -- no token, no credentials.
+    The cache genuinely could not reach the registry as anyone."""
+    ref = registry.resolve("library/something")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: False)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": False}, "latest", "manifest")
+    assert r.status_code == 502
+    assert r.headers["x-xhc-upstream-auth"] == "unconfigured"
+
+
+def test_bare_status_still_supported_for_blobs():
+    """The blob path passes a bare 401 on purpose; it must not become a 404."""
+    ref = registry.resolve("library/something")
+    r = ocicompat._unavailable(ref, 401, "sha256:" + "0" * 64, "blob")
+    assert r.status_code == 502
