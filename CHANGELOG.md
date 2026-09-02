@@ -89,6 +89,18 @@ and headers and prints only the status, so the status is the whole message most
 people ever see -- and 404 is the only one that hides itself, rendering as "not
 found" with no code at all.
 
+A COUNTER SERIES THAT DOES NOT EXIST READS AS ZERO
+
+Prometheus handles a counter RESET; it cannot handle a series that is not THERE,
+and those look identical on a graph. Counters keyed on first increment left a
+label absent until its first occurrence after each restart, so any window
+containing a restart was full of holes indistinguishable from zero and
+increase() could not tell "this never happened" from "the process restarted".
+The counters could not answer frequency questions, which is most of what a
+counter is for. Every result/kind the code can emit is now seeded to 0 at
+startup: a zero means zero, a gap means the process was down. Additive to
+/metrics -- nothing is removed or renamed, and /healthz is untouched.
+
 KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
 
