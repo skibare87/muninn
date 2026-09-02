@@ -9,6 +9,66 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.0 — 2026-09-01
+
+Push-through works end to end against a real registry.
+
+Everything in 0.8.x was built and tested against registry:2 and a test client.
+Pointing it at a different registry implementation, with a real multi-megabyte
+layer on the other end, found six defects in a row. Every one of them passed the
+existing suite. That is the release note: the gap was not test coverage, it was
+that a fake never disagrees with you.
+
+THE TWO THAT ONLY A LARGE REAL LAYER COULD FIND
+
+A 3 MiB blob failed with an empty-message ReadError while a 463-byte blob on the
+same session succeeded. The cause is challenge-response plus a body: Muninn sent
+the upload unauthenticated, the registry answered 401 as soon as it had the
+headers and closed WITHOUT DRAINING, and the remaining writes failed. A small
+body already sits in socket buffers and survives; a large one does not. Once an
+upstream has challenged for Basic, credentials now go up front. The first request
+to any upstream is still challenge-response, so credentials are never sent to a
+registry that has not asked -- there is a test for that specifically, because the
+failure mode of getting this wrong in the other direction is leaking them.
+
+A push stalled for 223 seconds at ~0% CPU. Writing client chunks to disk ran on
+the event loop; docker sends a layer as many small writes, and each one blocked
+it for a scheduling round trip. Measuring throughput said this was impossible --
+80 MiB in 0.105s -- and throughput was the wrong measure. The cost was per-call
+latency times call count. Client writes now go to a thread.
+
+THE REST
+
+- A relative upload Location is spec-legal and some registries return one; it was
+  being used as an absolute URL. Now resolved against the session base. A relative
+  auth realm is a different case and is still refused: it is meaningless, and
+  guessing a host to send credentials to is not a recovery.
+- store-forward is EVENTUALLY consistent, not immediately consistent. A manifest
+  is now held until every blob it references is confirmed upstream, and a blob
+  held behind a retry re-enqueues rather than being dropped. A manifest that lands
+  before its layers is a tag resolving to a broken image.
+- Transport failures retry with backoff (5 attempts, 1/4/15/45s), and outstanding
+  forwards are recorded on disk before the client is answered, so a restart
+  re-enqueues them instead of losing them. Confirmed in the wild rather than by
+  construction: a forward that had exhausted its retries survived a restart and
+  was delivered once the upload path could carry it.
+- A failure is never reported without a reason. str(ReadError()) is the empty
+  string, so the operator-facing text now always leads with the exception type.
+- Push limits are logged at boot, including which upstreams are NOT listed and
+  will therefore go unchunked.
+
+DOCS
+
+The pending endpoints are now documented -- an undocumented queue is an invisible
+one, which is the failure store-forward exists to prevent. GET /_cache/docker/pending
+shows state, error, attempts and pin status per outstanding forward; DELETE
+abandons one, which is an explicit decision to break the promise made to whoever
+pushed and to make the only copy evictable. Nothing does that automatically.
+
+KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
+revalidate". 0 means never. The default of 300s is unaffected.
+
+
 ## v0.8.2 — 2026-09-01
 
 Tests for the push HTTP routes, and two fixes they found.
@@ -273,9 +333,6 @@ on, and altering it is client-visible.
 Muninn still cannot pull from registries requiring per-client credentials, by
 design. This is about answering correctly when it cannot.
 
-Found by a colleague while testing whether Muninn could front the private registries;
-that question is settled separately as no.
-
 
 ## v0.6.0 — 2026-09-01
 
@@ -325,7 +382,7 @@ is a health endpoint.
 
 ## v0.5.1 — 2026-08-29
 
-Fix /metrics 500 during ingest (an internal issue).
+Fix /metrics 500 during ingest.
 
 muninn_ingest_bytes_inflight summed j.downloaded_bytes without calling it. An
 uncalled method is truthy, so 'or 0' never fired and sum() raised
