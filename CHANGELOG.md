@@ -111,11 +111,28 @@ mechanism for "who asserts this behaviour", and searching the other's documents
 does not scale -- it makes correctness depend on remembering to go and look.
 
 So the assertion moves to where the change happens: a contract someone else
-depends on becomes a test in the repo that can break it. Pinned are the healthz
-body shape, healthz and metrics staying unauthenticated, the externally scraped
-metric names, and a nonexistent repo answering 404. Each was verified by
-breaking it -- renaming the "ok" key, the exact "tidy" that would silently stop
-another team's alerts, fails the contract test.
+depends on becomes a test in the repo that can break it.
+
+Pinned, read out of the consumer's live monitoring configuration rather than
+guessed: the healthz body as their probe's own regexp matches it -- the key must
+be literally `ok` and the value the JSON boolean `true`, so {"ok": 1} and
+{"healthy": true} pass review and fail the probe -- an exact 200, healthz and
+metrics staying unauthenticated AND served locally rather than falling through
+to the Hub proxy, the durable gauge names, the path-prefix resolution rule with
+all four bare-name forms, a nonexistent repo answering 404, and push defaulting
+to off.
+
+The path separation is the load-bearing one: everything that is not /v2/* or
+/_cache/* proxies to the Hub, so an endpoint moved behind that catch-all would
+return 200 with Hub HTML and read healthy forever.
+
+Each guard was verified by breaking the thing it protects -- renaming the "ok"
+key, flipping the push default, dropping `localhost` from the resolution rule.
+
+Writing them also surfaced something nobody had asserted: /healthz and /metrics
+share cachefs.disk_stats(), and only /healthz catches OSError. There is no
+shared readiness gate, but for that one failure mode two alerts believed to be
+independent have a common cause. Recorded rather than silently changed.
 
 KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
