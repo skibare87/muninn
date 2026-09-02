@@ -9,6 +9,40 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.8.2 — 2026-09-01
+
+Tests for the push HTTP routes, and two fixes they found.
+
+The routes a docker client actually meets had NO tests. Everything about
+push-through was verified underneath them -- the chunking policy, the session
+state, the upstream forwarding, and an end-to-end push against a real
+registry:2 -- and none of it issued an HTTP request to Muninn.
+
+That matters because the OCI push protocol is a sequence, not a call. Each step
+depends on headers from the previous one -- Location, Docker-Upload-UUID, Range
+-- so a route returning the right status with a wrong header fails a real push
+while passing any test that checks only the status.
+
+FIXED, found by those tests: a write-shaped request matching no push route --
+PATCH or PUT with no session id -- fell through to the catch-all, which told the
+caller about "delete and cross-repo mount". With push disabled that is
+misleading; the caller's next question is how to enable it. It now names
+XHC_DOCKER_PUSH.
+
+DELETE /_cache/docker/images now says what it did about layers. Dropping a tag
+frees every layer no other tag references, but on the NEXT scheduled sweep --
+up to XHC_EVICT_INTERVAL away. The old response mentioned only the tag, so
+deleting an image and looking at the disk suggested nothing had happened.
+`?sweep=1` reclaims immediately and reports blobs_removed, manifests_removed
+and freed_bytes; it is opt-in because a sweep walks every blob in the store.
+
+The delete-by-tag guarantee is now pinned by tests, including the half that
+would lose data if it broke: a layer SHARED with a surviving tag must survive.
+Container images share bases constantly, so an eviction that over-collected
+would break every other image on the node. A pinned image also survives its tag
+being dropped, because a pin is a root in its own right.
+
+
 ## v0.8.1 — 2026-09-01
 
 store-forward with XHC_DOCKER_CACHE_ON_PUSH=0 is an EPHEMERAL store.
