@@ -113,8 +113,9 @@ def _unavailable(ref: registry.Ref, up: dict | int | None,
     if isinstance(up, dict):
         upstream_status = up.get("status")
         authenticated = bool(up.get("authenticated"))
+        token_state = up.get("token")
     else:
-        upstream_status, authenticated = up, False
+        upstream_status, authenticated, token_state = up, False, None
     if upstream_status != 401:
         return _err(404, unknown, f"{kind} {reference} not available",
                     {"x-xhc-upstream-status": str(upstream_status or "none"),
@@ -151,6 +152,44 @@ def _unavailable(ref: registry.Ref, up: dict | int | None,
                                     "request. The repository does not exist, or it is "
                                     "private and this cache holds no credentials for "
                                     f"{ref.upstream}.")})
+
+    # THE SAME DISTINCTION, ONE LAYER DOWN. Registries differ in WHERE they
+    # refuse, and the fix above only covered one of the two places.
+    #
+    #   Docker Hub  issues a valid anonymous token for a repo that does not
+    #               exist, then 401s the request carrying it -> handled above.
+    #   ghcr        refuses at the TOKEN ENDPOINT with 403, so we never
+    #               authenticate at all and the branch above cannot fire.
+    #
+    # Measured: ghcr's token endpoint returns 403 for a nonexistent repo and 200
+    # for a real public one; Docker Hub returns 200 for both. Same user error,
+    # same user-visible failure, and before this the second one still rendered
+    # as 502 -- so a mistyped image name accused the infrastructure depending on
+    # which registry it was mistyped against.
+    #
+    # A 401/403 FROM THE AUTH SERVICE IS AN ANSWER. It understood the request
+    # and refused this scope. With no credentials held that is indistinguishable
+    # from "no such repository", which is the honest thing to tell the caller.
+    if token_state == "declined" and not configured:
+        return _err(404, unknown, f"{kind} {reference} not available",
+                    {"x-xhc-upstream-status": "401",
+                     "x-xhc-upstream-auth": "anonymous-refused-at-token",
+                     "x-xhc-hint": (f"{ref.upstream}'s token endpoint refused an anonymous "
+                                    "request for this repository. It does not exist, or it "
+                                    "is private and this cache holds no credentials for "
+                                    f"{ref.upstream}.")})
+
+    # No answer at all from the auth service. This is what 502 is FOR, and
+    # keeping it distinct is what stops the change above from hiding outages:
+    # a token endpoint returning 500 must never render as "you typed it wrong".
+    if token_state == "unreachable":
+        metrics.record_docker("UPSTREAM_AUTH", kind)
+        return _err(502, "UNAVAILABLE",
+                    f"could not reach {ref.upstream}'s token endpoint to authenticate "
+                    f"for {reference}. This is an upstream or network fault rather than "
+                    "a missing credential.",
+                    {"x-xhc-upstream-status": "401",
+                     "x-xhc-upstream-auth": "token-endpoint-unreachable"})
 
     metrics.record_docker("UPSTREAM_AUTH", kind)
     if configured:

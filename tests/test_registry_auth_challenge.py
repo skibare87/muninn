@@ -232,7 +232,9 @@ def test_a_bearer_challenge_does_not_take_the_basic_path(monkeypatch):
     _fetch_token is stubbed to fail, so a Bearer challenge yields the original
     401. If Bearer wrongly fell into the Basic branch this would be a 200.
     """
-    async def _no_token(ref, challenge):
+    async def _no_token(ref, challenge, out=None):
+        if out is not None:
+            out["token"] = "unreachable"
         return None
 
     monkeypatch.setattr(registry, "_fetch_token", _no_token)
@@ -318,7 +320,11 @@ def test_anonymous_token_then_401_still_counts_as_authenticated(monkeypatch):
     monkeypatch.setattr(registry, "_cached_token", lambda ref: None)
     monkeypatch.setattr(registry, "_basic_for", lambda upstream: None)
 
-    async def _token(ref, challenge):
+    async def _token(ref, challenge, out=None):
+        # `out` mirrors the real signature: _fetch_token reports WHY it failed
+        # so the caller can tell a definitive refusal from no answer at all.
+        if out is not None:
+            out["token"] = "ok"
         return "an-anonymous-token"
 
     monkeypatch.setattr(registry, "_fetch_token", _token)
@@ -355,3 +361,62 @@ def test_unsatisfiable_challenge_leaves_authenticated_false(monkeypatch):
     )
     assert resp.status_code == 401
     assert out["authenticated"] is False
+
+
+# ---------------------------------------------------------------------------
+# The wiring: _fetch_token used to return None for five distinct
+# states, so the caller could not tell a definitive refusal from no answer.
+# ---------------------------------------------------------------------------
+
+
+class _TokenEndpointClient:
+    """A client whose TOKEN endpoint answers with a chosen status."""
+
+    def __init__(self, token_status):
+        self.token_status = token_status
+        self.sent = []
+
+    def build_request(self, method, url, headers=None, content=None):
+        return types.SimpleNamespace(method=method, url=url,
+                                     headers=headers or {}, content=content)
+
+    async def send(self, req, stream=False):
+        self.sent.append(str(req.url))
+        return _FakeResponse(401, {"www-authenticate":
+                                   'Bearer realm="https://auth.example.com/token"'})
+
+    async def get(self, url, params=None, headers=None):
+        return _FakeResponse(self.token_status)
+
+
+def _token_state(monkeypatch, status):
+    client = _TokenEndpointClient(status)
+    monkeypatch.setattr(registry, "_get_client", lambda: client)
+    monkeypatch.setattr(registry, "_cached_token", lambda ref: None)
+    monkeypatch.setattr(registry, "_basic_for", lambda upstream: None)
+    ref = registry.Ref(upstream="ghcr.io", api="https://ghcr.io", repo="org/img")
+    out: dict = {}
+    asyncio.run(registry._authed_request(
+        "GET", f"{ref.api}/v2/{ref.repo}/manifests/latest", ref, {},
+        stream=False, out=out))
+    return out
+
+
+def test_token_endpoint_403_is_recorded_as_declined(monkeypatch):
+    """ghcr's actual behaviour for a nonexistent repo, measured."""
+    assert _token_state(monkeypatch, 403).get("token") == "declined"
+
+
+def test_token_endpoint_401_is_recorded_as_declined(monkeypatch):
+    assert _token_state(monkeypatch, 401).get("token") == "declined"
+
+
+def test_token_endpoint_500_is_recorded_as_unreachable(monkeypatch):
+    """A 5xx is NOT an answer. Collapsing it into `declined` would turn an
+    upstream outage into a 404, which is the defect in reverse."""
+    assert _token_state(monkeypatch, 500).get("token") == "unreachable"
+
+
+def test_token_endpoint_429_is_recorded_as_unreachable(monkeypatch):
+    """Rate limiting is not a statement about whether the repo exists."""
+    assert _token_state(monkeypatch, 429).get("token") == "unreachable"

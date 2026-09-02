@@ -182,3 +182,72 @@ def test_bare_status_still_supported_for_blobs():
     ref = registry.resolve("library/something")
     r = ocicompat._unavailable(ref, 401, "sha256:" + "0" * 64, "blob")
     assert r.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Registries differ in WHERE they refuse, and the first fix only
+# covered one of the two places.
+#
+#   Docker Hub  issues an anonymous token for a nonexistent repo, then 401s
+#               the request carrying it        -> "authenticated, then refused"
+#   ghcr        refuses at the token endpoint  -> never authenticates at all
+#
+# Measured 2026-09-02: ghcr's token endpoint returns 403 for a nonexistent repo
+# and 200 for a real public one; Docker Hub returns 200 for both.
+# ---------------------------------------------------------------------------
+
+
+def test_token_endpoint_declined_anonymously_is_404(monkeypatch):
+    """A 401/403 from the auth service is an ANSWER, not a gateway failure.
+
+    With no credentials held it is indistinguishable from "no such repository",
+    which is what the caller needs to hear. Before this, a mistyped ghcr image
+    name returned 502 Bad Gateway and sent the reader to check the network.
+    """
+    ref = registry.resolve("ghcr.io/org/definitely-not-real-xyzzy")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: False)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": False, "token": "declined"},
+        "latest", "manifest")
+    assert r.status_code == 404
+    assert r.headers["x-xhc-upstream-auth"] == "anonymous-refused-at-token"
+
+
+def test_token_endpoint_declined_with_credentials_is_502(monkeypatch):
+    """We presented real credentials to the auth service and were refused.
+    That is the operator's problem to fix and must not be softened to 404."""
+    ref = registry.resolve("ghcr.io/org/private")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: True)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": False, "token": "declined"},
+        "latest", "manifest")
+    assert r.status_code == 502
+    assert r.headers["x-xhc-upstream-auth"] == "rejected"
+
+
+def test_token_endpoint_unreachable_is_502_not_404(monkeypatch):
+    """THE NEGATIVE CONTROL, and the reason it matters more than the fix.
+
+    A token endpoint returning 500, or timing out, means we got no answer at
+    all. Rendering that as 404 would convert a genuine upstream outage into
+    "you typed it wrong" -- the same misdirection as the original defect, in the
+    opposite direction, and harder to spot because it looks like a clean answer.
+    """
+    ref = registry.resolve("ghcr.io/org/img")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: False)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": False, "token": "unreachable"},
+        "latest", "manifest")
+    assert r.status_code == 502
+    assert r.headers["x-xhc-upstream-auth"] == "token-endpoint-unreachable"
+
+
+def test_docker_hub_path_is_unaffected(monkeypatch):
+    """The earlier fix must not regress: Hub authenticates anonymously and
+    is then refused, which is a different branch from ghcr's."""
+    ref = registry.resolve("library/definitely-not-real-xyzzy")
+    monkeypatch.setattr(registry, "has_credentials", lambda u: False)
+    r = ocicompat._unavailable(
+        ref, {"status": 401, "authenticated": True}, "latest", "manifest")
+    assert r.status_code == 404
+    assert r.headers["x-xhc-upstream-auth"] == "anonymous-refused"

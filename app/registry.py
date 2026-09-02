@@ -180,9 +180,33 @@ def _parse_challenge(header: str) -> dict:
     return parsed
 
 
-async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
+async def _fetch_token(ref: Ref, challenge: dict, out: dict | None = None) -> str | None:
+    """Run the bearer token dance. `out["token"]` records WHY it failed.
+
+    THIS FUNCTION USED TO RETURN None FOR FIVE DISTINCT STATES -- no realm, a
+    non-URL realm, a transport error, a non-200 from the token endpoint, and a
+    200 carrying no token -- and the caller could not tell them apart. That is
+    the same collapse that made every upstream 401 render as 502, one layer
+    down, and it is why the fix for THAT did not reach every registry.
+
+    The distinction that matters to a caller is whether the registry's auth
+    service gave us an ANSWER:
+
+        declined     401/403 -- it understood us and refused this scope. For a
+                     registry that will not leak existence, an anonymous
+                     refusal is indistinguishable from "no such repository".
+        unreachable  transport error or 5xx -- we never got an answer. This is
+                     what a gateway failure actually is.
+        unusable     a realm we cannot or must not use, or a 200 with no token.
+    """
+
+    def _mark(state: str) -> None:
+        if out is not None:
+            out["token"] = state
+
     realm = challenge.get("realm")
     if not realm:
+        _mark("unusable")
         return None
     # The realm is registry-controlled text, not necessarily a URL. One registry
     # sends `Basic realm="Authorization Required"`, and httpx treats that as a
@@ -192,6 +216,7 @@ async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
     # calling it handled. an internal issue.
     if urlparse(realm).scheme not in ("http", "https") or not urlparse(realm).netloc:
         log.warning("ignoring non-URL auth realm %r from %s", realm, ref.upstream)
+        _mark("unusable")
         return None
     params = {k: v for k, v in challenge.items() if k in ("service", "scope") and v}
     params.setdefault("scope", f"repository:{ref.repo}:pull")
@@ -205,13 +230,20 @@ async def _fetch_token(ref: Ref, challenge: dict) -> str | None:
         # ValueError as well: httpx raises it out of urllib for a malformed URL
         # rather than as an httpx error. Belt and braces behind the check above.
         log.warning("token fetch failed for %s: %s", ref.upstream, exc)
+        _mark("unreachable")
         return None
     if r.status_code != 200:
         log.warning("token endpoint %s returned %s for %s", realm, r.status_code, ref.key)
+        # 401/403 is the auth service ANSWERING: it understood the request and
+        # refused this scope. Anything else -- 5xx, 429, a redirect loop -- is a
+        # failure to get an answer at all, and only that is a gateway problem.
+        _mark("declined" if r.status_code in (401, 403) else "unreachable")
         return None
     body = r.json()
     token = body.get("token") or body.get("access_token")
     if not token:
+        log.warning("token endpoint %s returned 200 with no token for %s", realm, ref.key)
+        _mark("unusable")
         return None
     ttl = float(body.get("expires_in") or 300)
     # Expire a little early rather than discovering staleness mid-pull.
@@ -369,7 +401,7 @@ async def _authed_request(
     lock = _token_locks.setdefault((ref.upstream, ref.repo), asyncio.Lock())
     async with lock:
         # Another request may have refreshed while we waited.
-        token = _cached_token(ref) or await _fetch_token(ref, challenge)
+        token = _cached_token(ref) or await _fetch_token(ref, challenge, out)
     if not token:
         return r
     hdrs["authorization"] = f"Bearer {token}"
