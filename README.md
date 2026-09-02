@@ -594,7 +594,7 @@ collapsing those would silently disarm pin protection inside an unattended loop.
 | `GET` | `/_cache/docker/prewarm/{id}` | poll it |
 | `GET` | `/_cache/docker/images` | cached tags, with pin and orphan state |
 | `GET`/`POST`/`DELETE` | `/_cache/docker/pins` | pin an image and its blob closure |
-| `DELETE` | `/_cache/docker/images` | drop a tag; its blobs go on the next sweep |
+| `DELETE` | `/_cache/docker/images` | drop a tag; frees every layer no other tag references. `?sweep=1` reclaims now and reports the bytes, otherwise the next sweep does it |
 | `POST` | `/_cache/docker/gc` | run mark-and-sweep now (`?dry_run=true` to see what would go) |
 
 Prewarm is fire-and-forget, so nobody holds an HTTP connection open across a 30 GB pull.
@@ -804,6 +804,13 @@ If you need a door on it, put one in front — a reverse proxy doing basic auth 
 unauthenticated by design.
 
 ## Management API
+
+> **Deleting a tag frees exactly its own layers.** Eviction is top-down: dropping the tag
+> removes the root, and mark-and-sweep collects whatever became unreachable. A layer another
+> tag still uses stays reachable and is never collected — which matters because container
+> images share bases constantly, and an eviction that over-collected would break every other
+> image on the node. A pinned image survives its tag being dropped, because a pin is a root
+> in its own right.
 
 All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer …`.
 

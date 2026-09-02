@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from . import metrics, ocicompat, ocigc, ocistore, policy, registry
 from .cachefs import StateUnavailable
+from .config import settings
 from .manage import require_manage_token
 
 log = logging.getLogger("xhc.ocimanage")
@@ -232,9 +233,24 @@ async def remove_pin(req: PinRequest) -> dict:
 
 
 @router.delete("/images", dependencies=[Depends(require_manage_token)])
-async def evict_image(req: EvictRequest) -> dict:
-    """Drop a tag. Its blobs are removed by the next sweep if nothing else
-    references them -- eviction is top-down and never deletes a blob directly."""
+async def evict_image(req: EvictRequest, sweep: bool = False) -> dict:
+    """Drop a tag, freeing every layer no other tag still references.
+
+    Eviction is TOP-DOWN and never deletes a blob directly: dropping the tag
+    removes the root, and mark-and-sweep then collects whatever became
+    unreachable. That is what makes shared layers safe -- a layer another tag
+    still uses is still reachable, so it is never collected.
+
+    By default the blobs go on the NEXT scheduled sweep, up to
+    XHC_EVICT_INTERVAL away. That is fine for reclaiming space and confusing
+    for a human: delete a tag, look at the disk, see nothing freed, conclude it
+    failed. So the response says when it will happen, and `?sweep=1` does it
+    now and reports the bytes.
+
+    `?sweep=1` walks every blob in the store, so it costs more than the delete
+    itself on a large cache. It is opt-in for that reason rather than the
+    default.
+    """
     try:
         pins = ocigc.pinned_tag_keys(strict=True)
     except StateUnavailable as exc:
@@ -249,7 +265,29 @@ async def evict_image(req: EvictRequest) -> dict:
         raise HTTPException(status_code=404, detail=f"{req.image} is not cached")
     for p in dropped:
         p.unlink(missing_ok=True)
-    return {"dropped": req.image, "tags_removed": len(dropped)}
+
+    out = {"dropped": req.image, "tags_removed": len(dropped)}
+    if sweep:
+        try:
+            result = ocigc.sweep(ocigc.mark(strict=True))
+        except StateUnavailable as exc:
+            # The tag is already gone; say so rather than implying the whole
+            # call failed, and let the scheduled sweep finish the job.
+            out["swept"] = False
+            out["sweep_error"] = str(exc)
+            return out
+        out["swept"] = True
+        out["blobs_removed"] = result["blobs"]
+        out["manifests_removed"] = result["manifests"]
+        out["freed_bytes"] = result["freed_bytes"]
+    else:
+        out["swept"] = False
+        out["note"] = (
+            "layers not referenced by another tag are freed by the next sweep, "
+            f"within {settings.evict_interval_s}s. Pass ?sweep=1 to reclaim now "
+            "and see the bytes."
+        )
+    return out
 
 
 @router.post("/gc", dependencies=[Depends(require_manage_token)])
