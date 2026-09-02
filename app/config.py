@@ -185,6 +185,15 @@ class Settings:
     allow_images: str = ""
     deny_images: str = ""
     docker_max_blob_bytes: int | None = None
+    # Below this much free space on the image store, a miss is PROXIED to the
+    # client without being cached, rather than ingested into a filesystem that
+    # cannot hold it. Set 0 to disable.
+    #
+    # 1 GiB is a floor with a reason rather than a round number: container
+    # layers are routinely hundreds of megabytes, so an ingest attempted below
+    # this is near-certain to fail -- and failing costs more than not trying,
+    # because it fails MID-STREAM after the client already has a 2xx.
+    docker_min_free_bytes: int = 1 << 30
 
     # --- server --------------------------------------------------------------
     host: str = "0.0.0.0"
@@ -292,6 +301,8 @@ class Settings:
             allow_images=os.environ.get("XHC_ALLOW_IMAGES", cls.allow_images),
             deny_images=os.environ.get("XHC_DENY_IMAGES", cls.deny_images),
             docker_max_blob_bytes=parse_size(os.environ.get("XHC_DOCKER_MAX_BLOB_BYTES"), None),
+            docker_min_free_bytes=parse_size(os.environ.get("XHC_DOCKER_MIN_FREE"),
+                                             cls.docker_min_free_bytes),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),
             port=_env_int("XHC_PORT", 8080),
             manage_token=os.environ.get("XHC_MANAGE_TOKEN") or None,

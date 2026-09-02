@@ -600,6 +600,34 @@ If the pin or orphan state cannot be read, **GC refuses rather than proceeding**
 state file legitimately means "nothing is pinned"; an unreadable one means "unknown", and
 collapsing those would silently disarm pin protection inside an unattended loop.
 
+### A full disk degrades the pull instead of breaking it
+
+**Under budget is not the same as having room.** Eviction compares the cache's own size against
+its own budget (`XHC_DOCKER_MAX_SIZE`) and never consults free space — so on a shared filesystem
+anything else can fill the volume while this cache sits far under budget.
+
+Before `XHC_DOCKER_MIN_FREE`, every ingest then failed **mid-stream**, after the client already
+had a `2xx`, arriving as a truncated body and a digest mismatch with the real cause invisible.
+**And there is no fallback for the client to take** — a node configured to use this cache has had
+its image reference rewritten, so the cache *is* its registry.
+
+Below the floor, a miss is now **streamed straight through to the client and not cached**. The
+pull gets slower; it does not break. Responses carry `x-xhc-cache: BYPASS-NO-SPACE`, because
+"the cache is cold" and "the cache cannot write" look identical from the client otherwise, and
+the condition is logged at `WARNING` on every bypass.
+
+**It does not evict to make room, deliberately.** On a filesystem with no quota or reservation,
+space freed here does not come back to this cache — it goes to whatever is filling the volume.
+The cache would shrink, evict again, and end up small *and* still failing, having destroyed warm
+data to get there. Refusing to cache is reversible and costs nothing that was already paid for.
+
+An **unreadable** filesystem keeps caching rather than switching to bypass: the risk being
+guarded here is a slowdown, not data loss, so unknown resolves to the status quo. That is the
+opposite of how pin state resolves unknown, and deliberately so.
+
+Watch `muninn_disk_free_bytes` — it is the only figure that moves here, because every
+budget-derived number reads healthy throughout.
+
 ### What a failed pull means, by status
 
 The docker CLI **discards the body and headers and prints only the status**, so the status is
@@ -662,6 +690,7 @@ mid-pull and assemble a tree from two commits.
 | `XHC_ALLOW_REGISTRIES` / `XHC_DENY_REGISTRIES` | unset | host globs, **honoured in `open` mode too** |
 | `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |
 | `XHC_DOCKER_MAX_BLOB_BYTES` | unset | refuse an oversized layer before bytes move |
+| `XHC_DOCKER_MIN_FREE` | `1G` | below this much free space, a miss is **proxied to the client uncached** instead of ingested; `0` disables |
 | `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
 
 > **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing

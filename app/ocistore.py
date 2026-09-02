@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import settings
+
+log = logging.getLogger("xhc.ocistore")
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
@@ -237,6 +241,56 @@ def tag_is_fresh(entry: dict) -> bool:
         # first cached, forever, which is what a pure archive wants.
         return True
     return (time.time() - float(entry.get("checked_at") or 0)) < ttl
+
+
+def free_bytes() -> int | None:
+    """Free space on the image store's filesystem, or None if unreadable.
+
+    None is deliberately NOT zero. An unreadable filesystem is UNKNOWN, and
+    resolving unknown to "no space" would silently stop caching everything;
+    resolving it to "plenty" would silently keep trying. The caller decides,
+    and it is the same distinction that governs pin state.
+    """
+    try:
+        return shutil.disk_usage(root()).free
+    except OSError as exc:
+        log.warning("cannot read free space on the image store: %s", exc)
+        return None
+
+
+def has_ingest_room() -> bool:
+    """Whether a miss should be cached, or proxied to the client uncached.
+
+    UNDER BUDGET IS NOT THE SAME AS HAVING ROOM. Eviction compares this cache's
+    own size against its own budget and never consults free space, so on a
+    shared filesystem anything else can fill the volume while this cache sits
+    far under budget -- and then every ingest fails MID-STREAM, after the client
+    already has a 2xx, as a truncated body and a digest mismatch.
+
+    There is no fallback for the client to take: a node using this cache has had
+    its image reference rewritten, so the cache IS its registry. Degrading to a
+    slow uncached pull is the only behaviour that keeps the pull working.
+
+    NOT evicting to make room, deliberately. The pool this runs on has no quota
+    and no reservation anywhere -- ruled permanent by Matt, 2026-09-02: "I don't
+    see a reason we need quota or reservation... if we are running out of space
+    and need to keep it all, that's an architecture update, quota won't save
+    us." So space freed here does not come back to this cache; it goes to
+    whoever is filling the volume, and the cache shrinks, evicts again, and ends
+    small AND still failing, having destroyed warm data to get there.
+
+    An UNREADABLE filesystem returns True -- keep behaving as before rather than
+    silently switching every client to uncached on a stat error. That is a
+    deliberate fail-open and it is the safe direction here, because the failure
+    it guards is a degradation rather than a data loss.
+    """
+    floor = settings.docker_min_free_bytes
+    if floor <= 0:
+        return True
+    free = free_bytes()
+    if free is None:
+        return True
+    return free >= floor
 
 
 # -- accounting -------------------------------------------------------------

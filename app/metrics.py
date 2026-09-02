@@ -62,6 +62,7 @@ _DOCKER_SERIES: tuple[tuple[str, str], ...] = (
     ("UPSTREAM_AUTH", "manifest"), ("UPSTREAM_AUTH", "blob"),
     ("PROXIED", "tags"), ("PROXIED", "referrers"),
     ("PUSH", "manifest"), ("PUSH", "blob"),
+    ("BYPASS", "blob"),
 )
 
 # Results carrying no kind dimension are seeded the same way.

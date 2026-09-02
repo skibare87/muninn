@@ -299,6 +299,63 @@ async def _write_blob(job: BlobJob, resp: httpx.Response) -> None:
                 _inflight.pop((job.upstream, job.digest), None)
 
 
+async def _proxy_blob_uncached(ref: registry.Ref, digest: str,
+                               head: bool) -> Response:
+    """Stream a blob straight through to the client without caching it.
+
+    Used when the image store has no room. THE ALTERNATIVE IS NOT "cache it
+    anyway", it is a failed pull: an ingest into a full filesystem dies
+    mid-stream, after the client already has a 2xx, and arrives as a truncated
+    body and a digest mismatch with the real cause invisible. There is no
+    fallback for the client to take -- its image reference was rewritten to
+    point here, so this cache IS its registry.
+
+    So this is the fail-open path that the docker surface never had. The pull
+    gets slower; it does not break.
+    """
+    try:
+        resp = await registry.open_stream(ref, f"blobs/{digest}")
+    except httpx.HTTPError as exc:
+        metrics.record_docker_upstream(ref.upstream, None)
+        return _err(502, "UNAVAILABLE", f"upstream unreachable: {exc}")
+
+    metrics.record_docker_upstream(ref.upstream, resp.status_code)
+    if resp.status_code != 200:
+        status = resp.status_code
+        await resp.aclose()
+        if status == 404:
+            return _err(404, "BLOB_UNKNOWN", f"blob {digest} not found upstream")
+        return _unavailable(ref, status, digest, "blob")
+
+    headers = dict(_API_VERSION)
+    headers["docker-content-digest"] = digest
+    # Say so on the wire. An operator seeing slow pulls needs to be able to tell
+    # "the cache is cold" from "the cache cannot write", and those look
+    # identical from the client otherwise.
+    headers["x-xhc-cache"] = "BYPASS-NO-SPACE"
+    size = int(resp.headers.get("content-length") or 0) or None
+    if size is not None:
+        headers["content-length"] = str(size)
+
+    metrics.record_docker("BYPASS", "blob")
+    if head:
+        await resp.aclose()
+        return Response(content=b"", headers=headers)
+
+    async def _pump():
+        try:
+            async for chunk in resp.aiter_bytes(serving.CHUNK):
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    # Bytes are NOT counted as served: served/ingested figures describe the
+    # cache's own traffic, and counting a passthrough would inflate the
+    # amplification ratio with bytes the cache never held.
+    return StreamingResponse(_pump(), headers=headers,
+                             media_type="application/octet-stream")
+
+
 async def _ensure_blob(ref: registry.Ref, digest: str) -> BlobJob:
     """Start (or join) an ingest for this blob.
 
@@ -588,6 +645,17 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
 
     if not verdict.allowed:
         return _denied(verdict.reason, "blob")
+
+    # Checked BEFORE claiming an in-flight slot: an ingest that cannot succeed
+    # should never start, and joiners must not queue behind one.
+    if not ocistore.has_ingest_room():
+        log.warning(
+            "image store is below XHC_DOCKER_MIN_FREE -- proxying %s/%s UNCACHED. "
+            "Something is consuming this filesystem; eviction will not help, "
+            "because this cache is not necessarily what filled it.",
+            ref.upstream, digest,
+        )
+        return await _proxy_blob_uncached(ref, digest, head)
 
     try:
         job = await _ensure_blob(ref, digest)
