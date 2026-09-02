@@ -591,6 +591,8 @@ sweeps only what falls outside that set. Freeing space when everything is refere
 it. **Pinned tags and retained orphans are never candidates**, even if that means missing the
 capacity target — running hot on disk is recoverable.
 
+**"Running hot" means near capacity, not out of space.** Those are different states, not points on a spectrum. If the filesystem actually fills, an ingest fails mid-stream and the client receives a **truncated body on an already-sent `2xx`**, surfacing as a digest mismatch rather than a clear error — and there is **no fallback to upstream**, because a client configured to use this cache has had its image reference rewritten, so the cache *is* its registry. Only `XHC_MISS_POLICY=redirect` sends a client upstream on a miss, and it is not the default. Watch `muninn_disk_free_bytes`: every budget-derived number reads healthy while this happens, because eviction compares the cache's own size against its own budget and never consults free space.
+
 **Pinning an image pins its whole closure.** A pin that kept the manifest but let its layers
 go would look intact until someone pulled it.
 

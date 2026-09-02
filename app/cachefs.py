@@ -415,6 +415,15 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
     # strict: if we cannot read what is protected, we must not delete anything.
     # Running hot on disk is recoverable; evicting a pinned model or a retained
     # orphan is not -- for an orphan the copy here is the only one left.
+    #
+    # "RECOVERABLE" MEANS NEAR CAPACITY, NOT OUT OF SPACE, and the two are not
+    # on a spectrum. Measured: an OSError during ingest sets job.state="error"
+    # and serving.tail_follow() returns mid-stream, so the client gets a
+    # truncated body on an already-sent 2xx and sees a digest mismatch. There
+    # is NO fallback to upstream -- a node using this cache has had its image
+    # reference rewritten, so the cache IS its registry
+    # (`docker pull <closed-port>/library/alpine` -> connection refused).
+    # Do not read this comment as "a full disk is fine".
     try:
         pins = load_pins(strict=True)
         orphans = load_orphans(strict=True)
