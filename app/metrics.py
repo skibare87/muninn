@@ -3,9 +3,24 @@
 Hand-rolled text format rather than a client library: the exposition format is a
 few lines of string building, and this service otherwise has four dependencies.
 
-Counters live in the process and reset on restart, which is fine — Prometheus
-handles counter resets, and every gauge here is derived from disk or from live
-state rather than accumulated.
+Counters live in the process and reset on restart. Prometheus handles a counter
+RESET; what it cannot handle is a series that does not exist, and those are not
+the same thing.
+
+A `collections.Counter` materialises a key on first increment, so before a given
+result has occurred even once since startup, that series is ABSENT from the
+exposition rather than present at zero. Over a window containing a restart the
+timeline is then full of holes that look exactly like zero, and `increase()`
+cannot tell "this never happened" from "the process restarted and nothing has
+triggered this label yet". That makes the counters unable to answer the
+frequency questions counters exist for -- measured by an operator who tried to
+ask "has the fleet been hitting this?" over 7 days and could not, while
+`up{job="muninn"}` and the disk-derived gauges were continuous throughout.
+
+So every label combination that CAN occur is seeded to 0 at import. A zero then
+means zero, a gap means the process was down, and `increase()` works across a
+restart. Gauges are unaffected: they are derived from disk or live state rather
+than accumulated.
 """
 
 from __future__ import annotations
@@ -32,6 +47,40 @@ _docker_bytes_ingested = 0
 # Bounds the label cardinality: a client that sends a unique header per request
 # would otherwise grow this map without limit and blow up the scrape.
 MAX_CLIENT_LABELS = 200
+
+# Every (result, kind) this process can emit, seeded to 0 so the series exists
+# from startup rather than from first occurrence. NOT the cartesian product:
+# only combinations a code path can actually produce, so the exposition does not
+# advertise states that cannot happen. Adding a new record_docker() result means
+# adding it here -- there is a test that fails if a call site uses a pair this
+# list does not carry.
+_DOCKER_SERIES: tuple[tuple[str, str], ...] = (
+    ("HIT", "manifest"), ("HIT", "blob"),
+    ("MISS", "manifest"), ("MISS", "blob"),
+    ("RETAINED", "manifest"),
+    ("DENIED", "manifest"), ("DENIED", "blob"),
+    ("UPSTREAM_AUTH", "manifest"), ("UPSTREAM_AUTH", "blob"),
+    ("PROXIED", "tags"), ("PROXIED", "referrers"),
+    ("PUSH", "manifest"), ("PUSH", "blob"),
+)
+
+# Results carrying no kind dimension are seeded the same way.
+_REQUEST_SERIES: tuple[str, ...] = (
+    "DSSERVER-HIT", "DSSERVER-MISS", "DSSERVER-SYNTHESIZED",
+    "VIEWER-HIT", "VIEWER-SYNTHESIZED",
+)
+
+
+def _seed() -> None:
+    """Make every possible series exist at zero. Idempotent, and it must never
+    overwrite a live value -- `setdefault` semantics, not assignment."""
+    for result, kind in _DOCKER_SERIES:
+        _docker.setdefault(f"{result}|{kind}", 0)
+    for result in _REQUEST_SERIES:
+        _requests.setdefault(result, 0)
+
+
+_seed()
 
 
 def record_request(result: str, client: str | None = None) -> None:

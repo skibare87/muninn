@@ -460,6 +460,18 @@ terabytes will report zero bytes served immediately after a restart, and that is
 not a fault. If you need to know whether it has ever worked, ask the durable
 gauges — a non-zero `muninn_cache_bytes` cannot exist without ingestion.
 
+**Every labelled series exists from startup, at zero.** Prometheus handles a
+counter *reset*; it cannot handle a series that is not *there*, and those are
+different failures that look identical on a graph. A counter keyed on first
+increment would leave `muninn_docker_requests_total{result="UPSTREAM_AUTH"}`
+absent until the first such request after each restart — so a window containing
+a restart is full of holes indistinguishable from zero, and `increase()` over it
+cannot tell "this never happened" from "the process restarted and nothing has
+triggered this label yet". Every result/kind combination the code can emit is
+therefore seeded to zero at startup, so **a zero means zero and a gap means the
+process was down.** A test enumerates the call sites and fails if a new result
+is added without being seeded.
+
 ### Every `bytes_served_total` figure from before 0.5.2 is inflated
 
 Before 0.5.2 the served counter incremented on **`HEAD` as well as `GET`**, using
