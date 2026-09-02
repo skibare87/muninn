@@ -486,6 +486,19 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
     if path.is_file():
         if not verdict.allowed and policy.docker_enforced_on_hits():
             return _denied(verdict.reason, "blob")
+        # Answering 200 here is CORRECT in store-forward: the cache holds the
+        # bytes and will deliver them. But a client that sees 200 skips the
+        # upload, so if this blob arrived from an earlier push whose forward
+        # failed, nothing would ever schedule another attempt -- no upload, no
+        # enqueue, an empty queue and no error anywhere. Silence that means
+        # "nothing was asked", not "nothing went wrong".
+        #
+        # So: keep the 200 (store-forward is eventually consistent, not
+        # immediately consistent) and make sure the delivery it implies is
+        # actually scheduled. No-op for a blob cached from a pull, which was
+        # fetched from that upstream and is already there.
+        if settings.docker_push_enabled:
+            ocipush.ensure_forward(ref, digest)
         size = path.stat().st_size
         metrics.record_docker("HIT", "blob")
         headers = dict(_API_VERSION)

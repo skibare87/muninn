@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import uuid as uuidlib
@@ -312,6 +313,39 @@ def is_pinned(upstream: str, digest: str) -> bool:
     return f"{upstream}/{digest}" in _pinned
 
 
+def ensure_forward(ref: registry.Ref, digest: str) -> bool:
+    """Make sure an unconfirmed blob is actually scheduled for delivery.
+
+    THE QUIET HALF OF THE PUSH BUG. `docker push` HEADs each blob and skips
+    uploading any the registry reports it has. In store-forward the cache
+    legitimately answers 200 for a blob it holds -- it has the bytes and will
+    forward them -- so the client correctly skips the upload. But if that blob
+    arrived from an EARLIER PUSH WHOSE FORWARD FAILED, nothing schedules a new
+    attempt: the client uploads nothing, so no forward is enqueued, so the
+    queue stays empty and NOTHING LOGS AN ERROR. From here nothing failed,
+    because from here nothing was asked.
+
+    That is why the second attempt failed faster and more quietly than the
+    first: the first uploaded blobs and enqueued forwards that then failed
+    loudly; the second skipped the upload and enqueued nothing at all.
+
+    Returns True if a forward was (re)scheduled. Only ever acts on blobs this
+    cache is holding UNCONFIRMED -- a blob cached from a pull was fetched from
+    that upstream, so it is already there and needs nothing.
+    """
+    key = f"{ref.upstream}/{digest}"
+    if key not in _pinned:
+        return False                       # confirmed, or not ours to deliver
+    task = _pending.get(key)
+    if task is not None and not task.done():
+        return False                       # already in flight
+    log.info("re-scheduling the forward of %s to %s: it is held here but not "
+             "confirmed upstream, and no attempt is in flight",
+             digest, ref.upstream)
+    _pending[key] = asyncio.create_task(_forward_later(ref, digest, key))
+    return True
+
+
 def pending() -> list[dict]:
     """What has been accepted but not yet confirmed upstream.
 
@@ -395,20 +429,106 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
                       "(XHC_DOCKER_CACHE_ON_PUSH=0)", digest)
 
 
+def referenced_digests(body: bytes) -> list[str]:
+    """Every blob digest a manifest points at: config plus layers.
+
+    A manifest is only valid once its blobs are upstream, so this is the
+    ordering constraint for a deferred forward. An index or manifest list
+    points at other manifests rather than blobs; those have their own
+    dependencies and are not chased here.
+    """
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return []
+    out = []
+    cfg = (doc.get("config") or {}).get("digest")
+    if cfg:
+        out.append(cfg)
+    for layer in doc.get("layers") or []:
+        if layer.get("digest"):
+            out.append(layer["digest"])
+    return out
+
+
 async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
                         reference: str) -> str:
-    """Forward a manifest and cache it. Returns its digest."""
+    """Deliver a manifest, synchronously or deferred depending on the mode.
+
+    STORE-FORWARD IS EVENTUALLY CONSISTENT, NOT IMMEDIATELY CONSISTENT. This
+    path did not honour that: it forwarded synchronously and handed the client
+    the upstream's status, which is proxy behaviour. The tell is that a client
+    saw the registry's own 400 -- a deferred forward cannot return an upstream
+    status, so receiving one is proof no deferral happened.
+
+    It also forwarded a manifest while the blobs it references were still in
+    flight, which the registry correctly rejects: a manifest is only valid once
+    its blobs are there. So the deferred forward must be ORDERED AFTER them.
+    """
     digest = ocistore.compute_digest(body)
-    r = await registry.request(
-        ref, "PUT", f"manifests/{reference}",
-        {"content-type": media_type, "content-length": str(len(body))},
-        lambda: body,
-    )
-    if r.status_code not in (201, 202):
-        raise PushError(502, "UNAVAILABLE",
-                        f"{ref.upstream} rejected the manifest: {r.status_code}")
-    if settings.docker_cache_on_push:
-        ocistore.store_manifest(ref.upstream, digest, body, media_type)
-        ocistore.write_tag(ref.upstream, ref.repo, reference,
-                           ocistore.accept_fingerprint(media_type), digest, media_type)
+
+    if settings.docker_push_mode == "proxy":
+        r = await registry.request(
+            ref, "PUT", f"manifests/{reference}",
+            {"content-type": media_type, "content-length": str(len(body))},
+            lambda: body,
+        )
+        if r.status_code not in (201, 202):
+            raise PushError(502, "UNAVAILABLE",
+                            f"{ref.upstream} rejected the manifest: {r.status_code}")
+        _store_manifest(ref, digest, body, media_type, reference)
+        return digest
+
+    # store-forward: land it, answer, deliver behind -- after its blobs.
+    _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
+    key = f"{ref.upstream}/{digest}"
+    _pinned.add(key)
+    _pending[key] = asyncio.create_task(
+        _forward_manifest_later(ref, body, media_type, reference, digest, key))
     return digest
+
+
+def _store_manifest(ref, digest, body, media_type, reference, *,
+                    force_keep: bool = False) -> None:
+    if not (settings.docker_cache_on_push or force_keep):
+        return
+    ocistore.store_manifest(ref.upstream, digest, body, media_type)
+    ocistore.write_tag(ref.upstream, ref.repo, reference,
+                       ocistore.accept_fingerprint(media_type), digest, media_type)
+
+
+async def _forward_manifest_later(ref, body, media_type, reference, digest, key):
+    """Wait for this manifest's blobs to land upstream, then deliver it.
+
+    Released on success only, for the same reason as a blob: a manifest whose
+    forward failed is the record that the client was told 201 and the registry
+    never got it. Tidying it away turns a visible failure into a silent one.
+    """
+    try:
+        deps = [_pending.get(f"{ref.upstream}/{d}")
+                for d in referenced_digests(body)]
+        deps = [t for t in deps if t is not None]
+        if deps:
+            log.info("manifest %s waits on %d blob forward(s) to %s",
+                     reference, len(deps), ref.upstream)
+            await asyncio.gather(*deps)
+        r = await registry.request(
+            ref, "PUT", f"manifests/{reference}",
+            {"content-type": media_type, "content-length": str(len(body))},
+            lambda: body,
+        )
+        if r.status_code not in (201, 202):
+            raise PushError(502, "UNAVAILABLE",
+                            f"{ref.upstream} rejected the manifest: {r.status_code}")
+    except asyncio.CancelledError:
+        log.warning("deferred manifest forward of %s to %s CANCELLED; it stays "
+                    "pinned and pending", reference, ref.upstream)
+        raise
+    except Exception:
+        log.exception("deferred manifest forward of %s to %s FAILED; the client "
+                      "was told 201 and the registry does not have it",
+                      reference, ref.upstream)
+        raise
+    else:
+        _pinned.discard(key)
+        _pending.pop(key, None)

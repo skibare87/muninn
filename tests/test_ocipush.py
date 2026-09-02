@@ -448,3 +448,126 @@ def test_a_location_on_a_different_host_is_honoured(monkeypatch, tmp_path):
     other = "https://uploads.zot.example.com/v2/team/img/blobs/uploads/q"
     url = _push_against(monkeypatch, tmp_path, other)
     assert url.startswith(other)
+
+
+# --------------------------------------------------------------------------
+# store-forward is EVENTUALLY consistent, not immediately consistent.
+#
+# Two defects came from treating it as the latter. Both were silent: the queue
+# was empty and nothing logged an error, because from Muninn's side nothing had
+# failed -- nothing had been asked.
+# --------------------------------------------------------------------------
+
+def test_manifests_are_deferred_in_store_forward(monkeypatch, tmp_path):
+    """The manifest path was forwarding SYNCHRONOUSLY in both modes.
+
+    The tell was that a client received the registry's own 400: a deferred
+    forward cannot return an upstream status, so receiving one proves no
+    deferral happened.
+    """
+    from app import ocistore
+    from app import registry as reg
+
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    sent = asyncio.Event()
+
+    async def upstream(r, method, path, headers=None, content=None):
+        sent.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(reg, "request", upstream)
+    body = b'{"schemaVersion":2,"layers":[]}'
+
+    async def go():
+        digest = await ocipush.push_manifest(
+            _ref(), body, "application/vnd.oci.image.manifest.v1+json", "latest")
+        # Returned WITHOUT the upstream having answered.
+        return digest, sent.is_set(), ocipush.pending()
+
+    digest, upstream_answered, pend = asyncio.run(go())
+    assert digest == ocistore.compute_digest(body)
+    assert not upstream_answered, "the manifest was forwarded synchronously"
+    assert pend, "the deferred manifest was never enqueued"
+
+
+def test_a_deferred_manifest_waits_for_its_blobs(monkeypatch, tmp_path):
+    """A manifest is only valid once its blobs are upstream, so the deferred
+    forward must be ordered after them -- pushing it early is what the registry
+    rejected with a 400."""
+    from app import registry as reg
+
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    order = []
+    blob_done = asyncio.Event()
+
+    async def slow_blob(ref, path, digest):
+        await blob_done.wait()
+        order.append("blob")
+
+    async def upstream(r, method, path, headers=None, content=None):
+        order.append("manifest")
+        return type("R", (), {"status_code": 201, "headers": {}})()
+
+    monkeypatch.setattr(ocipush, "push_blob", slow_blob)
+    monkeypatch.setattr(reg, "request", upstream)
+
+    cfg = "sha256:" + "a" * 64
+    body = ('{"schemaVersion":2,"config":{"digest":"%s"},"layers":[]}' % cfg).encode()
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"cfg")
+        # Pretend the config blob is the one being forwarded.
+        ocipush._pending[f"r.example.com/{cfg}"] = asyncio.create_task(
+            slow_blob(_ref(), up.path, cfg))
+        await ocipush.push_manifest(
+            _ref(), body, "application/vnd.oci.image.manifest.v1+json", "t")
+        await asyncio.sleep(0)
+        blob_done.set()
+        await asyncio.gather(*[t for t in ocipush._pending.values()],
+                             return_exceptions=True)
+        return order
+
+    got = asyncio.run(go())
+    assert got and got[0] == "blob", \
+        f"the manifest was delivered before its blobs: {got}"
+
+
+def test_a_held_but_unconfirmed_blob_gets_its_forward_rescheduled(monkeypatch, tmp_path):
+    """The quiet half.
+
+    A client that sees 200 skips the upload, so a blob left over from a failed
+    forward would never be re-enqueued: no upload, no enqueue, empty queue, no
+    error. ensure_forward closes that.
+    """
+    scheduled = []
+
+    async def fake_forward(ref, digest, key):
+        scheduled.append(digest)
+
+    monkeypatch.setattr(ocipush, "_forward_later", fake_forward)
+    ref = _ref()
+    digest = "sha256:" + "b" * 64
+
+    async def go():
+        # Not held at all -- nothing to deliver, nothing scheduled.
+        first = ocipush.ensure_forward(ref, digest)
+        # Held and unconfirmed, with no attempt in flight.
+        ocipush._pinned.add(f"{ref.upstream}/{digest}")
+        second = ocipush.ensure_forward(ref, digest)
+        await asyncio.sleep(0)
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert first is False, "scheduled a forward for a blob we do not hold"
+    assert second is True, "an unconfirmed blob was never rescheduled"
+    assert scheduled == [digest]
+
+
+def test_a_confirmed_cached_blob_is_not_rescheduled(monkeypatch, tmp_path):
+    """The complement. A blob cached from a PULL was fetched from that upstream
+    and is already there -- re-pushing every cached layer on every HEAD would
+    be a self-inflicted stampede."""
+    ref = _ref()
+    digest = "sha256:" + "c" * 64
+    assert ocipush.ensure_forward(ref, digest) is False
