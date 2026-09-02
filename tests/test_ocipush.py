@@ -17,6 +17,7 @@ bytes.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sys
 from pathlib import Path
@@ -262,7 +263,8 @@ def test_store_forward_exposes_what_is_pending(monkeypatch):
         return ocipush.pending()
 
     pend = asyncio.run(go())
-    assert pend and all(v == "running" for v in pend.values())
+    assert pend and all(p["state"] == "running" for p in pend)
+    assert all(p["digest"].startswith("sha256:") for p in pend)
 
 
 def test_a_failed_forward_stays_pinned_and_visible(monkeypatch):
@@ -294,8 +296,13 @@ def test_a_failed_forward_stays_pinned_and_visible(monkeypatch):
 
     pinned, pend = asyncio.run(go())
     assert pinned, "a blob whose push FAILED was left collectable"
-    assert pend and all(v == "failed" for v in pend.values()), \
+    assert pend and all(p["state"] == "failed" for p in pend), \
         "a failed push vanished from the pending view"
+    assert all(p["error"] for p in pend), \
+        "a failed push reported no reason -- 'failed' alone sends the reader " \
+        "to the wrong place"
+    assert all(p["pinned"] for p in pend), \
+        "a failed push was reported as unpinned while still being the only copy"
 
 
 def test_store_forward_with_cache_off_is_an_EPHEMERAL_store(monkeypatch):
@@ -366,3 +373,78 @@ def test_store_forward_with_cache_ON_keeps_it_after_confirming(monkeypatch):
     digest = asyncio.run(go())
     assert ocistore.blob_path("r.example.com", digest).exists()
     assert not ocipush.is_pinned("r.example.com", digest)
+
+
+# --------------------------------------------------------------------------
+# A RELATIVE Location header, which the OCI spec permits and zot returns.
+#
+# registry:2 answers with an absolute URL, so the end-to-end test that shipped
+# with this feature never exercised the relative path -- push worked against
+# every registry that happened to answer absolutely and CRASHED on the others
+# with ValueError out of urllib, not an error the caller could act on.
+#
+# Second time an upstream's relative URL has broken this module. The first was
+# a Basic realm that was not a URL at all. The two are handled differently and
+# both are right: a relative Location is spec-legal and gets RESOLVED, while a
+# relative realm is meaningless and gets REFUSED.
+# --------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, code, headers=None):
+        self.status_code, self.headers = code, headers or {}
+
+    async def aread(self):
+        return b""
+
+
+def _push_against(monkeypatch, tmp_path, location_header):
+    """Drive push_blob against a registry that answers with `location_header`."""
+    from app import registry as reg
+
+    seen = {}
+
+    async def fake_request(r, method, path, headers=None, content=None):
+        if method == "HEAD":
+            return _Resp(404)
+        if method == "POST":
+            return _Resp(202, {"location": location_header})
+        raise AssertionError(f"unexpected {method} {path}")
+
+    async def fake_absolute(r, method, url, headers=None, content=None):
+        seen["url"] = url
+        return _Resp(201)
+
+    monkeypatch.setattr(reg, "request", fake_request)
+    monkeypatch.setattr(reg, "request_absolute", fake_absolute)
+
+    payload = b"z" * 4096
+    blob = tmp_path / "layer"
+    blob.write_bytes(payload)
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    ref = reg.Ref(upstream="zot.example.com", api="https://zot.example.com",
+                  repo="team/img")
+    asyncio.run(ocipush.push_blob(ref, blob, digest))
+    return seen["url"]
+
+
+def test_a_relative_location_is_resolved_against_the_session(monkeypatch, tmp_path):
+    url = _push_against(monkeypatch, tmp_path, "/v2/team/img/blobs/uploads/abc-123")
+    assert url.startswith("https://zot.example.com/v2/team/img/blobs/uploads/abc-123"), \
+        f"a relative Location reached the client unresolved: {url!r}"
+
+
+def test_an_absolute_location_is_left_alone(monkeypatch, tmp_path):
+    """The complement. A fix that mangled absolute URLs would pass the test
+    above and break every registry that already worked."""
+    absolute = "https://zot.example.com/v2/other/path/uploads/xyz"
+    url = _push_against(monkeypatch, tmp_path, absolute)
+    assert url.startswith(absolute), f"an absolute Location was rewritten: {url!r}"
+
+
+def test_a_location_on_a_different_host_is_honoured(monkeypatch, tmp_path):
+    """Registries may hand the session to a separate upload endpoint. Resolving
+    must not force it back onto the API host."""
+    other = "https://uploads.zot.example.com/v2/team/img/blobs/uploads/q"
+    url = _push_against(monkeypatch, tmp_path, other)
+    assert url.startswith(other)

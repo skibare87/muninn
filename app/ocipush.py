@@ -39,6 +39,7 @@ import os
 import uuid as uuidlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urljoin
 
 from . import ocistore, pushlimits, registry
 from .config import settings
@@ -164,6 +165,7 @@ async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
         return
 
     size = path.stat().st_size
+    session_base = f"{ref.api}/v2/{ref.repo}/blobs/uploads/"
     r = await registry.request(ref, "POST", "blobs/uploads/")
     if r.status_code not in (202, 201):
         raise PushError(502, "UNAVAILABLE",
@@ -172,6 +174,16 @@ async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
     if not location:
         raise PushError(502, "UNAVAILABLE",
                         f"{ref.upstream} returned no upload Location")
+    # THE OCI SPEC PERMITS A RELATIVE Location, and registries differ: zot
+    # returns a relative path, registry:2 an absolute URL. Passing a relative
+    # one to httpx raises ValueError out of urllib -- so push worked against
+    # every registry that happened to answer absolutely, and failed on the
+    # others with a crash rather than an error.
+    #
+    # This is the SECOND time an upstream's relative URL has broken this
+    # module: the first was a Basic realm that was not a URL at all. Same
+    # shape, different header. Resolve, never assume.
+    location = urljoin(session_base, location)
 
     limit = pushlimits.for_upstream(ref.upstream)
     while True:
@@ -230,8 +242,13 @@ async def _upload(ref, location, path, size, digest, limit) -> None:
             raise PushError(502, "UNAVAILABLE",
                             f"{ref.upstream} rejected a chunk at {offset}: "
                             f"{r.status_code}")
-        # The session URL may move between chunks; the registry chooses it.
-        url = r.headers.get("location") or url
+        # The session URL may move between chunks; the registry chooses it,
+        # and may again choose a relative one. Resolve against the URL this
+        # response actually came from, not against the original session base --
+        # a registry that redirects the session mid-upload would otherwise have
+        # each hop resolved against the wrong origin.
+        nxt = r.headers.get("location")
+        url = urljoin(url, nxt) if nxt else url
         offset += n
 
     r = await registry.request_absolute(ref, "PUT", _with_digest(url, digest),
@@ -295,14 +312,55 @@ def is_pinned(upstream: str, digest: str) -> bool:
     return f"{upstream}/{digest}" in _pinned
 
 
-def pending() -> dict[str, str]:
+def pending() -> list[dict]:
     """What has been accepted but not yet confirmed upstream.
 
     store-forward owes an answer to "what is pending right now" -- an invisible
-    queue is how a push gets silently lost.
+    queue is how a push gets silently lost. The failure text is included
+    because "failed" without a reason sends the reader to the wrong place.
     """
-    return {k: ("running" if not t.done() else "failed" if t.exception() else "done")
-            for k, t in _pending.items()}
+    out = []
+    for key, task in _pending.items():
+        upstream, _, digest = key.partition("/")
+        if not task.done():
+            state, err = "running", None
+        elif task.cancelled():
+            state, err = "cancelled", "the forward was cancelled, likely at shutdown"
+        elif task.exception() is not None:
+            state, err = "failed", str(task.exception())
+        else:
+            state, err = "done", None
+        out.append({"upstream": upstream, "digest": digest, "state": state,
+                    "error": err, "pinned": key in _pinned})
+    return sorted(out, key=lambda x: (x["state"], x["digest"]))
+
+
+def abandon(upstream: str, digest: str) -> dict:
+    """Give up on a forward that will not succeed, and let GC have the blob.
+
+    A pinned blob is pinned because it may be the ONLY copy -- so releasing one
+    is a deletion decision, not housekeeping, and it is deliberately explicit
+    rather than something a sweep decides on its own.
+
+    Refuses while the forward is still running: abandoning a push that is
+    mid-flight would race the upload and could unpin content that is about to
+    be needed. Stop it by other means first if that is really what you want.
+    """
+    key = f"{upstream}/{digest}"
+    task = _pending.get(key)
+    if task is None and key not in _pinned:
+        raise PushError(404, "NOT_PENDING", f"{key} is not a pending push")
+    if task is not None and not task.done():
+        raise PushError(409, "STILL_RUNNING",
+                        f"{key} is still forwarding; refusing to unpin content "
+                        "whose upload is in flight")
+    _pinned.discard(key)
+    _pending.pop(key, None)
+    log.warning("ABANDONED the forward of %s to %s. It is no longer pinned and "
+                "GC may now collect it. The client that pushed it was told 201.",
+                digest, upstream)
+    return {"abandoned": key, "note": "unpinned; the next sweep may collect it "
+            "if no manifest references it"}
 
 
 async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:

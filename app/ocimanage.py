@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from . import metrics, ocicompat, ocigc, ocistore, policy, registry
+from . import metrics, ocicompat, ocigc, ocipush, ocistore, policy, registry
 from .cachefs import StateUnavailable
 from .config import settings
 from .manage import require_manage_token
@@ -62,6 +62,11 @@ class PrewarmRequest(BaseModel):
 
 class PinRequest(BaseModel):
     image: str
+
+
+class AbandonRequest(BaseModel):
+    upstream: str = Field(description="registry host, e.g. ghcr.io")
+    digest: str = Field(description="sha256:... of the blob whose forward is abandoned")
 
 
 class EvictRequest(BaseModel):
@@ -288,6 +293,33 @@ async def evict_image(req: EvictRequest, sweep: bool = False) -> dict:
             "and see the bytes."
         )
     return out
+
+
+@router.get("/pending", dependencies=[Depends(require_manage_token)])
+async def list_pending() -> dict:
+    """Pushes accepted but not yet confirmed upstream (store-forward only).
+
+    Documented as "the pending view" before it existed as a route: pending()
+    was reachable in-process and by nothing over HTTP, so the documentation
+    described a surface a reader could not reach. Anyone following it got the
+    HF catch-all and a page of huggingface.co HTML -- a wrong path here returns
+    200 with someone else's content rather than a 404.
+    """
+    return {"pending": ocipush.pending()}
+
+
+@router.delete("/pending", dependencies=[Depends(require_manage_token)])
+async def abandon_pending(req: AbandonRequest) -> dict:
+    """Give up on a forward that will not succeed and release its pin.
+
+    A deletion decision rather than housekeeping: the blob is pinned precisely
+    because it may be the only copy, and the client that pushed it was told
+    201. Refuses while the forward is still running.
+    """
+    try:
+        return ocipush.abandon(req.upstream, req.digest)
+    except ocipush.PushError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
 
 
 @router.post("/gc", dependencies=[Depends(require_manage_token)])
