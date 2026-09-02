@@ -27,7 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from . import metrics, ocigc, ocistore, policy, registry, serving
+from . import metrics, ocigc, ocipush, ocistore, policy, registry, serving
 from .config import settings
 
 log = logging.getLogger("xhc.oci")
@@ -625,15 +625,131 @@ async def unknown_v2(rest: str) -> Response:
     return _err(404, "NOT_FOUND", f"/v2/{rest} is not a supported registry endpoint")
 
 
+def _push_disabled() -> JSONResponse:
+    return _err(
+        405,
+        "UNSUPPORTED",
+        "push-through is disabled. Set XHC_DOCKER_PUSH=1 to enable it, or push "
+        "to the upstream registry directly.",
+    )
+
+
+@router.post("/v2/{name:path}/blobs/uploads/", include_in_schema=False)
+async def blob_upload_start(name: str, request: Request) -> Response:
+    """Begin an upload session, or reject a cross-repo mount.
+
+    A mount asks the registry to link a blob it already holds from another
+    repository. Muninn cannot honour that meaningfully -- the blob may not be
+    upstream at all yet -- so it declines by answering 202, which the spec
+    defines as "no mount, upload it normally". Declining a mount is not an
+    error, and returning one would fail the push.
+    """
+    if not settings.docker_push_enabled:
+        return _push_disabled()
+    ref, err = _resolve_or_error(name)
+    if err:
+        return err
+    verdict = policy.check_docker(ref.upstream, ref.repo)
+    if not verdict.allowed:
+        return _denied(verdict.reason, "blob")
+
+    up = ocipush.begin(ref)
+    digest = request.query_params.get("digest")
+    if digest:
+        # Single-POST monolithic upload: body and digest in one request.
+        ocipush.append(up, await request.body())
+        try:
+            await ocipush.finalise_blob(up, digest)
+        except ocipush.PushError as exc:
+            return _err(exc.status, exc.code, exc.message)
+        return Response(status_code=201, headers={
+            "location": f"/v2/{name}/blobs/{digest}",
+            "docker-content-digest": digest, **_API_VERSION})
+
+    return Response(status_code=202, headers={
+        "location": f"/v2/{name}/blobs/uploads/{up.uuid}",
+        "docker-upload-uuid": up.uuid,
+        "range": "0-0", **_API_VERSION})
+
+
+@router.patch("/v2/{name:path}/blobs/uploads/{uuid}", include_in_schema=False)
+async def blob_upload_chunk(name: str, uuid: str, request: Request) -> Response:
+    if not settings.docker_push_enabled:
+        return _push_disabled()
+    try:
+        up = ocipush.get(uuid)
+    except ocipush.PushError as exc:
+        return _err(exc.status, exc.code, exc.message)
+    async for chunk in request.stream():
+        ocipush.append(up, chunk)
+    return Response(status_code=202, headers={
+        "location": f"/v2/{name}/blobs/uploads/{uuid}",
+        "docker-upload-uuid": uuid,
+        "range": f"0-{max(up.offset - 1, 0)}", **_API_VERSION})
+
+
+@router.put("/v2/{name:path}/blobs/uploads/{uuid}", include_in_schema=False)
+async def blob_upload_finish(name: str, uuid: str, request: Request) -> Response:
+    """Finalise: verify the digest, then forward and cache."""
+    if not settings.docker_push_enabled:
+        return _push_disabled()
+    digest = request.query_params.get("digest")
+    if not digest or not ocistore.DIGEST_RE.match(digest):
+        return _err(400, "DIGEST_INVALID", "PUT requires a ?digest=sha256:...")
+    try:
+        up = ocipush.get(uuid)
+    except ocipush.PushError as exc:
+        return _err(exc.status, exc.code, exc.message)
+    async for chunk in request.stream():
+        ocipush.append(up, chunk)
+    try:
+        await ocipush.finalise_blob(up, digest)
+    except ocipush.PushError as exc:
+        return _err(exc.status, exc.code, exc.message)
+    metrics.record_docker("PUSH", "blob")
+    return Response(status_code=201, headers={
+        "location": f"/v2/{name}/blobs/{digest}",
+        "docker-content-digest": digest, **_API_VERSION})
+
+
+@router.put("/v2/{name:path}/manifests/{reference}", include_in_schema=False)
+async def manifest_push(name: str, reference: str, request: Request) -> Response:
+    if not settings.docker_push_enabled:
+        return _push_disabled()
+    ref, err = _resolve_or_error(name)
+    if err:
+        return err
+    verdict = policy.check_docker(ref.upstream, ref.repo)
+    if not verdict.allowed:
+        return _denied(verdict.reason, "manifest")
+    body = await request.body()
+    media = request.headers.get("content-type") or (
+        "application/vnd.oci.image.manifest.v1+json")
+    try:
+        digest = await ocipush.push_manifest(ref, body, media, reference)
+    except ocipush.PushError as exc:
+        return _err(exc.status, exc.code, exc.message)
+    metrics.record_docker("PUSH", "manifest")
+    return Response(status_code=201, headers={
+        "location": f"/v2/{name}/manifests/{digest}",
+        "docker-content-digest": digest, **_API_VERSION})
+
+
 @router.api_route(
     "/v2/{rest:path}",
     methods=["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
 async def unsupported(rest: str) -> Response:
+    """Everything push-shaped that is not implemented.
+
+    DELETE stays refused deliberately: removing an upstream tag or manifest is
+    a retention decision belonging to whoever owns that registry, not to a
+    cache sitting in front of it.
+    """
     return _err(
         405,
         "UNSUPPORTED",
-        "muninn is a pull-through cache: push, delete and cross-repo mount are "
-        "not supported. Push to the upstream registry directly.",
+        "not supported: delete and cross-repo mount. Deleting upstream content "
+        "is a retention decision for that registry's owner, not for a cache.",
     )

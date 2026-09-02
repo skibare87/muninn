@@ -86,6 +86,23 @@ async def lifespan(app: FastAPI):
         # disarmed pin protection in an internal issue. Losing a password file must not
         # silently reopen the cache.
         dockerauth.load()
+
+        if settings.docker_push_enabled:
+            log.warning(
+                "push-through is ENABLED (mode=%s). Any client that can reach "
+                "this cache may push to any registry it holds credentials for, "
+                "under this cache's identity and with no attribution -- a "
+                "docker push cannot identify itself. Restrict who can reach the "
+                "port, or set XHC_DOCKER_HTPASSWD to require a credential.",
+                settings.docker_push_mode,
+            )
+            if settings.docker_push_mode == "store-forward":
+                log.warning(
+                    "push mode is `store-forward`: clients are told 201 BEFORE "
+                    "the upstream registry has the content. A push followed by "
+                    "a pull elsewhere can race it. Use `proxy` if a 201 must "
+                    "mean the registry really has it."
+                )
         if settings.docker_auth == "basic":
             log.warning(
                 "client auth is `basic`: credentials are sent in clear unless "

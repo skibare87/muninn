@@ -226,7 +226,13 @@ def clear_tokens() -> None:
 
 
 async def _authed_request(
-    method: str, url: str, ref: Ref, headers: dict, *, stream: bool
+    method: str,
+    url: str,
+    ref: Ref,
+    headers: dict,
+    *,
+    stream: bool,
+    content=None,
 ):
     """Issue a request, performing the bearer dance once on a 401.
 
@@ -239,7 +245,14 @@ async def _authed_request(
         hdrs["authorization"] = f"Bearer {token}"
 
     async def send(h):
-        req = client.build_request(method, url, headers=h)
+        # `content` is a CALLABLE returning a fresh body, not a body. The auth
+        # dance re-sends the request after a 401, and a consumed file handle or
+        # exhausted iterator would silently send an empty second request --
+        # which for a push means an accepted upload containing nothing. A
+        # factory makes the retry safe for a 5 GB layer streamed off disk as
+        # well as for a small chunk held in memory.
+        body = content() if content is not None else None
+        req = client.build_request(method, url, headers=h, content=body)
         return await client.send(req, stream=stream)
 
     r = await send(hdrs)
@@ -315,3 +328,35 @@ async def open_stream(ref: Ref, path: str, headers: dict | None = None):
     """Streaming request; the caller MUST close the returned response."""
     url = f"{ref.api}/v2/{ref.repo}/{path}"
     return await _authed_request("GET", url, ref, headers or {}, stream=True)
+
+
+async def request(ref: Ref, method: str, path: str, headers: dict | None = None,
+                  content=None):
+    """Arbitrary method against `<api>/v2/<repo>/<path>`, with an optional body.
+
+    `content` is a callable returning a fresh body per attempt -- see send().
+    Used by the push path, which needs PATCH and PUT with real payloads and
+    must survive the bearer/basic dance without sending an empty retry.
+    """
+    url = f"{ref.api}/v2/{ref.repo}/{path}"
+    r = await _authed_request(method, url, ref, headers or {}, stream=False,
+                              content=content)
+    if not hasattr(r, "_content_read"):
+        await r.aread()
+    return r
+
+
+async def request_absolute(ref: Ref, method: str, url: str,
+                           headers: dict | None = None, content=None):
+    """Same, against an absolute URL.
+
+    An upload session's Location is registry-chosen and may point anywhere --
+    a different host, a different path shape, with its own query string. It
+    must be used verbatim rather than reconstructed, which is why this exists
+    alongside request().
+    """
+    r = await _authed_request(method, url, ref, headers or {}, stream=False,
+                              content=content)
+    if not hasattr(r, "_content_read"):
+        await r.aread()
+    return r

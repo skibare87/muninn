@@ -142,8 +142,12 @@ class _FakeClient:
         self.challenge = challenge
         self.sent = []
 
-    def build_request(self, method, url, headers=None):
-        return types.SimpleNamespace(method=method, url=url, headers=headers or {})
+    def build_request(self, method, url, headers=None, content=None):
+        # `content` mirrors httpx: the push path sends bodies through the same
+        # auth dance, and a fake that did not accept it would pass while the
+        # real client raised.
+        return types.SimpleNamespace(method=method, url=url,
+                                     headers=headers or {}, content=content)
 
     async def send(self, req, stream=False):
         self.sent.append(dict(req.headers))

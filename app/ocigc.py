@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ocistore
+from . import ocipush, ocistore
 from .cachefs import StateUnavailable
 from .config import settings
 
@@ -308,6 +308,15 @@ def sweep(marking: Marking, dry_run: bool = False) -> dict:
     removed_blobs = removed_manifests = 0
     for item in _enumerate("blobs"):
         if marking.protects_blob(item.upstream, item.digest):
+            continue
+        # A blob accepted by store-forward and not yet confirmed upstream is
+        # THE ONLY COPY. Unlike a cached layer it cannot be re-fetched, so
+        # collecting it loses data that a client was already told was pushed.
+        # A manifest referencing it may not exist yet either -- an uploaded
+        # blob is unreachable BY CONSTRUCTION in the window before its
+        # manifest arrives, which is exactly what mark-and-sweep would
+        # otherwise treat as garbage. an internal issue.
+        if ocipush.is_pinned(item.upstream, item.digest):
             continue
         freed += item.size if dry_run else _unlink(item.path)
         removed_blobs += 1
