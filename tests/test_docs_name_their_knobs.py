@@ -89,3 +89,77 @@ def test_the_regctl_file_credential_caveat_is_documented():
     readme = (ROOT / "README.md").read_text()
     assert "ignores any credentials" in readme or "limits-only" in readme, \
         "the README does not say credentials in the limits file are ignored"
+
+
+# ---------------------------------------------------------------------------
+# THE GUARD ABOVE GENERALISED TO THE INSTANCES THAT PROMPTED IT, WHICH IS ITS
+# OWN DEFECT.
+#
+# Both examples that caused it to be written were environment variables, so it
+# encodes "env vars must be documented". The actual shape is broader:
+#
+#     ANYTHING A READER MUST NAME IN ORDER TO USE MUST BE NAMED IN THE DOCS.
+#
+# Config variables are one instance. ROUTES are another, and that is the one
+# that got through: `/_cache/docker/pending` shipped and stayed undocumented
+# for three releases while this file went green -- and the docs described "the
+# pending view" as the reason store-forward is safe to enable, so the mitigation
+# was unreachable by anyone who had not read the router.
+#
+# The management surface is read off app.routes rather than a hand-maintained
+# list, because a list beside code that changes is a list that drifts.
+# ---------------------------------------------------------------------------
+
+# Excluded deliberately, each with the reason. An exclusion list that grows
+# silently rebuilds the original problem, so these are named individually
+# rather than matched by a broad pattern.
+_NOT_READER_FACING = {
+    # OCI protocol surface: a docker client calls these, never a human, and
+    # they are specified by the distribution spec rather than by this project.
+    "/v2", "/v2/",
+    # Catch-alls, not endpoints.
+    "/v2/{rest:path}", "/{full_path:path}",
+    # FastAPI's own, not ours.
+    "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc",
+}
+
+
+def _management_routes() -> set[str]:
+    """Every non-protocol path this app serves, from the router itself."""
+    from app.main import app
+
+    paths = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if not path or not getattr(route, "methods", None):
+            continue
+        if path in _NOT_READER_FACING or path.startswith("/v2/{name:path}"):
+            continue
+        paths.add(path)
+    return paths
+
+
+def test_every_management_endpoint_is_named_in_the_readme():
+    """A route a reader must type is exactly as undocumentable as a variable
+    they must set, and this file did not know that until it was bitten."""
+    readme = (ROOT / "README.md").read_text()
+    missing = sorted(p for p in _management_routes()
+                     if p.split("{")[0].rstrip("/") not in readme)
+    assert not missing, (
+        "endpoints the app serves but the README never names, so a reader can "
+        f"only find them by reading the router: {missing}"
+    )
+
+
+def test_the_exclusion_list_does_not_silently_cover_everything():
+    """The negative control for the test above.
+
+    If a refactor renamed the management prefix, `_management_routes()` could
+    return an empty set and the check above would pass vacuously -- a sweep
+    that has never been shown to find a known instance. Assert it still sees
+    the surface it exists to police.
+    """
+    routes = _management_routes()
+    assert len(routes) >= 10, f"the route sweep found almost nothing: {sorted(routes)}"
+    for expected in ("/healthz", "/metrics", "/_cache/docker/pending"):
+        assert expected in routes, f"{expected} vanished from the swept set"
