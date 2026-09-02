@@ -625,8 +625,74 @@ mid-pull and assemble a tree from two commits.
 > what the cache holds** and is deliberate; this one is about **which upstreams anyone may
 > make the cache fetch from**, which is worth narrowing even on a network you trust.
 
-**Not implemented:** push. A cache that accepts pushes is a registry, with GC, quota
-and durability obligations.
+### Push-through
+
+**Off by default.** `XHC_DOCKER_PUSH=1` enables it.
+
+```bash
+docker push <cache-host>/ghcr.io/you/image:latest
+```
+
+The image is forwarded to `ghcr.io/you/image:latest` **and** kept in the cache, so
+the next node to pull it gets a local hit rather than a cold fetch.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `XHC_DOCKER_PUSH` | `0` | accept pushes at all |
+| `XHC_DOCKER_PUSH_MODE` | `proxy` | `proxy`, `store-forward` |
+| `XHC_DOCKER_CACHE_ON_PUSH` | `1` | keep the pushed image locally |
+| `XHC_DOCKER_PUSH_LIMITS` | unset | per-registry chunking, regctl format |
+| `XHC_DOCKER_BLOB_CHUNK` | unset | global chunk fallback |
+
+#### The point: chunk limits stop being every client's problem
+
+A `docker push` does a **monolithic PUT** and has no chunk-size knob. A registry behind a
+body-size-limiting proxy rejects that outright, so pushing to one means knowing a number
+the OCI protocol never advertises — which is why tools like `regctl` have to be configured
+per host, and why plain `docker push` fails against such a registry for large layers.
+
+Muninn decouples the two: the client pushes normally, and **what goes upstream is
+re-chunked per registry**. Point `XHC_DOCKER_PUSH_LIMITS` at a regctl-format file — the
+same shape `regctl registry set --blob-chunk` already produces, so if you have solved this
+before you already have the values:
+
+```json
+{"hosts": {"registry.example.com": {"blobChunk": 16777216, "blobMax": 16777216}}}
+```
+
+`blobMax` is the threshold above which to chunk; `blobChunk` is the piece size. Muninn reads
+**only** those two fields and ignores any credentials in the file — mount a limits-only file
+rather than a real regctl config.
+
+**If you configure nothing, it still works.** On a `413` Muninn halves the chunk, retries,
+and logs the exact config line to add. You learn the number from your own logs instead of
+bisecting a production registry. That depends on the proxy returning a clean `413`; some
+drop the connection instead, which is indistinguishable from a network failure, and those
+need configuring by hand.
+
+#### `proxy` vs `store-forward`
+
+`proxy` (default) confirms upstream **before** answering the client, so a `201` means the
+registry really has it. `store-forward` answers as soon as the content is on disk and
+pushes behind, which is faster and survives upstream flakiness — but **it tells the client
+the push succeeded before it has.** CI that pushes and then triggers a pull elsewhere can
+race it. The mode that can lie is the one you have to ask for.
+
+In `store-forward`, content that has not yet been confirmed upstream is **pinned**: it is
+the only copy in existence and cannot be re-fetched, so eviction and GC leave it alone. A
+push that fails stays pinned and stays visible rather than being tidied away.
+
+#### What enabling push means
+
+> **Push is not gated by authentication.** If push is enabled and client auth is off,
+> **anyone who can reach this cache can push to any registry it holds credentials for**,
+> under the cache's identity, with no attribution — a `docker push` cannot identify
+> itself. That is the same trust model as the pull surface rather than an exception to it.
+> Restrict who can reach the port, or set `XHC_DOCKER_HTPASSWD`. Muninn warns at boot; it
+> does not refuse.
+
+**Not implemented:** delete and cross-repo mount. Removing upstream content is a retention
+decision for that registry's owner, not for a cache sitting in front of it.
 
 ### Optional client auth on the pull surface
 

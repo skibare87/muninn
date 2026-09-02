@@ -78,22 +78,45 @@ def test_an_unknown_session_is_a_clean_404():
 
 # --- the body factory ------------------------------------------------------
 
+async def _drain(agen):
+    return b"".join([chunk async for chunk in agen])
+
+
 def test_the_body_factory_yields_the_same_bytes_twice(tmp_path):
     """The auth dance re-sends. A consumed handle would upload nothing, and a
     registry would ACCEPT that -- a blob that exists and is wrong."""
+    import asyncio
+
     blob = tmp_path / "b"
     blob.write_bytes(b"A" * 4096)
     factory = ocipush._chunk_reader(blob, 0, 4096)
-    first = b"".join(factory())
-    second = b"".join(factory())
+    first = asyncio.run(_drain(factory()))
+    second = asyncio.run(_drain(factory()))
     assert first == second == b"A" * 4096
+
+
+def test_the_body_is_an_ASYNC_iterator(tmp_path):
+    """httpx's AsyncClient refuses a sync iterable as a streaming body.
+
+    The first version of this factory was a sync generator. Every unit test
+    passed -- they consumed it directly -- and the real client raised
+    "Attempted to send an sync request with an AsyncClient instance" on the
+    first end-to-end push. Assert the property the client actually requires.
+    """
+    blob = tmp_path / "b"
+    blob.write_bytes(b"A" * 16)
+    body = ocipush._chunk_reader(blob, 0, 16)()
+    assert hasattr(body, "__aiter__"), "httpx will refuse this body"
+    assert not hasattr(body, "__next__")
 
 
 def test_the_body_factory_respects_its_window(tmp_path):
     """Chunked upload reads a range, not the whole file."""
+    import asyncio
+
     blob = tmp_path / "b"
     blob.write_bytes(bytes(range(256)) * 16)
-    got = b"".join(ocipush._chunk_reader(blob, 100, 50)())
+    got = asyncio.run(_drain(ocipush._chunk_reader(blob, 100, 50)()))
     assert len(got) == 50
     assert got == blob.read_bytes()[100:150]
 

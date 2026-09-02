@@ -117,34 +117,44 @@ async def _blob_exists(ref: registry.Ref, digest: str) -> bool:
     return r.status_code == 200
 
 
-def _chunk_reader(path: Path, start: int, length: int):
-    """Body factory for one chunk: a FRESH file handle per call.
+READ_SIZE = 1024 * 1024
 
-    _authed_request may send twice (the auth dance). Returning a consumed
-    handle would silently upload an empty second request, and the registry
-    would accept it -- a blob that exists and is wrong.
+
+def _chunk_reader(path: Path, start: int, length: int):
+    """Body factory for one chunk: a FRESH ASYNC iterator per call.
+
+    Two properties, both learned the hard way.
+
+    ASYNC, because httpx's AsyncClient refuses a sync iterable as a streaming
+    body -- "Attempted to send an sync request with an AsyncClient instance".
+    The unit test for this factory passed while the real client raised, because
+    the test consumed the iterator directly and never went through httpx. Only
+    an end-to-end push against a real registry showed it.
+
+    A FRESH one per call, because _authed_request may send twice for the
+    bearer/basic dance. A consumed handle on the second attempt would upload
+    NOTHING, and a registry accepts that -- leaving a blob that exists and is
+    wrong.
+
+    File reads go through a thread so a multi-gigabyte monolithic PUT does not
+    block the event loop while every other request waits on it.
     """
     def factory():
-        fh = path.open("rb")
-        fh.seek(start)
-        return _Bounded(fh, length)
+        async def stream():
+            fh = await asyncio.to_thread(path.open, "rb")
+            try:
+                await asyncio.to_thread(fh.seek, start)
+                left = length
+                while left > 0:
+                    data = await asyncio.to_thread(fh.read, min(READ_SIZE, left))
+                    if not data:
+                        break
+                    left -= len(data)
+                    yield data
+            finally:
+                await asyncio.to_thread(fh.close)
+        return stream()
     return factory
-
-
-class _Bounded:
-    """Reads at most `length` bytes from an already-positioned handle."""
-
-    def __init__(self, fh, length: int):
-        self.fh, self.left = fh, length
-
-    def __iter__(self):
-        while self.left > 0:
-            data = self.fh.read(min(1024 * 1024, self.left))
-            if not data:
-                break
-            self.left -= len(data)
-            yield data
-        self.fh.close()
 
 
 async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
