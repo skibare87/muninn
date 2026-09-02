@@ -639,10 +639,23 @@ the next node to pull it gets a local hit rather than a cold fetch.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `XHC_DOCKER_PUSH` | `0` | accept pushes at all |
-| `XHC_DOCKER_PUSH_MODE` | `proxy` | `proxy`, `store-forward` |
+| `XHC_DOCKER_PUSH_MODE` | `proxy` | `proxy` or `store-forward`. Hyphen, not underscore; an invalid value refuses to start rather than falling back |
 | `XHC_DOCKER_CACHE_ON_PUSH` | `1` | keep the pushed image locally |
-| `XHC_DOCKER_PUSH_LIMITS` | unset | per-registry chunking, regctl format |
-| `XHC_DOCKER_BLOB_CHUNK` | unset | global chunk fallback |
+| `XHC_DOCKER_PUSH_LIMITS` | unset | path to a regctl-format file giving per-registry chunk sizes |
+| `XHC_DOCKER_BLOB_CHUNK` | unset | global chunk size for hosts with no entry in that file |
+
+A worked example, since the settings above are easier to read than to assemble:
+
+```yaml
+environment:
+  XHC_DOCKER_PUSH: "1"
+  XHC_DOCKER_PUSH_MODE: store-forward      # answer 201 early, forward behind
+  XHC_DOCKER_CACHE_ON_PUSH: "1"            # keep the image after forwarding
+  XHC_DOCKER_PUSH_LIMITS: /auth/push-limits.json
+```
+
+The mode is **global**, not per-registry — there is one push mode for the whole cache.
+`XHC_DOCKER_PUSH_LIMITS` is the only per-registry push setting.
 
 #### The point: chunk limits stop being every client's problem
 
@@ -976,6 +989,12 @@ experiments age out.
 | `XHC_ORPHAN_CHECK_INTERVAL` | `21600` | seconds between upstream liveness sweeps; `0` disables |
 | `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo/tree listings from cache when upstream 404s |
 | `XHC_REF_TTL` | `300` | seconds a ref→commit mapping is trusted; `0` never revalidates |
+| `XHC_UPSTREAM` | `https://huggingface.co` | the Hub this cache fetches from |
+| `XHC_HOST` | `0.0.0.0` | bind address |
+| `XHC_PORT` | `8080` | bind port |
+| `XHC_REQUEST_TIMEOUT` | `60` | seconds before an upstream request is abandoned |
+| `XHC_STREAM_START_TIMEOUT` | `120` | seconds a `stream` miss waits for the first bytes to land |
+| `XHC_STREAM_POLL_INTERVAL` | `0.25` | seconds between checks for new bytes while streaming a miss |
 | `XHC_INGEST_POLICY` | `open` | `open` \| `allowlist` |
 | `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins |
 | `XHC_POLICY_SCOPE` | `ingest` | `ingest` \| `all` — whether policy also gates cache hits |
