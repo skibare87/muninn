@@ -9,6 +9,49 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.2 — 2026-09-02
+
+A pull failed with 404 through the cache while working directly against the same
+registry. Neither auth nor, at root, a status-mapping problem.
+
+SIX OF SEVEN ACCEPT VALUES WERE SILENTLY DROPPED
+
+HTTP allows a repeated header. Starlette's Headers.get() returns only the FIRST
+occurrence, so reading Accept that way discards the rest and says nothing.
+
+regctl sends SEVEN separate Accept lines -- both OCI types, four docker types,
+the OCI artifact type. This cache forwarded the first alone. A registry holding
+a DOCKER manifest list then has nothing acceptable to return and answers
+
+    400 MANIFEST_INVALID: Schema 2 manifest not supported by client
+
+a content-negotiation refusal entirely of the cache's making, which was then
+rendered to the client as 404. The client was told the image does not exist when
+the REQUEST was the problem, and 404 is the answer most likely to stop someone
+looking.
+
+WHY EVERY HAND-RUN PROBE PASSED: curl and docker send ONE comma-joined Accept
+line, so nothing is dropped. Only a client using repeated headers loses values,
+so the defect was invisible to exactly the checks anyone would reach for -- and
+invisible from both ends, since the client saw a plausible answer about the image
+and the registry saw a request that genuinely did not accept what it held.
+
+AN UPSTREAM STATUS IS NO LONGER RELABELLED AS "NOT FOUND"
+
+400 and 406 pass through as a content-negotiation failure naming the cause, 429
+passes through, 5xx becomes 502, and a genuine upstream 404 stays 404. A 400 is
+an answer about the REQUEST; 404 is an answer about the RESOURCE; neither is
+"the cache is broken".
+
+This is the third instance in three releases of distinct states collapsed into
+one rendering -- after every upstream 401 becoming 502, and _fetch_token
+returning None for five different failures. Same shape, different layer each
+time.
+
+Verified end to end against a real client rather than only in unit tests,
+because every test that did not use one passed throughout.
+
+
 ## v0.9.1 — 2026-09-02
 
 Four fixes, and three of them are the same defect: distinct states collapsed
