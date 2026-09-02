@@ -147,6 +147,32 @@ class Settings:
     # Upstream credentials as a standard ~/.docker/config.json, so `docker
     # login` output can be mounted directly and nothing bespoke is invented.
     registry_auth_file: str | None = None
+
+    # --- push-through (an internal issue) ---------------------------------------------
+    # OFF by default: enabling it means a client's `docker push` causes Muninn
+    # to WRITE to a real registry using credentials the operator mounted. With
+    # client auth off, anyone who can reach Muninn can push to anything Muninn
+    # is configured for, under Muninn's identity and with no attribution -- a
+    # docker push cannot identify itself. the maintainer ruled that acceptable and NOT
+    # gated: the network is the trust boundary for pull, and making one verb an
+    # exception would be the odd thing. It warns at boot; it does not refuse.
+    docker_push_enabled: bool = False
+    # proxy         forward as the client uploads. A 201 means upstream has it.
+    # store-forward accept to disk, answer 201, push after. Faster and
+    #               retryable, and it TELLS THE CLIENT THE PUSH SUCCEEDED
+    #               BEFORE IT HAS. The mode that can lie is the one you ask for.
+    docker_push_mode: str = "proxy"
+    # Keep the pushed image in the cache. A push is nearly always followed by
+    # pulls from other nodes and the bytes have already crossed the wire.
+    docker_cache_on_push: bool = True
+    # Per-registry blob chunking, in regctl's format, so anyone who has already
+    # hit this has the values in the shape they already wrote them. Muninn reads
+    # only blobChunk/blobMax and ignores any credentials in the file.
+    docker_push_limits: str | None = None
+    # Global fallback for hosts with no entry, so a single Cloudflare-fronted
+    # registry does not require writing and mounting a file for one integer.
+    # 0 means no chunking: a monolithic PUT, which is what a docker client does.
+    docker_blob_chunk: int = 0
     # Registry-host and image policy. Defaults to `open`, at parity with
     # XHC_INGEST_POLICY on the HF side -- the maintainer's ruling was parity.
     # NOTE the exposure that parity implies: path-prefix routing means anyone
@@ -200,6 +226,13 @@ class Settings:
             raise ValueError(f"XHC_DOCKER_POLICY must be open|allowlist, got {docker_policy!r}")
 
         docker_auth = (os.environ.get("XHC_DOCKER_AUTH") or cls.docker_auth).strip().lower()
+        push_mode = (
+            os.environ.get("XHC_DOCKER_PUSH_MODE") or cls.docker_push_mode
+        ).strip().lower()
+        if push_mode not in ("proxy", "store-forward"):
+            raise ValueError(
+                f"XHC_DOCKER_PUSH_MODE must be proxy|store-forward, got {push_mode!r}"
+            )
         if docker_auth not in ("none", "basic"):
             raise ValueError(f"XHC_DOCKER_AUTH must be none|basic, got {docker_auth!r}")
 
@@ -246,6 +279,13 @@ class Settings:
             docker_auth=docker_auth,
             docker_htpasswd=os.environ.get("XHC_DOCKER_HTPASSWD") or None,
             registry_auth_file=os.environ.get("XHC_REGISTRY_AUTH_FILE") or None,
+            docker_push_enabled=_env_bool("XHC_DOCKER_PUSH", cls.docker_push_enabled),
+            docker_push_mode=push_mode,
+            docker_cache_on_push=_env_bool(
+                "XHC_DOCKER_CACHE_ON_PUSH", cls.docker_cache_on_push
+            ),
+            docker_push_limits=os.environ.get("XHC_DOCKER_PUSH_LIMITS") or None,
+            docker_blob_chunk=parse_size(os.environ.get("XHC_DOCKER_BLOB_CHUNK"), cls.docker_blob_chunk),
             docker_policy=docker_policy,
             allow_registries=os.environ.get("XHC_ALLOW_REGISTRIES", cls.allow_registries),
             deny_registries=os.environ.get("XHC_DENY_REGISTRIES", cls.deny_registries),

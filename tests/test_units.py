@@ -643,6 +643,12 @@ ENV_TO_SETTING = [
     ("XHC_ALLOW_IMAGES", "ghcr.io/org/*", "allow_images", "ghcr.io/org/*"),
     ("XHC_DENY_IMAGES", "*/*:nightly", "deny_images", "*/*:nightly"),
     ("XHC_DOCKER_MAX_BLOB_BYTES", "10G", "docker_max_blob_bytes", 10 * 1024**3),
+    # --- push-through (0.8.0, an internal issue) ---
+    ("XHC_DOCKER_PUSH", "1", "docker_push_enabled", True),
+    ("XHC_DOCKER_PUSH_MODE", "store-forward", "docker_push_mode", "store-forward"),
+    ("XHC_DOCKER_CACHE_ON_PUSH", "0", "docker_cache_on_push", False),
+    ("XHC_DOCKER_PUSH_LIMITS", "/cfg/lim.json", "docker_push_limits", "/cfg/lim.json"),
+    ("XHC_DOCKER_BLOB_CHUNK", "16Mi", "docker_blob_chunk", 16 * 1024**2),
 ]
 
 
