@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -512,7 +513,8 @@ def test_a_deferred_manifest_waits_for_its_blobs(monkeypatch, tmp_path):
     monkeypatch.setattr(reg, "request", upstream)
 
     cfg = "sha256:" + "a" * 64
-    body = ('{"schemaVersion":2,"config":{"digest":"%s"},"layers":[]}' % cfg).encode()
+    body = json.dumps({"schemaVersion": 2, "config": {"digest": cfg},
+                       "layers": []}).encode()
 
     async def go():
         up = ocipush.begin(_ref())
