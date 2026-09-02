@@ -573,3 +573,108 @@ def test_a_confirmed_cached_blob_is_not_rescheduled(monkeypatch, tmp_path):
     ref = _ref()
     digest = "sha256:" + "c" * 64
     assert ocipush.ensure_forward(ref, digest) is False
+
+
+# --------------------------------------------------------------------------
+# A transient transport failure is not a terminal one.
+#
+# Retry was ASYMMETRIC and backwards. A 401 already recovered -- the auth dance
+# re-sends after a challenge -- while a dropped connection went straight to
+# failed and pinned forever. The transport error is the one that says nothing
+# about whether the request was acceptable, so it is the one that should retry.
+# --------------------------------------------------------------------------
+
+def test_a_read_error_is_retried_and_can_succeed(monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(ocipush, "BACKOFF_S", (0, 0, 0, 0))
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadError("")
+        return "delivered"
+
+    got = asyncio.run(ocipush._with_retries(flaky, what="x", key="k"))
+    assert got == "delivered"
+    assert calls["n"] == 3, "a transient transport error was not retried"
+
+
+def test_retries_are_bounded(monkeypatch):
+    """Retrying forever turns a broken upstream into an invisible hot loop."""
+    import httpx
+
+    monkeypatch.setattr(ocipush, "BACKOFF_S", (0, 0, 0, 0))
+    calls = {"n": 0}
+
+    async def always():
+        calls["n"] += 1
+        raise httpx.ConnectError("")
+
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(ocipush._with_retries(always, what="x", key="k"))
+    assert calls["n"] == ocipush.MAX_ATTEMPTS
+
+
+def test_an_http_answer_is_NOT_retried(monkeypatch):
+    """A registry that says 400 will say 400 again.
+
+    Retrying an answer burns the upstream and delays the operator learning
+    something true. Only the transport layer is retried.
+    """
+    monkeypatch.setattr(ocipush, "BACKOFF_S", (0, 0, 0, 0))
+    calls = {"n": 0}
+
+    async def refused():
+        calls["n"] += 1
+        raise ocipush.PushError(502, "UNAVAILABLE", "upstream rejected it: 400")
+
+    with pytest.raises(ocipush.PushError):
+        asyncio.run(ocipush._with_retries(refused, what="x", key="k"))
+    assert calls["n"] == 1, "an HTTP answer was retried as though transient"
+
+
+# --- the reason must never be empty ---------------------------------------
+
+def test_an_exception_with_no_message_still_reports_a_reason():
+    """str(httpx.ReadError()) is the EMPTY STRING.
+
+    The pending view reported {"state":"failed","error":""} -- a failure with
+    no cause, which sends an operator to the container logs for one word.
+    """
+    import httpx
+
+    assert ocipush.describe_exc(httpx.ReadError("")) == "httpx.ReadError"
+    assert "timed out" in ocipush.describe_exc(httpx.ReadTimeout("timed out"))
+    assert ocipush.describe_exc(ValueError("")) == "ValueError"
+
+
+def test_pending_distinguishes_retrying_from_given_up(monkeypatch):
+    """Both showed as the same state, so "it is still trying" and "it has
+    stopped" were indistinguishable to anyone polling."""
+    import httpx
+
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    monkeypatch.setattr(ocipush, "BACKOFF_S", (0, 0, 0, 0))
+
+    async def always_fails(ref, path, digest):
+        raise httpx.ReadError("")
+
+    monkeypatch.setattr(ocipush, "push_blob", always_fails)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        key = f"r.example.com/{up.computed}"
+        with pytest.raises(httpx.ReadError):
+            await ocipush._pending[key]
+        return ocipush.pending()
+
+    pend = asyncio.run(go())
+    rec = pend[0]
+    assert rec["state"] == "failed"
+    assert rec["error"] == "httpx.ReadError", f"empty reason: {rec['error']!r}"
+    assert rec["attempts"] == ocipush.MAX_ATTEMPTS
+    assert rec["pinned"], "gave up AND unpinned -- that would lose the only copy"

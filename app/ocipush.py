@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin
 
+import httpx
+
 from . import ocistore, pushlimits, registry
 from .config import settings
 
@@ -49,6 +51,29 @@ log = logging.getLogger("xhc.ocipush")
 
 _sessions: dict[str, Upload] = {}
 _pending: dict[str, asyncio.Task] = {}
+
+
+# Transport-level failures: the connection broke, timed out, or was refused.
+# These say nothing about whether the request was acceptable, so they are
+# retryable in a way an HTTP status never is. httpx.TransportError covers
+# ReadError, WriteError, ConnectError, PoolTimeout and the timeout family.
+RETRYABLE = (httpx.TransportError,)
+MAX_ATTEMPTS = 5
+BACKOFF_S = (1, 4, 15, 45)
+
+
+def describe_exc(exc: BaseException) -> str:
+    """A reason that is never empty.
+
+    str(httpx.ReadError()) is the EMPTY STRING -- that exception carries no
+    message. The management API reported {"state":"failed","error":""}, which
+    is worse than an ugly reason: an operator polling it sees a failure with no
+    cause and has to go to the container logs for a word. Always lead with the
+    type.
+    """
+    text = str(exc).strip()
+    name = f"{type(exc).__module__}.{type(exc).__name__}".removeprefix("builtins.")
+    return f"{name}: {text}" if text else name
 
 
 class PushError(Exception):
@@ -361,11 +386,15 @@ def pending() -> list[dict]:
         elif task.cancelled():
             state, err = "cancelled", "the forward was cancelled, likely at shutdown"
         elif task.exception() is not None:
-            state, err = "failed", str(task.exception())
+            state, err = "failed", describe_exc(task.exception())
         else:
             state, err = "done", None
+        attempts = _attempts.get(key, 0)
+        if state == "running" and attempts > 1:
+            state = "retrying"
         out.append({"upstream": upstream, "digest": digest, "state": state,
-                    "error": err, "pinned": key in _pinned})
+                    "error": err, "pinned": key in _pinned,
+                    "attempts": attempts, "max_attempts": MAX_ATTEMPTS})
     return sorted(out, key=lambda x: (x["state"], x["digest"]))
 
 
@@ -397,6 +426,42 @@ def abandon(upstream: str, digest: str) -> dict:
             "if no manifest references it"}
 
 
+async def _with_retries(make_coro, *, what: str, key: str):
+    """Retry TRANSPORT failures; never retry an answer.
+
+    A 401 already retried -- the auth dance re-sends after a challenge -- so a
+    dropped connection failing permanently while an auth rejection recovered
+    was exactly backwards: the transport error is the one that says nothing
+    about whether the request was acceptable.
+
+    An HTTP status is an ANSWER and is not retried here. A registry that says
+    400 will say 400 again, and retrying it burns the upstream and delays the
+    operator learning something true.
+    """
+    last: BaseException | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        _attempts[key] = attempt
+        try:
+            return await make_coro()
+        except RETRYABLE as exc:
+            last = exc
+            if attempt == MAX_ATTEMPTS:
+                break
+            delay = BACKOFF_S[min(attempt - 1, len(BACKOFF_S) - 1)]
+            log.warning("forward of %s failed with %s (attempt %d/%d); "
+                        "retrying in %ds", what, describe_exc(exc), attempt,
+                        MAX_ATTEMPTS, delay)
+            await asyncio.sleep(delay)
+    log.error("forward of %s gave up after %d attempts: %s",
+              what, MAX_ATTEMPTS, describe_exc(last))
+    raise last
+
+
+# Attempts made per pending key, so the pending view can distinguish "still
+# trying" from "given up" rather than showing both as failed.
+_attempts: dict[str, int] = {}
+
+
 async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
     """Push behind the client's 201.
 
@@ -407,7 +472,9 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
     leave the evidence pinned and visible, not tidy it away.
     """
     try:
-        await push_blob(ref, ocistore.blob_path(ref.upstream, digest), digest)
+        await _with_retries(
+            lambda: push_blob(ref, ocistore.blob_path(ref.upstream, digest), digest),
+            what=f"blob {digest} to {ref.upstream}", key=key)
     except asyncio.CancelledError:
         log.warning("store-forward push of %s to %s was CANCELLED; it stays "
                     "pinned and pending, and must be retried", digest, ref.upstream)
@@ -512,14 +579,19 @@ async def _forward_manifest_later(ref, body, media_type, reference, digest, key)
             log.info("manifest %s waits on %d blob forward(s) to %s",
                      reference, len(deps), ref.upstream)
             await asyncio.gather(*deps)
-        r = await registry.request(
-            ref, "PUT", f"manifests/{reference}",
-            {"content-type": media_type, "content-length": str(len(body))},
-            lambda: body,
-        )
-        if r.status_code not in (201, 202):
-            raise PushError(502, "UNAVAILABLE",
-                            f"{ref.upstream} rejected the manifest: {r.status_code}")
+        async def deliver():
+            r = await registry.request(
+                ref, "PUT", f"manifests/{reference}",
+                {"content-type": media_type, "content-length": str(len(body))},
+                lambda: body,
+            )
+            if r.status_code not in (201, 202):
+                raise PushError(
+                    502, "UNAVAILABLE",
+                    f"{ref.upstream} rejected the manifest: {r.status_code}")
+
+        await _with_retries(deliver,
+                            what=f"manifest {reference} to {ref.upstream}", key=key)
     except asyncio.CancelledError:
         log.warning("deferred manifest forward of %s to %s CANCELLED; it stays "
                     "pinned and pending", reference, ref.upstream)
