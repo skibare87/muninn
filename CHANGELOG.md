@@ -134,7 +134,23 @@ share cachefs.disk_stats(), and only /healthz catches OSError. There is no
 shared readiness gate, but for that one failure mode two alerts believed to be
 independent have a common cause. Recorded rather than silently changed.
 
-KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
+UNDER BUDGET IS NOT THE SAME AS HAVING ROOM
+
+Eviction compares this cache's own size against its own budget and never
+consults free space. On a shared filesystem those come apart: if anything else
+on the volume fills it, the cache sits under budget, declines to evict, and
+every write fails with ENOSPC while the evictor reports "under high water" --
+a true statement about the wrong limit. Below 5% free, a pass that declines
+because it is under budget now says so, naming which limit it is looking at and
+that the space is going to something outside this cache.
+
+Acting on it is deliberately NOT done here: freeing our own data may not recover
+space consumed elsewhere, so evicting on free-space pressure can destroy warm
+cache for nothing. That decision is written out rather than taken in a hurry.
+muninn_disk_free_bytes already carries the true figure and is the only signal
+that catches this class, since every budget-derived number reads healthy.
+
+KNOWN GAPS, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
 
 
