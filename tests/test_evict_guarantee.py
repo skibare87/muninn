@@ -134,3 +134,62 @@ def test_listing_reports_tags_that_exist_and_not_ones_that_do_not(store):
     assert any(k.endswith(":keep") for k in keys)
     assert not any(k.endswith(":go") for k in keys), \
         "a deleted tag was still listed"
+
+
+def test_under_budget_but_disk_nearly_full_is_loud(monkeypatch, caplog, tmp_path):
+    """Under budget is not the same as having room.
+
+    Eviction compares this cache's own size against its own budget and never
+    consults free space, so on a shared filesystem -- ZFS datasets in one pool,
+    another tenant, a runaway log -- the cache can sit far under budget and
+    decline to evict while every write fails with ENOSPC.
+
+    Acting on that is a real decision (freeing our own data may not recover
+    space consumed elsewhere) and is deliberately not taken. Being SILENT about
+    it is not a decision, it is the defect: "under high water" is a true
+    statement about the wrong limit.
+    """
+    import logging
+
+    from app import cachefs
+
+    monkeypatch.setattr(cachefs, "load_pins", lambda strict=False: set())
+    monkeypatch.setattr(cachefs, "load_orphans", lambda strict=False: {})
+    monkeypatch.setattr(cachefs, "protected_keys", lambda strict=False: set())
+    monkeypatch.setattr(cachefs, "disk_stats", lambda: {
+        "fs_total": 1000, "fs_used": 990, "fs_free": 10,   # 99% full
+        "capacity": 1000, "capacity_source": "XHC_CACHE_MAX_SIZE",
+    })
+    monkeypatch.setattr(cachefs, "scan_cache_dir",
+                        lambda d: type("I", (), {"size_on_disk": 1})())
+
+    with caplog.at_level(logging.WARNING):
+        out = cachefs._evict_sync()
+
+    assert out["reason"] == "under high water"
+    assert any("UNDER ITS OWN BUDGET" in r.message for r in caplog.records), (
+        "declining to evict while the disk is 99% full must say which limit "
+        "it is looking at, or the log reads as healthy"
+    )
+
+
+def test_plenty_of_free_space_stays_quiet(monkeypatch, caplog):
+    """The negative control: the warning must not fire on a healthy disk, or
+    it becomes noise and gets filtered, which is the same as not having it."""
+    import logging
+
+    from app import cachefs
+
+    monkeypatch.setattr(cachefs, "load_pins", lambda strict=False: set())
+    monkeypatch.setattr(cachefs, "load_orphans", lambda strict=False: {})
+    monkeypatch.setattr(cachefs, "protected_keys", lambda strict=False: set())
+    monkeypatch.setattr(cachefs, "disk_stats", lambda: {
+        "fs_total": 1000, "fs_used": 100, "fs_free": 900,
+        "capacity": 1000, "capacity_source": "XHC_CACHE_MAX_SIZE",
+    })
+    monkeypatch.setattr(cachefs, "scan_cache_dir",
+                        lambda d: type("I", (), {"size_on_disk": 1})())
+
+    with caplog.at_level(logging.WARNING):
+        cachefs._evict_sync()
+    assert not any("UNDER ITS OWN BUDGET" in r.message for r in caplog.records)

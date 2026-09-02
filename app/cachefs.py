@@ -437,6 +437,31 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
     used = info.size_on_disk
 
     if used <= high and used + target_free_bytes <= capacity:
+        # UNDER BUDGET IS NOT THE SAME AS HAVING ROOM, and on a shared
+        # filesystem they come apart completely. Eviction compares this cache's
+        # OWN size against its OWN budget; it never consults free space. So if
+        # anything else on the volume fills it -- another dataset in the same
+        # ZFS pool, another tenant, a runaway log -- this cache can sit far
+        # under budget, decline to evict, and watch every write fail with
+        # ENOSPC while reporting "under high water".
+        #
+        # That silence is the defect. Freeing our own data may not even fix it
+        # when the pressure is elsewhere, so ACTING on it is a real decision
+        # rather than an obvious one and is deliberately not taken here. Saying
+        # so is not: a cache declining to act while the disk fills should be
+        # loud about which of the two limits it is actually looking at.
+        #
+        # muninn_disk_free_bytes carries the true figure for alerting.
+        if stats["fs_total"] and stats["fs_free"] < stats["fs_total"] * 0.05:
+            log.warning(
+                "DISK IS %.1f%% FULL BUT THIS CACHE IS UNDER ITS OWN BUDGET "
+                "(%.1f GB used of %.1f GB), so eviction is declining to act. "
+                "The space is being consumed by something outside this cache, "
+                "and evicting our own data may not recover it. Free space is "
+                "%.1f GB.",
+                100.0 * (1 - stats["fs_free"] / stats["fs_total"]),
+                used / 1e9, capacity / 1e9, stats["fs_free"] / 1e9,
+            )
         return {
             "evicted": [],
             "freed": 0,
