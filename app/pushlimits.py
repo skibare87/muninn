@@ -104,9 +104,53 @@ def _load_file() -> dict[str, Limit]:
         threshold = int(entry.get("blobMax", chunk) or 0)
         if chunk > 0:
             _file_limits[host] = Limit(chunk=chunk, threshold=threshold)
-    if _file_limits:
-        log.info("push chunking configured for %s", sorted(_file_limits))
+    # No logging here: describe() reports this at boot with the resolved
+    # values, and a bare list of hostnames alongside it was two lines saying
+    # different amounts of the same thing.
     return _file_limits
+
+
+def describe() -> None:
+    """Log what was actually loaded, at boot, before anything pushes.
+
+    The credential loader already logs "loaded registry credentials for [...]",
+    and that line is what let a deployment prove the credentials had loaded and
+    then narrow a bug to "loaded but never sent". This had no equivalent, so a
+    typo in the path, malformed JSON, a wrong key name and a silently-ignored
+    field were all indistinguishable from working.
+
+    THE SECOND HALF MATTERS MORE THAN THE FIRST. Listing what WAS configured is
+    easy and half an answer: an upstream someone believes is configured and is
+    not looks exactly like one deliberately left unset. So this also states
+    what happens to everything absent from the file.
+    """
+    path = settings.docker_push_limits
+    limits = _load_file()
+
+    if path and not limits:
+        # _load_file has already warned if it was unreadable; this covers the
+        # readable-but-useless cases -- valid JSON with no hosts, or every
+        # entry missing blobChunk.
+        log.warning("XHC_DOCKER_PUSH_LIMITS=%s loaded NO usable entries. Every "
+                    "registry will use the fallback below.", path)
+    elif limits:
+        log.info("push chunking loaded from %s:", path)
+        for host in sorted(limits):
+            lim = limits[host]
+            log.info("    %-45s chunk=%d bytes (%.0f MiB) threshold=%d",
+                     host, lim.chunk, lim.chunk / 1048576, lim.threshold)
+    elif not path:
+        log.info("XHC_DOCKER_PUSH_LIMITS is unset; no per-registry chunking.")
+
+    if settings.docker_blob_chunk > 0:
+        log.info("    any registry NOT listed above uses XHC_DOCKER_BLOB_CHUNK="
+                 "%d bytes (%.0f MiB)", settings.docker_blob_chunk,
+                 settings.docker_blob_chunk / 1048576)
+    else:
+        log.info("    any registry NOT listed above: NO CHUNKING -- a monolithic "
+                 "PUT. If such a registry sits behind a body-size limit, the "
+                 "first large push will 413 and the size will be discovered "
+                 "from that and logged here.")
 
 
 def reset() -> None:

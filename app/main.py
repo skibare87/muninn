@@ -20,6 +20,7 @@ from . import (
     ocimanage,
     ocistore,
     orphans,
+    pushlimits,
     refs,
 )
 from . import registry as ociregistry
@@ -88,6 +89,9 @@ async def lifespan(app: FastAPI):
         dockerauth.load()
 
         if settings.docker_push_enabled:
+            # Before the warnings, so a reader sees WHAT WAS LOADED first and
+            # the caveats second.
+            pushlimits.describe()
             log.warning(
                 "push-through is ENABLED (mode=%s). Any client that can reach "
                 "this cache may push to any registry it holds credentials for, "

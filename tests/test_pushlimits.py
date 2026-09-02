@@ -153,3 +153,56 @@ def test_learned_values_are_not_persisted(tmp_path):
     p = _limits_file(tmp_path, {})
     pushlimits.learn("r.example.com", 33554432)
     assert "r.example.com" not in json.loads(p.read_text())["hosts"]
+
+
+# --- what the operator can see at boot -------------------------------------
+#
+# A deployment mounted the limits file and could not tell whether it had been
+# parsed: the env var was set, the file was readable inside the container, and
+# there was NO SIGNAL AT ALL. A typo in the path, malformed JSON, a wrong key
+# and a silently-ignored field were indistinguishable from working.
+#
+# The second assertion is the one that matters: listing what WAS configured is
+# half an answer, because a registry someone believes is configured and is not
+# looks exactly like one deliberately left unset.
+
+def test_boot_reports_resolved_values_and_what_is_absent(tmp_path, caplog):
+    import logging
+
+    _limits_file(tmp_path, {"a.example.com": {"blobChunk": 94371840,
+                                              "blobMax": 94371840}})
+    with caplog.at_level(logging.INFO, logger="xhc.pushlimits"):
+        pushlimits.describe()
+    out = caplog.text
+    assert "a.example.com" in out
+    assert "94371840" in out, "the resolved byte value must be visible, not inferred"
+    assert "NOT listed above" in out, \
+        "the log says what was configured but not what happens to everything else"
+
+
+def test_boot_warns_when_the_file_parsed_to_nothing(tmp_path, caplog):
+    """Readable, valid JSON, and useless. Distinct from unset."""
+    import json
+    import logging
+
+    p = tmp_path / "empty.json"
+    p.write_text(json.dumps({"hosts": {}}))
+    settings.docker_push_limits = str(p)
+    settings.docker_blob_chunk = 0
+    pushlimits.reset()
+    with caplog.at_level(logging.INFO, logger="xhc.pushlimits"):
+        pushlimits.describe()
+    assert "NO usable entries" in caplog.text
+
+
+def test_boot_distinguishes_unset_from_misconfigured(tmp_path, caplog):
+    import logging
+
+    settings.docker_push_limits = None
+    settings.docker_blob_chunk = 0
+    pushlimits.reset()
+    with caplog.at_level(logging.INFO, logger="xhc.pushlimits"):
+        pushlimits.describe()
+    assert "is unset" in caplog.text
+    assert "NO usable entries" not in caplog.text, \
+        "an unset file must not read as a broken one"
