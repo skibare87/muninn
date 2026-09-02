@@ -150,6 +150,23 @@ cache for nothing. That decision is written out rather than taken in a hurry.
 muninn_disk_free_bytes already carries the true figure and is the only signal
 that catches this class, since every budget-derived number reads healthy.
 
+"RUNNING HOT" MEANS NEAR CAPACITY, NOT OUT OF SPACE
+
+A claim nobody had measured -- "running hot on disk is recoverable" -- was true
+of running near capacity and got read as "a full disk is fine", which it is not.
+It spread from a code comment here into another team's alerting, where it
+justified a severity that routed to null; the sentence did not mislabel those
+alerts, it silenced them.
+
+The measurement now sits next to the claim instead: an ingest failure returns
+mid-stream, so the client gets a truncated body on an already-sent 2xx and sees
+a digest mismatch, and there is NO fallback to upstream -- a client using this
+cache has had its reference rewritten, so the cache IS its registry. Only
+XHC_MISS_POLICY=redirect sends a client upstream, and it is not the default.
+
+Nothing marked that claim UNVERIFIED anywhere. It was written down, and written
+down reads as established.
+
 KNOWN GAPS, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
 
