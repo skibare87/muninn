@@ -18,6 +18,7 @@ from . import (
     ocicompat,
     ocigc,
     ocimanage,
+    ocipush,
     ocistore,
     orphans,
     pushlimits,
@@ -92,6 +93,10 @@ async def lifespan(app: FastAPI):
             # Before the warnings, so a reader sees WHAT WAS LOADED first and
             # the caveats second.
             pushlimits.describe()
+            # Forwards owed from a previous run. Re-enqueued rather than only
+            # reported: store-forward promised the client eventual delivery,
+            # and a restart is not a reason to withdraw that.
+            await ocipush.resume()
             log.warning(
                 "push-through is ENABLED (mode=%s). Any client that can reach "
                 "this cache may push to any registry it holds credentials for, "

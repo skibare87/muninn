@@ -678,3 +678,124 @@ def test_pending_distinguishes_retrying_from_given_up(monkeypatch):
     assert rec["error"] == "httpx.ReadError", f"empty reason: {rec['error']!r}"
     assert rec["attempts"] == ocipush.MAX_ATTEMPTS
     assert rec["pinned"], "gave up AND unpinned -- that would lose the only copy"
+
+
+# --------------------------------------------------------------------------
+# An outstanding forward must survive a restart.
+#
+# The queue lived only in memory. A restart emptied it while the bytes stayed
+# on disk: the client had been told 201, the upstream did not have it, the blob
+# was pinned, and the only record of the obligation was gone. An operator
+# polling saw an empty queue -- which is exactly what they see when everything
+# succeeded. EMPTY MEANT "ALL DELIVERED" AND "WE FORGOT" AT THE SAME TIME.
+#
+# And nothing could reconstruct it: after a restart a blob landed by a failed
+# push is byte-identical on disk to one cached from a pull. Both are files
+# under <upstream>/blobs/. So "report it at startup" was not implementable
+# without persisting the obligation itself.
+# --------------------------------------------------------------------------
+
+def test_an_outstanding_forward_is_recorded_on_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    started = asyncio.Event()
+
+    async def slow(ref, path, digest):
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(ocipush, "push_blob", slow)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        await asyncio.wait_for(started.wait(), 5)
+        return up.computed
+
+    digest = asyncio.run(go())
+    markers = list((tmp_path / "_pending").glob("*.json"))
+    assert markers, "an accepted forward left no durable record"
+    rec = json.loads(markers[0].read_text())
+    assert rec["digest"] == digest and rec["kind"] == "blob"
+    assert rec["upstream"] == "r.example.com"
+
+
+def test_recovery_re_enqueues_what_a_previous_run_owed(monkeypatch, tmp_path):
+    """The restart case, simulated by clearing the in-memory state only."""
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    scheduled = []
+
+    async def capture(ref, digest, key):
+        scheduled.append((ref.upstream, digest))
+
+    async def slow(ref, path, digest):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(ocipush, "push_blob", slow)
+
+    async def enqueue():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        return up.computed
+
+    digest = asyncio.run(enqueue())
+
+    # THE RESTART: memory goes, disk stays.
+    ocipush._pending.clear()
+    ocipush._pinned.clear()
+    ocipush._attempts.clear()
+    assert ocipush.pending() == [], "precondition: the queue looks empty"
+
+    monkeypatch.setattr(ocipush, "_forward_later", capture)
+    asyncio.run(ocipush.resume())
+    assert scheduled == [("r.example.com", digest)], \
+        "an obligation from a previous run was silently dropped"
+    assert ocipush.is_pinned("r.example.com", digest), \
+        "recovered content was left collectable"
+
+
+def test_a_completed_forward_leaves_no_obligation(monkeypatch, tmp_path):
+    """The complement. A marker that outlived its forward would resurrect a
+    delivered blob on every restart, forever."""
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+
+    async def instant(ref, path, digest):
+        return None
+
+    monkeypatch.setattr(ocipush, "push_blob", instant)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        await ocipush._pending[f"r.example.com/{up.computed}"]
+
+    asyncio.run(go())
+    assert not list((tmp_path / "_pending").glob("*.json")), \
+        "a delivered forward left a marker that will resurrect it"
+
+
+def test_abandoning_a_forward_also_drops_its_marker(monkeypatch, tmp_path):
+    """An operator's decision to give up must outlive the process, exactly as
+    the obligation does -- otherwise an abandoned forward returns at the next
+    restart."""
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+
+    async def fails(ref, path, digest):
+        raise RuntimeError("upstream refused")
+
+    monkeypatch.setattr(ocipush, "push_blob", fails)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        with pytest.raises(RuntimeError):
+            await ocipush._pending[f"r.example.com/{up.computed}"]
+        return up.computed
+
+    digest = asyncio.run(go())
+    assert list((tmp_path / "_pending").glob("*.json")), "a failed forward lost its record"
+    ocipush.abandon("r.example.com", digest)
+    assert not list((tmp_path / "_pending").glob("*.json"))

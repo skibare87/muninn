@@ -97,6 +97,98 @@ class Upload:
         return "sha256:" + self.digest.hexdigest()
 
 
+def _obligations_dir() -> Path:
+    d = Path(settings.docker_dir) / "_pending"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _obligation_path(key: str) -> Path:
+    return _obligations_dir() / (key.replace("/", "_").replace(":", "_") + ".json")
+
+
+def _record_obligation(key: str, record: dict) -> None:
+    """Write down that we owe an upstream something, BEFORE we owe it.
+
+    The queue used to live only in memory. A restart emptied it while the bytes
+    stayed on disk, so the client had been told 201, the upstream did not have
+    it, the blob was pinned, and THE ONLY RECORD OF THE OBLIGATION WAS GONE. An
+    operator polling the queue saw empty -- which is exactly what they see when
+    everything succeeded. Empty meant "all delivered" and "we forgot" at once.
+
+    Worse, nothing could reconstruct it: after a restart a blob landed by a
+    failed push is byte-identical on disk to one cached from a pull. Both are
+    files under <upstream>/blobs/. Without this marker there is no way to tell
+    an unmet obligation from an ordinary cache entry, so "just report it at
+    startup" was not implementable either.
+
+    This is a minimal durable queue, not a general one: one small file per
+    outstanding forward, removed on success.
+    """
+    try:
+        _obligation_path(key).write_text(json.dumps(record))
+    except OSError:
+        # Never fail a push because the marker could not be written -- but say
+        # so, because it means this forward will not survive a restart.
+        log.exception("could not record the forward obligation for %s; it will "
+                      "be LOST if this process restarts before it completes", key)
+
+
+def _clear_obligation(key: str) -> None:
+    _obligation_path(key).unlink(missing_ok=True)
+
+
+def recover() -> list[dict]:
+    """Re-enqueue forwards this process owes from a previous life.
+
+    Called at startup. Re-pins and re-schedules rather than merely reporting,
+    because store-forward's promise to the client was eventual delivery and a
+    restart is not a reason to withdraw it.
+    """
+    out = []
+    for marker in sorted(_obligations_dir().glob("*.json")):
+        try:
+            rec = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            log.warning("unreadable forward obligation %s; leaving it in place "
+                        "rather than discarding an obligation we cannot read",
+                        marker.name)
+            continue
+        out.append(rec)
+    if not out:
+        return out
+    log.warning("recovered %d outstanding forward(s) from a previous run. The "
+                "clients that pushed these were told 201 and the upstream does "
+                "not have them yet.", len(out))
+    for rec in out:
+        log.warning("    %s %s -> %s", rec.get("kind"), rec.get("digest"),
+                    rec.get("upstream"))
+    return out
+
+
+async def resume() -> None:
+    """Schedule everything recover() found. Separate so it can be tested."""
+    for rec in recover():
+        ref = registry.Ref(upstream=rec["upstream"], api=rec["api"],
+                           repo=rec["repo"])
+        key = f"{rec['upstream']}/{rec['digest']}"
+        _pinned.add(key)
+        if rec.get("kind") == "manifest":
+            held = ocistore.load_manifest(rec["upstream"], rec["digest"])
+            if held is None:
+                log.error("manifest %s was owed to %s but is no longer in the "
+                          "store; cannot resume it", rec["digest"], rec["upstream"])
+                _clear_obligation(key)
+                _pinned.discard(key)
+                continue
+            _pending[key] = asyncio.create_task(_forward_manifest_later(
+                ref, held.body, held.media_type, rec["reference"],
+                rec["digest"], key))
+        else:
+            _pending[key] = asyncio.create_task(
+                _forward_later(ref, rec["digest"], key))
+
+
 def _staging(upstream: str) -> Path:
     d = Path(settings.docker_dir) / "_uploads" / upstream.replace("/", "_")
     d.mkdir(parents=True, exist_ok=True)
@@ -311,6 +403,9 @@ async def finalise_blob(up: Upload, claimed: str) -> None:
     # forwarded, and is deleted once upstream confirms.
     _land(up, claimed, pin=True, force_keep=True)
     key = f"{up.ref.upstream}/{claimed}"
+    _record_obligation(key, {"kind": "blob", "upstream": up.ref.upstream,
+                             "api": up.ref.api, "repo": up.ref.repo,
+                             "digest": claimed})
     _pending[key] = asyncio.create_task(_forward_later(up.ref, claimed, key))
 
 
@@ -419,6 +514,10 @@ def abandon(upstream: str, digest: str) -> dict:
                         "whose upload is in flight")
     _pinned.discard(key)
     _pending.pop(key, None)
+    # Drop the durable marker too, or an abandoned forward comes back from the
+    # dead at the next restart -- the operator's decision must outlive the
+    # process just as the obligation does.
+    _clear_obligation(key)
     log.warning("ABANDONED the forward of %s to %s. It is no longer pinned and "
                 "GC may now collect it. The client that pushed it was told 201.",
                 digest, upstream)
@@ -487,6 +586,7 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
     else:
         _pinned.discard(key)
         _pending.pop(key, None)
+        _clear_obligation(key)
         if not settings.docker_cache_on_push:
             # Ephemeral store: it existed only to be forwarded, and upstream
             # now has it. Deleting AFTER confirmation is the whole point --
@@ -550,6 +650,9 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
     _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
     key = f"{ref.upstream}/{digest}"
     _pinned.add(key)
+    _record_obligation(key, {"kind": "manifest", "upstream": ref.upstream,
+                             "api": ref.api, "repo": ref.repo, "digest": digest,
+                             "reference": reference})
     _pending[key] = asyncio.create_task(
         _forward_manifest_later(ref, body, media_type, reference, digest, key))
     return digest
@@ -604,3 +707,4 @@ async def _forward_manifest_later(ref, body, media_type, reference, digest, key)
     else:
         _pinned.discard(key)
         _pending.pop(key, None)
+        _clear_obligation(key)
