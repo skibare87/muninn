@@ -255,7 +255,11 @@ async def _authed_request(
         req = client.build_request(method, url, headers=h, content=body)
         return await client.send(req, stream=stream)
 
+    _t = time.monotonic()
     r = await send(hdrs)
+    if (time.monotonic() - _t) > 1.0:
+        log.warning("%s %s took %.1fs before any auth retry", method, url,
+                    time.monotonic() - _t)
     if r.status_code != 401:
         return r
 
@@ -292,7 +296,17 @@ async def _authed_request(
             log.info("basic challenge from %s and no credentials for it", ref.upstream)
             return r
         hdrs["authorization"] = f"Basic {basic}"
-        return await send(hdrs)
+        _t = time.monotonic()
+        try:
+            return await send(hdrs)
+        finally:
+            # Isolates the re-send from everything around it. A stall observed
+            # BETWEEN a 401 and its authenticated retry is either here or in
+            # the caller, and these two timings say which without anyone
+            # reading the source.
+            if (time.monotonic() - _t) > 1.0:
+                log.warning("basic re-send to %s took %.1fs", url,
+                            time.monotonic() - _t)
 
     if challenge.get("_scheme") != "bearer" or "realm" not in challenge:
         # Neither Basic nor a usable Bearer challenge. Hand the client the

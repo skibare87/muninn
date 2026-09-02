@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid as uuidlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -210,9 +211,25 @@ def get(uuid: str) -> Upload:
     return up
 
 
-def append(up: Upload, chunk: bytes) -> None:
-    with up.path.open("ab") as fh:
-        fh.write(chunk)
+async def append(up: Upload, chunk: bytes) -> None:
+    """Land one chunk from the client.
+
+    The write goes through a thread. It was synchronous inside the event loop,
+    which is fine on a fast disk and not fine on a slow one or a large layer:
+    a blocked loop produces NO log lines, shows as idle CPU, and stalls every
+    OTHER in-flight forward rather than only this one. Measured at 80 MiB in
+    0.105s here, so it was invisible -- but the failure mode it creates is a
+    stall that looks like it belongs somewhere else entirely.
+
+    Reopening per chunk rather than holding a handle is deliberate: an upload
+    session can be abandoned at any point, and a handle held across awaits is a
+    file descriptor leaked per abandoned push.
+    """
+    def _write():
+        with up.path.open("ab") as fh:
+            fh.write(chunk)
+
+    await asyncio.to_thread(_write)
     up.digest.update(chunk)
     up.offset += len(chunk)
 
@@ -276,11 +293,36 @@ def _chunk_reader(path: Path, start: int, length: int):
     return factory
 
 
+def _stage(t0: float, what: str, key: str = "") -> float:
+    """Timestamp a step of the forward, so a stall names itself.
+
+    A forward stalled for 223 seconds with ZERO httpx lines, idle CPU, idle
+    disk and a healthy network. Nothing in the logs covered the gap, so the
+    only way to localise it was to reverse-engineer the internals -- which is
+    exactly what a deployment should never have to do.
+
+    These are DEBUG so they cost nothing normally, and XHC_LOG_LEVEL=DEBUG
+    turns the forward path into a timeline. Anything over a second is also
+    logged at WARNING regardless of level, because a step that slow is worth
+    seeing without having to reproduce it.
+    """
+    now = time.monotonic()
+    elapsed = now - t0
+    log.debug("forward %s: %s took %.3fs", key, what, elapsed)
+    if elapsed > 1.0:
+        log.warning("forward %s: %s took %.1fs -- unexpectedly slow for this step",
+                    key, what, elapsed)
+    return now
+
+
 async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
     """Upload one blob upstream, chunked according to that registry's policy."""
+    t = time.monotonic()
+    key = f"{ref.upstream}/{digest[:19]}"
     if await _blob_exists(ref, digest):
         log.info("%s already has %s; skipping upload", ref.upstream, digest)
         return
+    t = _stage(t, "HEAD blob (does upstream have it)", key)
 
     size = path.stat().st_size
     session_base = f"{ref.api}/v2/{ref.repo}/blobs/uploads/"
@@ -288,6 +330,7 @@ async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
     if r.status_code not in (202, 201):
         raise PushError(502, "UNAVAILABLE",
                         f"{ref.upstream} refused an upload session: {r.status_code}")
+    t = _stage(t, "POST open upload session (incl. any auth retry)", key)
     location = r.headers.get("location")
     if not location:
         raise PushError(502, "UNAVAILABLE",
@@ -304,9 +347,12 @@ async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
     location = urljoin(session_base, location)
 
     limit = pushlimits.for_upstream(ref.upstream)
+    log.debug("forward %s: uploading %d bytes, chunking=%s", key, size,
+              f"{limit.chunk} over {limit.threshold}" if limit.chunks else "none")
     while True:
         try:
             await _upload(ref, location, path, size, digest, limit)
+            _stage(t, "upload body and finalise", key)
             return
         except _TooLarge as exc:
             # The registry said 413. Halve and retry rather than failing --

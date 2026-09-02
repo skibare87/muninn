@@ -53,8 +53,8 @@ def _ref(upstream="r.example.com"):
 
 def test_digest_is_computed_as_bytes_arrive():
     up = ocipush.begin(_ref())
-    ocipush.append(up, b"hello ")
-    ocipush.append(up, b"world")
+    asyncio.run(ocipush.append(up, b"hello "))
+    asyncio.run(ocipush.append(up, b"world"))
     assert up.offset == 11
     assert up.computed == "sha256:" + hashlib.sha256(b"hello world").hexdigest()
 
@@ -64,7 +64,7 @@ def test_a_mismatched_digest_is_refused_and_the_upload_discarded():
     import asyncio
 
     up = ocipush.begin(_ref())
-    ocipush.append(up, b"payload")
+    asyncio.run(ocipush.append(up, b"payload"))
     with pytest.raises(ocipush.PushError) as e:
         asyncio.run(ocipush.finalise_blob(up, "sha256:" + "0" * 64))
     assert e.value.status == 400 and e.value.code == "DIGEST_INVALID"
@@ -140,7 +140,7 @@ def test_store_forward_pins_until_confirmed(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         await asyncio.wait_for(started.wait(), 5)
         # Asserted INSIDE the loop: asyncio.run cancels pending tasks on exit,
@@ -164,7 +164,7 @@ def test_proxy_mode_pins_nothing(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         return up.computed
 
@@ -188,7 +188,7 @@ def test_proxy_mode_does_not_answer_before_upstream(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
 
     with pytest.raises(ocipush.PushError) as e:
@@ -212,7 +212,7 @@ def test_cache_on_push_off_keeps_nothing(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         return up.computed
 
@@ -232,7 +232,7 @@ def test_cache_on_push_on_keeps_the_blob(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"the layer")
+        await ocipush.append(up, b"the layer")
         await ocipush.finalise_blob(up, up.computed)
         return up.computed
 
@@ -258,7 +258,7 @@ def test_store_forward_exposes_what_is_pending(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         await asyncio.wait_for(started.wait(), 5)
         return ocipush.pending()
@@ -287,7 +287,7 @@ def test_a_failed_forward_stays_pinned_and_visible(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         key = f"r.example.com/{up.computed}"
         task = ocipush._pending[key]
@@ -336,7 +336,7 @@ def test_store_forward_with_cache_off_is_an_EPHEMERAL_store(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         key = f"r.example.com/{up.computed}"
         await asyncio.sleep(0)
@@ -366,7 +366,7 @@ def test_store_forward_with_cache_ON_keeps_it_after_confirming(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         await ocipush._pending[f"r.example.com/{up.computed}"]
         return up.computed
@@ -518,7 +518,7 @@ def test_a_deferred_manifest_waits_for_its_blobs(monkeypatch, tmp_path):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"cfg")
+        await ocipush.append(up, b"cfg")
         # Pretend the config blob is the one being forwarded.
         ocipush._pending[f"r.example.com/{cfg}"] = asyncio.create_task(
             slow_blob(_ref(), up.path, cfg))
@@ -665,7 +665,7 @@ def test_pending_distinguishes_retrying_from_given_up(monkeypatch):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         key = f"r.example.com/{up.computed}"
         with pytest.raises(httpx.ReadError):
@@ -707,7 +707,7 @@ def test_an_outstanding_forward_is_recorded_on_disk(monkeypatch, tmp_path):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         await asyncio.wait_for(started.wait(), 5)
         return up.computed
@@ -735,7 +735,7 @@ def test_recovery_re_enqueues_what_a_previous_run_owed(monkeypatch, tmp_path):
 
     async def enqueue():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         return up.computed
 
@@ -767,7 +767,7 @@ def test_a_completed_forward_leaves_no_obligation(monkeypatch, tmp_path):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         await ocipush._pending[f"r.example.com/{up.computed}"]
 
@@ -789,7 +789,7 @@ def test_abandoning_a_forward_also_drops_its_marker(monkeypatch, tmp_path):
 
     async def go():
         up = ocipush.begin(_ref())
-        ocipush.append(up, b"payload")
+        await ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
         with pytest.raises(RuntimeError):
             await ocipush._pending[f"r.example.com/{up.computed}"]
