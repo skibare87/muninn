@@ -600,6 +600,26 @@ If the pin or orphan state cannot be read, **GC refuses rather than proceeding**
 state file legitimately means "nothing is pinned"; an unreadable one means "unknown", and
 collapsing those would silently disarm pin protection inside an unattended loop.
 
+### `XHC_DOCKER_TAG_TTL` has three regimes, and `0` is the surprising one
+
+| value | meaning |
+| --- | --- |
+| `300` (default) | trust a tag→digest mapping for that many seconds |
+| `0` | **never** revalidate — mutable tags are frozen at whatever was first cached |
+| `always` | revalidate on every request |
+
+**`0` means never, not always.** It is the value an operator reaches for wanting the strictest
+behaviour, and it selects the loosest — so the knob fails toward staleness in the direction of
+"I thought I turned checking on". `0` is unchanged because deployments rely on it; `always` is a
+new spelling rather than a redefinition, so upgrading changes nothing.
+
+A negative value is also read as `always`, because that is what someone guesses when they want
+"no caching" — and silently treating it as `never` is the exact surprise this exists to remove.
+
+The boot log prints the **resolved regime in words** (`tag_ttl=always-revalidate`,
+`tag_ttl=NEVER-revalidate`, `tag_ttl=300s`) rather than the raw number, because `tag_ttl=0s`
+reads like "no delay" and gives an operator no way to tell which of the three they have.
+
 ### A full disk degrades the pull instead of breaking it
 
 **Under budget is not the same as having room.** Eviction compares the cache's own size against
@@ -685,7 +705,7 @@ mid-pull and assemble a tree from two commits.
 | `XHC_DOCKER_DIR` | `/docker` | storage root; use a separate volume |
 | `XHC_DOCKER_MAX_SIZE` | unset | capacity budget for the image cache |
 | `XHC_DOCKER_DEFAULT_UPSTREAM` | `docker.io` | used when the first path segment has no dot |
-| `XHC_DOCKER_TAG_TTL` | `300` | seconds a tag→digest mapping is trusted; `0` never revalidates |
+| `XHC_DOCKER_TAG_TTL` | `300` | seconds a tag→digest mapping is trusted. **`0` means NEVER revalidate**, not always — use `always` for check-every-request |
 | `XHC_DOCKER_POLICY` | `open` | `open`, `allowlist` — parity with `XHC_INGEST_POLICY` |
 | `XHC_ALLOW_REGISTRIES` / `XHC_DENY_REGISTRIES` | unset | host globs, **honoured in `open` mode too** |
 | `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |

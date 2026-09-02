@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from . import (
     cachefs,
+    config,
     dockerauth,
     hfcompat,
     manage,
@@ -66,11 +67,22 @@ async def lifespan(app: FastAPI):
         settings.miss_policy,
     )
     if settings.docker_enabled:
+        # Print the RESOLVED regime in words, not the raw number. `0` means
+        # NEVER revalidate and reads like "no delay"; an operator seeing
+        # `tag_ttl=0s` in a boot log has no way to tell which of the three
+        # behaviours they actually have without reading the comparison.
+        ttl = settings.docker_tag_ttl_s
+        if ttl == config.ALWAYS_REVALIDATE:
+            ttl_desc = "always-revalidate"
+        elif ttl <= 0:
+            ttl_desc = "NEVER-revalidate (0: mutable tags are frozen once cached)"
+        else:
+            ttl_desc = f"{ttl:g}s"
         log.info(
-            "docker/OCI pull-through on /v2/* | dir=%s policy=%s tag_ttl=%ss",
+            "docker/OCI pull-through on /v2/* | dir=%s policy=%s tag_ttl=%s",
             settings.docker_dir,
             settings.docker_policy,
-            settings.docker_tag_ttl_s,
+            ttl_desc,
         )
         if settings.docker_policy == "open" and not settings.allow_registries:
             # Parity with the HF side is the ruling, but the exposure it implies

@@ -57,6 +57,38 @@ def _env_float(key: str, default: float) -> float:
     return float(raw)
 
 
+# Sentinel for XHC_DOCKER_TAG_TTL=always. Negative rather than a separate flag,
+# so every existing comparison keeps working on a plain float and no call site
+# has to learn about a second variable.
+ALWAYS_REVALIDATE = -1.0
+
+
+def _parse_tag_ttl(default: float) -> float:
+    """Parse XHC_DOCKER_TAG_TTL, which has THREE regimes and used to expose two.
+
+        N        trust a tag->digest mapping for N seconds
+        0        never revalidate -- serve whatever was first cached, forever
+        always   revalidate on every request
+
+    `0` meaning NEVER is the trap: it is the value an operator reaches for when
+    they want the strictest behaviour, and it selected the loosest. It stays as
+    documented -- someone is relying on it -- and "always" is a new spelling
+    rather than a redefinition, so no existing deployment changes behaviour.
+
+    A negative number is accepted as "always" too, because that is what someone
+    who guessed would try, and silently treating it as "never" is exactly the
+    surprise this exists to remove.
+    """
+    raw = os.environ.get("XHC_DOCKER_TAG_TTL")
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip().lower()
+    if text in ("always", "revalidate", "0s"):
+        return ALWAYS_REVALIDATE
+    value = float(text)
+    return ALWAYS_REVALIDATE if value < 0 else value
+
+
 @dataclass
 class Settings:
     # --- upstream / identity -------------------------------------------------
@@ -284,7 +316,7 @@ class Settings:
             docker_default_upstream=os.environ.get(
                 "XHC_DOCKER_DEFAULT_UPSTREAM", cls.docker_default_upstream
             ),
-            docker_tag_ttl_s=_env_float("XHC_DOCKER_TAG_TTL", cls.docker_tag_ttl_s),
+            docker_tag_ttl_s=_parse_tag_ttl(cls.docker_tag_ttl_s),
             docker_auth=docker_auth,
             docker_htpasswd=os.environ.get("XHC_DOCKER_HTPASSWD") or None,
             registry_auth_file=os.environ.get("XHC_REGISTRY_AUTH_FILE") or None,

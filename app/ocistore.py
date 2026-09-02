@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import config
 from .config import settings
 
 log = logging.getLogger("xhc.ocistore")
@@ -235,7 +236,17 @@ def touch_tag(upstream: str, repo: str, tag: str, accept_fp: str) -> None:
 
 
 def tag_is_fresh(entry: dict) -> bool:
+    """Whether a cached tag->digest mapping may be served without asking upstream.
+
+    THREE REGIMES, and this function used to express two of them. `0` means
+    NEVER revalidate -- which is the value an operator reaches for when they
+    want the strictest behaviour, and it selects the loosest. That reading is
+    documented and unchanged, because deployments rely on it; what was missing
+    was any way to say "check every time", which is now `always`.
+    """
     ttl = settings.docker_tag_ttl_s
+    if ttl == config.ALWAYS_REVALIDATE:
+        return False
     if ttl <= 0:
         # 0 disables revalidation entirely: mutable tags then serve whatever was
         # first cached, forever, which is what a pure archive wants.
