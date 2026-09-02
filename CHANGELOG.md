@@ -9,6 +9,72 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.1 — 2026-09-02
+
+Four fixes, and three of them are the same defect: distinct states collapsed
+into one rendering, so a reader was told the wrong thing about what happened.
+
+A MISTYPED GHCR IMAGE NAME ACCUSED THE INFRASTRUCTURE TOO
+
+v0.9.0 fixed that for Docker Hub and not for ghcr, because the two registries
+refuse in different places. Docker Hub issues an anonymous token for a repo that
+does not exist and then 401s the request carrying it; ghcr refuses at the token
+endpoint, so the cache never authenticates and the earlier branch could not
+fire. Same user error, same user-visible failure, and the diagnosis differed by
+which registry the name was mistyped against.
+
+The cause was one layer down and in the same file: _fetch_token returned None
+for five distinct states -- no realm, an unusable realm, a transport error, a
+non-200 from the token endpoint, and a 200 with no token -- so the caller could
+not tell an ANSWER from NO ANSWER. It now reports which. A 401/403 from the auth
+service with no credentials held renders 404; with credentials it stays 502
+rejected; a 5xx or a timeout is its own 502 naming the token endpoint.
+
+The negative control matters more than the fix: a token endpoint returning 500
+must never become 404, or an upstream outage renders as "you typed it wrong".
+
+A FULL DISK DEGRADES THE PULL INSTEAD OF BREAKING IT
+
+Eviction compares the cache's own size against its own budget and never consults
+free space, so on a shared filesystem anything else can fill the volume while
+the cache sits far under budget. Every ingest then failed MID-STREAM, after the
+client already had a 2xx, as a truncated body and a digest mismatch -- and there
+is no fallback for the client to take, because its image reference was rewritten
+to point here, so the cache IS its registry.
+
+Below XHC_DOCKER_MIN_FREE (default 1 GiB) a miss is now streamed straight
+through and not cached, carrying `x-xhc-cache: BYPASS-NO-SPACE`. The pull gets
+slower; it does not break.
+
+It does NOT evict to make room. On a filesystem with no quota or reservation,
+space freed here goes to whatever is filling the volume -- the cache would
+shrink, evict again, and end small AND still failing, having destroyed warm data
+to get there. An unreadable filesystem keeps caching, which is the opposite of
+how pin state resolves unknown and deliberately so: the risk here is a slowdown,
+not data loss.
+
+XHC_DOCKER_TAG_TTL HAD THREE REGIMES AND EXPOSED TWO
+
+`0` means NEVER revalidate -- the value an operator reaches for wanting the
+strictest behaviour, selecting the loosest. `always` now means check every
+request. `0` is unchanged because deployments rely on it, so upgrading changes
+nothing. A negative value reads as `always` rather than `never`, because that is
+what someone guesses when they want no caching.
+
+The boot log prints the resolved regime in words rather than the raw number:
+`tag_ttl=0s` reads like "no delay" and gave an operator no way to tell which of
+the three they had.
+
+THE DOCS GUARD ONLY COVERED CONFIG VARIABLES
+
+Because both examples that prompted it were config variables. Routes are the
+instance that got through -- the pending endpoints shipped undocumented for
+three releases while that test went green, and its green is why nobody looked.
+It now reads the management surface off the router. The sweep was shown to find
+the historical miss before being trusted, and has a negative control, because a
+sweep returning an empty set passes vacuously and looks identical to a clean one.
+
+
 ## v0.9.0 — 2026-09-01
 
 Push-through works end to end against a real registry, and a typo'd image name
