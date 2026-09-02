@@ -9,6 +9,61 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.8.0 — 2026-09-01
+
+Push-through. OFF BY DEFAULT (XHC_DOCKER_PUSH=1).
+
+    docker push <cache-host>/ghcr.io/you/image:latest
+
+is forwarded to ghcr.io/you/image:latest AND kept in the cache, so the next node
+to pull it gets a local hit rather than a cold fetch.
+
+THE POINT IS THE CHUNKING, not that a cache accepts writes. A `docker push` does
+a MONOLITHIC PUT and has no chunk-size knob, so a registry behind a
+body-size-limiting proxy rejects it outright -- which is why tools like regctl
+must be configured per host and why plain docker fails against such a registry
+for large layers. Muninn decouples the two: the client pushes normally and what
+goes upstream is re-chunked per registry.
+
+  XHC_DOCKER_PUSH_LIMITS   regctl-format file, per host. blobMax is the
+                           threshold above which to chunk, blobChunk the piece
+                           size. Only those two fields are read; credentials in
+                           the file are ignored.
+  XHC_DOCKER_BLOB_CHUNK    global fallback, so one registry does not need a file
+  adaptive                 on a 413, halve and retry, and log the exact config
+                           line to add -- an unconfigured push works, slowly,
+                           and tells you how to make it fast
+
+Default is no chunking, because the problem is sparse.
+
+MODES. `proxy` (default) confirms upstream BEFORE answering, so a 201 means the
+registry really has it. `store-forward` answers as soon as the content is on
+disk and pushes behind: faster, retryable, and it TELLS THE CLIENT THE PUSH
+SUCCEEDED BEFORE IT HAS. The mode that can lie is the one you ask for.
+
+In store-forward, unconfirmed content is PINNED -- it is the only copy in
+existence and cannot be re-fetched, so eviction and GC leave it alone. A push
+that FAILS stays pinned and stays visible in the pending view rather than being
+tidied away.
+
+XHC_DOCKER_CACHE_ON_PUSH=1 by default: a push is nearly always followed by pulls
+from other nodes and the bytes have already crossed the wire.
+
+PUSH IS NOT GATED BY AUTHENTICATION. With client auth off, anyone who can reach
+this cache can push to any registry it holds credentials for, under the cache's
+identity and with no attribution -- a docker push cannot identify itself. That
+is the same trust model as the pull surface rather than an exception to it.
+Muninn warns at boot; it does not refuse. Restrict who can reach the port, or
+set XHC_DOCKER_HTPASSWD.
+
+Not implemented: delete and cross-repo mount. Removing upstream content is a
+retention decision for that registry's owner, not for a cache in front of it.
+
+Verified against a real registry:2 -- monolithic and chunked uploads both land,
+a chunked 5 MiB layer fetches back with a matching digest, an existing blob is
+not re-uploaded, and a manifest is retrievable by tag afterwards.
+
+
 ## v0.7.0 — 2026-09-01
 
 Optional client auth on the pull surface. OFF BY DEFAULT.
