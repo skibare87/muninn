@@ -682,6 +682,12 @@ In `store-forward`, content that has not yet been confirmed upstream is **pinned
 the only copy in existence and cannot be re-fetched, so eviction and GC leave it alone. A
 push that fails stays pinned and stays visible rather than being tidied away.
 
+The two settings compose rather than conflict. `XHC_DOCKER_PUSH_MODE` decides **when the
+client is answered**; `XHC_DOCKER_CACHE_ON_PUSH` decides **whether the copy is kept**. With
+`store-forward` and `CACHE_ON_PUSH=0` the store is **ephemeral** — the content survives long
+enough to be forwarded and is deleted once upstream confirms. That is a useful combination:
+absorb the upload and push behind, without the pushed image occupying the cache.
+
 #### What enabling push means
 
 > **Push is not gated by authentication.** If push is enabled and client auth is off,

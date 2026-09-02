@@ -261,13 +261,11 @@ async def finalise_blob(up: Upload, claimed: str) -> None:
     # store-forward: land it, answer, push behind. The blob is the only copy
     # until that task completes, so it is pinned (see _forward_later).
     #
-    # cache_on_push=0 is INCOHERENT here -- discarding the bytes before the
-    # deferred push would leave nothing to forward, and the client has already
-    # been told 201. Keep it regardless and say why, rather than silently
-    # losing the push or silently ignoring the setting.
-    if not settings.docker_cache_on_push:
-        log.warning("XHC_DOCKER_CACHE_ON_PUSH=0 is ignored in store-forward "
-                    "mode: the blob must survive until it has been forwarded")
+    # cache_on_push=0 composes with this rather than conflicting: the two
+    # settings answer different questions. store-forward is WHEN THE CLIENT IS
+    # ANSWERED; cache_on_push is WHETHER THE COPY IS KEPT AFTERWARDS. With it
+    # off the store is EPHEMERAL -- the blob must survive long enough to be
+    # forwarded, and is deleted once upstream confirms.
     _land(up, claimed, pin=True, force_keep=True)
     key = f"{up.ref.upstream}/{claimed}"
     _pending[key] = asyncio.create_task(_forward_later(up.ref, claimed, key))
@@ -330,6 +328,13 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
     else:
         _pinned.discard(key)
         _pending.pop(key, None)
+        if not settings.docker_cache_on_push:
+            # Ephemeral store: it existed only to be forwarded, and upstream
+            # now has it. Deleting AFTER confirmation is the whole point --
+            # deleting before would have left nothing to push.
+            ocistore.blob_path(ref.upstream, digest).unlink(missing_ok=True)
+            log.debug("store-forward: %s forwarded and dropped "
+                      "(XHC_DOCKER_CACHE_ON_PUSH=0)", digest)
 
 
 async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,

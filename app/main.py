@@ -103,6 +103,12 @@ async def lifespan(app: FastAPI):
                     "a pull elsewhere can race it. Use `proxy` if a 201 must "
                     "mean the registry really has it."
                 )
+                if not settings.docker_cache_on_push:
+                    log.info(
+                        "XHC_DOCKER_CACHE_ON_PUSH=0 with store-forward: the "
+                        "store is EPHEMERAL -- pushed content is held only "
+                        "until the upstream push confirms, then dropped."
+                    )
         if settings.docker_auth == "basic":
             log.warning(
                 "client auth is `basic`: credentials are sent in clear unless "

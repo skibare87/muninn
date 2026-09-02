@@ -298,11 +298,16 @@ def test_a_failed_forward_stays_pinned_and_visible(monkeypatch):
         "a failed push vanished from the pending view"
 
 
-def test_store_forward_keeps_the_blob_even_with_cache_on_push_off(monkeypatch):
-    """Incoherent combination, resolved explicitly rather than silently.
+def test_store_forward_with_cache_off_is_an_EPHEMERAL_store(monkeypatch):
+    """The two settings compose; they do not conflict.
 
-    Discarding the bytes before a deferred push would leave nothing to forward,
-    and the client has already been told 201.
+    store-forward is WHEN THE CLIENT IS ANSWERED. cache_on_push is WHETHER THE
+    COPY IS KEPT. Off means the store is ephemeral: the blob survives long
+    enough to be forwarded and is deleted once upstream confirms.
+
+    An earlier version treated this as incoherent and overrode the setting with
+    a warning -- substituting my judgement for the operator's configuration,
+    which is exactly what a config option exists to prevent.
     """
     import asyncio
 
@@ -310,19 +315,54 @@ def test_store_forward_keeps_the_blob_even_with_cache_on_push_off(monkeypatch):
 
     monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
     monkeypatch.setattr(settings, "docker_cache_on_push", False)
-    started = asyncio.Event()
+    release = asyncio.Event()
+    seen = {}
 
-    async def slow(ref, path, digest):
-        started.set()
-        await asyncio.sleep(3600)
+    async def gated(ref, path, digest):
+        # Present while the push is in flight -- otherwise there is nothing
+        # to forward.
+        seen["during"] = ocistore.blob_path("r.example.com", digest).exists()
+        await release.wait()
 
-    monkeypatch.setattr(ocipush, "push_blob", slow)
+    monkeypatch.setattr(ocipush, "push_blob", gated)
 
     async def go():
         up = ocipush.begin(_ref())
         ocipush.append(up, b"payload")
         await ocipush.finalise_blob(up, up.computed)
-        await asyncio.wait_for(started.wait(), 5)
-        return ocistore.blob_path("r.example.com", up.computed).exists()
+        key = f"r.example.com/{up.computed}"
+        await asyncio.sleep(0)
+        release.set()
+        await ocipush._pending[key]
+        return up.computed
 
-    assert asyncio.run(go()), "store-forward discarded the only copy"
+    digest = asyncio.run(go())
+    assert seen["during"], "deleted before it could be forwarded"
+    assert not ocistore.blob_path("r.example.com", digest).exists(), \
+        "kept after confirmation despite XHC_DOCKER_CACHE_ON_PUSH=0"
+
+
+def test_store_forward_with_cache_ON_keeps_it_after_confirming(monkeypatch):
+    """The other half of the same behaviour, so neither can regress alone."""
+    import asyncio
+
+    from app import ocistore
+
+    monkeypatch.setattr(settings, "docker_push_mode", "store-forward")
+    monkeypatch.setattr(settings, "docker_cache_on_push", True)
+
+    async def instant(ref, path, digest):
+        return None
+
+    monkeypatch.setattr(ocipush, "push_blob", instant)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        ocipush.append(up, b"payload")
+        await ocipush.finalise_blob(up, up.computed)
+        await ocipush._pending[f"r.example.com/{up.computed}"]
+        return up.computed
+
+    digest = asyncio.run(go())
+    assert ocistore.blob_path("r.example.com", digest).exists()
+    assert not ocipush.is_pinned("r.example.com", digest)
