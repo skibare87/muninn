@@ -101,6 +101,22 @@ counter is for. Every result/kind the code can emit is now seeded to 0 at
 startup: a zero means zero, a gap means the process was down. Additive to
 /metrics -- nothing is removed or renamed, and /healthz is untouched.
 
+BEHAVIOURS OTHER TEAMS ASSERT ARE NOW PINNED HERE
+
+Twice in one night a change broke something another team had published as a
+check, and both times it was found by luck: /healthz's BODY is matched by a
+blackbox monitoring probe rather than just its 200, and a bogus repository name
+returning 404 is the line used to validate a deployment. Neither side has a
+mechanism for "who asserts this behaviour", and searching the other's documents
+does not scale -- it makes correctness depend on remembering to go and look.
+
+So the assertion moves to where the change happens: a contract someone else
+depends on becomes a test in the repo that can break it. Pinned are the healthz
+body shape, healthz and metrics staying unauthenticated, the externally scraped
+metric names, and a nonexistent repo answering 404. Each was verified by
+breaking it -- renaming the "ok" key, the exact "tidy" that would silently stop
+another team's alerts, fails the contract test.
+
 KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
 
