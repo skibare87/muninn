@@ -54,3 +54,38 @@ def test_enumerated_settings_document_their_accepted_values():
         assert knob in readme, f"{knob} is not in the README at all"
         for v in values:
             assert v in readme, f"{knob} is named but its value {v!r} is not"
+
+
+def test_the_shipped_compose_is_a_general_example_not_someone_s_deployment():
+    """It is a public repo and the example was written for one machine.
+
+    the maintainer: "this is public but you wrote it for me alone". It carried an 80T
+    array, a 70T cache budget, a 16G memory limit and absolute paths from one
+    NAS -- meaningless to anyone cloning it, and actively misleading as a
+    starting point.
+    """
+    compose = (ROOT / "docker-compose.yml").read_text()
+    for leak in ("80T", "70T", "/mnt/nvme", "NAS"):
+        assert leak not in compose, f"the example still carries {leak!r} from one deployment"
+
+
+def test_the_shipped_compose_covers_the_docker_side():
+    """It shipped with ZERO XHC_DOCKER_* settings while OCI caching was a
+    headline feature, so copying it gave you none of the registry half."""
+    compose = (ROOT / "docker-compose.yml").read_text()
+    for knob in ("XHC_DOCKER_ENABLED", "XHC_DOCKER_MAX_SIZE", "XHC_DOCKER_POLICY",
+                 "XHC_REGISTRY_AUTH_FILE", "XHC_DOCKER_PUSH",
+                 "XHC_DOCKER_PUSH_MODE", "XHC_DOCKER_CACHE_ON_PUSH",
+                 "XHC_DOCKER_PUSH_LIMITS"):
+        assert knob in compose, f"{knob} is not in the shipped example"
+
+
+def test_the_regctl_file_credential_caveat_is_documented():
+    """regctl's format carries user/pass and Muninn reads neither.
+
+    Someone who mounts their real regctl config needs to know that, and
+    someone deciding what to mount needs to know a limits-only file suffices.
+    """
+    readme = (ROOT / "README.md").read_text()
+    assert "ignores any credentials" in readme or "limits-only" in readme, \
+        "the README does not say credentials in the limits file are ignored"

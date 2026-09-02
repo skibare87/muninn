@@ -1,85 +1,129 @@
+# A working starting point, not a copy of anyone's deployment.
+#
+# The defaults below are deliberately modest so this runs unedited on an
+# ordinary machine. Every size and limit is a knob, not a recommendation --
+# set them from your own disk and RAM. Figures quoted in comments are
+# MEASUREMENTS from one deployment, given so you can reason about scaling,
+# not targets to match.
+#
+# Copy .env.example to .env, set HF_TOKEN, and `docker compose up -d`.
+
 services:
   muninn:
-    build: .
-    image: ghcr.io/skibare87/muninn:0.6.0
+    image: ghcr.io/skibare87/muninn:${MUNINN_VERSION:-latest}
     container_name: muninn
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${XHC_PORT:-8080}:8080"
     volumes:
-      # The 80T NVMe array. Standard huggingface_hub cache layout, so you can
-      # also mount it read-only elsewhere and point HF_HUB_CACHE at it directly.
-      - ${XHC_CACHE_PATH:-/mnt/nvme/hf-cache}:/cache
-      # hf_xet scratch chunk cache. Keep on fast local disk, separate from /cache.
-      - ${XHC_XET_PATH:-/var/lib/muninn/xet}:/xet
-    environment:
-      # --- identity ------------------------------------------------------
-      # One org token here means edge nodes need no Hub credentials at all,
-      # and gated licences (Llama/Gemma/Mistral) are accepted once, centrally.
-      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN in .env}
-      XHC_UPSTREAM: https://huggingface.co
+      # Hugging Face cache. Standard huggingface_hub layout, so you can also
+      # mount it read-only elsewhere and point HF_HUB_CACHE at it directly.
+      - ${XHC_CACHE_PATH:-./data/cache}:/cache
+      # hf_xet scratch. Keep on fast local disk, separate from the cache.
+      - ${XHC_XET_PATH:-./data/xet}:/xet
+      # Docker/OCI image store. A separate volume: image layers and model
+      # weights have different sizes, lifetimes and eviction pressure.
+      - ${XHC_DOCKER_PATH:-./data/docker}:/docker
+      # Optional, for pulling from private registries -- see below.
+      # - ~/.docker/config.json:/auth/config.json:ro
+      # - ./push-limits.json:/auth/push-limits.json:ro
 
-      # --- capacity ------------------------------------------------------
-      XHC_CACHE_MAX_SIZE: ${XHC_CACHE_MAX_SIZE:-70T}
+    environment:
+      # --- Hugging Face side ---------------------------------------------
+      # One token here means client nodes need no Hub credentials, and gated
+      # licences are accepted once, centrally.
+      HF_TOKEN: ${HF_TOKEN:-}
+      XHC_UPSTREAM: ${XHC_UPSTREAM:-https://huggingface.co}
+
+      # Size the cache to your disk, leaving headroom. This is the number
+      # eviction targets, not the size of the filesystem.
+      XHC_CACHE_MAX_SIZE: ${XHC_CACHE_MAX_SIZE:-100G}
       XHC_HIGH_WATER: "0.90"
       XHC_LOW_WATER: "0.75"
       XHC_EVICT_INTERVAL: "900"
 
-      # --- behaviour -----------------------------------------------------
-      # stream:   default. N concurrent cold clients share ONE WAN fetch and
-      #           all get bytes at ingest speed (measured: 3 clients x 157MB/s
-      #           off a single 3.95GB ingest). Needs sequential writes.
-      # redirect: 302 to HF. Coalesces the ingest but NOT the clients -- each
-      #           pulls from the WAN itself and needs a Hub token.
-      # wait:     block until ingest completes. Always correct, slowest.
+      # What happens on a request for a file not yet cached.
+      #   stream    default. N concurrent cold clients share ONE upstream
+      #             fetch and all receive bytes at ingest speed. Requires
+      #             sequential writes, which the image sets.
+      #   redirect  302 upstream. Coalesces the ingest but not the clients;
+      #             each pulls from the WAN itself and needs its own token.
+      #   wait      block until ingest finishes. Always correct, slowest.
       XHC_MISS_POLICY: ${XHC_MISS_POLICY:-stream}
       XHC_BLOCK_CLIENT_XET: "1"
-      XHC_INGEST_CONCURRENCY: "4"
-      # Remember upstream 404s briefly. Clients probe for optional files on
-      # every model load; this keeps that off the WAN. 0 disables.
+      XHC_INGEST_CONCURRENCY: "${XHC_INGEST_CONCURRENCY:-4}"
+      # Clients probe for optional files on every model load. Remembering an
+      # upstream 404 briefly keeps those off the WAN. 0 disables.
       XHC_NEGATIVE_TTL: "60"
-      # Repos deleted or gated upstream exist only here, so evicting one cannot
-      # be undone. retain exempts them from eviction; evict opts out.
+      # A repo deleted or gated upstream exists ONLY here, so evicting it
+      # cannot be undone. retain exempts them; evict opts out.
       XHC_ORPHAN_POLICY: ${XHC_ORPHAN_POLICY:-retain}
-      XHC_ORPHAN_CHECK_INTERVAL: "21600"
-      # Keep deleted repos enumerable by rebuilding their listing from cache.
       XHC_SYNTHESIZE_REPO_INFO: "1"
-      # Revalidate mutable refs (main, branches, tags) this often. 0 = never,
-      # which serves whatever was first cached forever.
+      # Revalidate mutable refs this often. 0 serves whatever was first
+      # cached, forever.
       XHC_REF_TTL: "${XHC_REF_TTL:-300}"
-      # Ingest policy: open | allowlist. Deny wins over allow. Gates ingest,
-      # not serving, unless XHC_POLICY_SCOPE=all.
       XHC_INGEST_POLICY: ${XHC_INGEST_POLICY:-open}
-      XHC_ALLOW_REPOS: ${XHC_ALLOW_REPOS:-}
-      XHC_DENY_REPOS: ${XHC_DENY_REPOS:-}
-      XHC_POLICY_SCOPE: ${XHC_POLICY_SCOPE:-ingest}
-      XHC_MAX_FILE_BYTES: ${XHC_MAX_FILE_BYTES:-}
-      # Small dataset metadata worth holding, so a deleted dataset stays
-      # describable. Never /rows.
-      XHC_VIEWER_ENDPOINTS: ${XHC_VIEWER_ENDPOINTS:-parquet,croissant}
-      XHC_VIEWER_CACHE_TTL: "${XHC_VIEWER_CACHE_TTL:-3600}"
-      # Opt-in datasets-server proxy at /datasets-server/*. Empty disables.
-      XHC_DATASETS_SERVER: ${XHC_DATASETS_SERVER:-https://datasets-server.huggingface.co}
       XHC_MANAGE_TOKEN: ${XHC_MANAGE_TOKEN:-}
-      XHC_LOG_LEVEL: INFO
+      XHC_LOG_LEVEL: ${XHC_LOG_LEVEL:-INFO}
 
-      # --- WAN ingest tuning ---------------------------------------------
-      # Raise if the NAS has bandwidth to spare; this is the main throughput
-      # dial. Default in the image is 32 (hf_xet's own default is 16).
-      HF_XET_NUM_CONCURRENT_RANGE_GETS: "32"
-      # Wants >=64GB RAM. Tensions against WRITE_SEQUENTIALLY below -- measure
-      # the combination rather than assuming they compose.
-      # HF_XET_HIGH_PERFORMANCE: "1"
-      # Required for XHC_MISS_POLICY=stream (set in the image too). Measured
-      # no throughput penalty vs unset on a 3.95GB Xet file.
+      # --- Docker / OCI side ---------------------------------------------
+      XHC_DOCKER_ENABLED: "${XHC_DOCKER_ENABLED:-1}"
+      XHC_DOCKER_MAX_SIZE: ${XHC_DOCKER_MAX_SIZE:-50G}
+      # Used when the first path segment has no dot:
+      # <cache>/nginx -> docker.io/library/nginx
+      XHC_DOCKER_DEFAULT_UPSTREAM: ${XHC_DOCKER_DEFAULT_UPSTREAM:-docker.io}
+      XHC_DOCKER_TAG_TTL: "${XHC_DOCKER_TAG_TTL:-300}"
+
+      # POLICY DEFAULTS TO open, at parity with the HF side. Path-prefix
+      # routing means anyone who can reach the port can pull from ANY
+      # registry onto your disk. Setting XHC_ALLOW_REGISTRIES is the
+      # cheapest useful hardening and does not require allowlist mode.
+      XHC_DOCKER_POLICY: ${XHC_DOCKER_POLICY:-open}
+      XHC_ALLOW_REGISTRIES: ${XHC_ALLOW_REGISTRIES:-}
+      XHC_DENY_REGISTRIES: ${XHC_DENY_REGISTRIES:-}
+      XHC_ALLOW_IMAGES: ${XHC_ALLOW_IMAGES:-}
+      XHC_DENY_IMAGES: ${XHC_DENY_IMAGES:-}
+      XHC_DOCKER_MAX_BLOB_BYTES: ${XHC_DOCKER_MAX_BLOB_BYTES:-}
+
+      # Client-facing auth on /v2/*. `basic` needs XHC_DOCKER_HTPASSWD and
+      # refuses to start without a readable one. It is a GATE, not per-client
+      # isolation: everyone who authenticates sees everything cached.
+      XHC_DOCKER_AUTH: ${XHC_DOCKER_AUTH:-none}
+      XHC_DOCKER_HTPASSWD: ${XHC_DOCKER_HTPASSWD:-}
+
+      # Pull from private registries as the cache itself: `docker login` on
+      # this host, then mount the resulting config.json (see volumes above).
+      XHC_REGISTRY_AUTH_FILE: ${XHC_REGISTRY_AUTH_FILE:-}
+
+      # --- push-through (off by default) ---------------------------------
+      # ENABLING THIS MEANS anyone who can reach the cache can push to any
+      # registry it holds credentials for, under the cache's identity and
+      # with no attribution. It warns at boot; it does not refuse.
+      XHC_DOCKER_PUSH: "${XHC_DOCKER_PUSH:-0}"
+      #   proxy          upstream confirmed BEFORE the client's 201
+      #   store-forward  201 first, forward behind. Faster, and it tells the
+      #                  client the push succeeded before it has.
+      XHC_DOCKER_PUSH_MODE: ${XHC_DOCKER_PUSH_MODE:-proxy}
+      XHC_DOCKER_CACHE_ON_PUSH: "${XHC_DOCKER_CACHE_ON_PUSH:-1}"
+      # Per-registry blob chunking for registries behind a body-size limit,
+      # in regctl's format. Only blobChunk/blobMax are read; any credentials
+      # in the file are ignored, so prefer a limits-only file.
+      XHC_DOCKER_PUSH_LIMITS: ${XHC_DOCKER_PUSH_LIMITS:-}
+      XHC_DOCKER_BLOB_CHUNK: ${XHC_DOCKER_BLOB_CHUNK:-}
+
+      # --- ingest tuning --------------------------------------------------
+      # The main throughput dial. Raise if your link and disk have headroom.
+      HF_XET_NUM_CONCURRENT_RANGE_GETS: "${HF_XET_RANGE_GETS:-16}"
+      # Required by XHC_MISS_POLICY=stream; the image sets it too.
       HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY: "1"
-      HF_XET_CHUNK_CACHE_SIZE_BYTES: "107374182400"  # 100G of xet scratch
+      HF_XET_CHUNK_CACHE_SIZE_BYTES: "${HF_XET_CACHE_BYTES:-10737418240}"  # 10G
 
-    # scan_cache_dir() over a multi-TB tree is memory-hungry; give it headroom.
+    # scan_cache_dir() over a large tree is memory-hungry. Raise this in
+    # proportion to how many files the cache holds, not how big they are.
     deploy:
       resources:
         limits:
-          memory: ${XHC_MEM_LIMIT:-16G}
+          memory: ${XHC_MEM_LIMIT:-2G}
     ulimits:
       nofile:
         soft: 65536
