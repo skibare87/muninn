@@ -596,6 +596,8 @@ collapsing those would silently disarm pin protection inside an unattended loop.
 | `GET`/`POST`/`DELETE` | `/_cache/docker/pins` | pin an image and its blob closure |
 | `DELETE` | `/_cache/docker/images` | drop a tag; frees every layer no other tag references. `?sweep=1` reclaims now and reports the bytes, otherwise the next sweep does it |
 | `POST` | `/_cache/docker/gc` | run mark-and-sweep now (`?dry_run=true` to see what would go) |
+| `GET` | `/_cache/docker/pending` | store-forward: what has been accepted but not yet confirmed upstream |
+| `DELETE` | `/_cache/docker/pending` | give up on one outstanding forward and unpin it — **the content is then evictable and may be the only copy** |
 
 Prewarm is fire-and-forget, so nobody holds an HTTP connection open across a 30 GB pull.
 **Pass a digest rather than a tag** for anything you intend to reproduce — a tag can move
@@ -700,6 +702,37 @@ client is answered**; `XHC_DOCKER_CACHE_ON_PUSH` decides **whether the copy is k
 `store-forward` and `CACHE_ON_PUSH=0` the store is **ephemeral** — the content survives long
 enough to be forwarded and is deleted once upstream confirms. That is a useful combination:
 absorb the upload and push behind, without the pushed image occupying the cache.
+
+#### What `store-forward` actually promises
+
+A `201` in `store-forward` means **accepted and owed**, not **delivered**. The mode is
+*eventually* consistent rather than immediately consistent, and everything below exists so
+that "eventually" is a commitment rather than a hope.
+
+- **Manifests are deferred until their blobs are upstream.** A manifest that lands before
+  its layers is a tag that resolves to a broken image, which is worse than a tag that does
+  not resolve yet. Muninn holds the manifest until every blob it references is confirmed.
+- **Transport failures retry with backoff** (5 attempts, 1s/4s/15s/45s). A registry that is
+  briefly unreachable does not cost you the push.
+- **Outstanding forwards survive a restart.** Each one is recorded on disk before the client
+  is answered and cleared only on confirmation, so a forward interrupted by a restart — or
+  one that had already exhausted its retries — is re-enqueued on the next boot rather than
+  lost. Startup logs each recovered obligation at `WARNING`: those clients were told `201`
+  and the upstream does not have their content yet. An obligation marker that cannot be
+  *read* is left in place rather than discarded, because unreadable is not the same as
+  absent.
+- **Nothing pending is evictable.** Unconfirmed content is the only copy in existence, so
+  it is pinned and GC leaves it alone.
+
+`GET /_cache/docker/pending` is the window into all of it, one row per outstanding forward
+with `state` (`running`, `retrying`, `failed`, `cancelled`, `done`), the `error` text if it
+failed, `attempts`/`max_attempts`, and whether it is `pinned`. **An empty queue means
+delivered** — that is the distinction the whole mechanism exists to create, and it is worth
+checking directly against the upstream at least once rather than trusting the queue alone.
+
+Giving up is explicit: `DELETE /_cache/docker/pending` abandons one forward and unpins it.
+That is a deliberate decision to break the promise made to whoever pushed, and it makes the
+content evictable when it may be the only copy anywhere. Nothing does it automatically.
 
 #### What enabling push means
 
