@@ -747,9 +747,16 @@ async def unsupported(rest: str) -> Response:
     a retention decision belonging to whoever owns that registry, not to a
     cache sitting in front of it.
     """
+    if not settings.docker_push_enabled:
+        # Anything write-shaped that did not match a push route, while push is
+        # off. Naming the flag is more useful than describing the verb: the
+        # caller's next question is "how do I turn this on", and a message
+        # about delete and mount would send them the wrong way.
+        return _push_disabled()
     return _err(
         405,
         "UNSUPPORTED",
-        "not supported: delete and cross-repo mount. Deleting upstream content "
-        "is a retention decision for that registry's owner, not for a cache.",
+        "not a supported write. Push is enabled, but delete and cross-repo "
+        "mount are not: removing upstream content is a retention decision for "
+        "that registry's owner, not for a cache in front of it.",
     )

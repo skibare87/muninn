@@ -262,7 +262,13 @@ def test_v2_root_is_answered_locally(client):
 
 
 @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
-def test_push_verbs_are_refused(client, method):
+def test_push_verbs_are_refused_while_push_is_disabled(client, method):
+    """Renamed: this asserts the DEFAULT, not that push is unimplemented.
+
+    Push-through exists as of 0.8.0 and is off unless XHC_DOCKER_PUSH is set,
+    so what this pins is that the default stays closed. The routes themselves
+    are covered in test_ocipush_routes.py.
+    """
     r = getattr(client, method)("/v2/ghcr.io/org/img/blobs/uploads/")
     assert r.status_code == 405
     assert r.json()["errors"][0]["code"] == "UNSUPPORTED"
