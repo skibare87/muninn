@@ -11,25 +11,44 @@ immutable; `X.Y`, `latest` and `edge` all move.
 
 ## v0.9.0 — 2026-09-01
 
-Push-through works end to end against a real registry.
+Push-through works end to end against a real registry, and a typo'd image name
+no longer accuses the infrastructure.
 
 Everything in 0.8.x was built and tested against registry:2 and a test client.
 Pointing it at a different registry implementation, with a real multi-megabyte
-layer on the other end, found six defects in a row. Every one of them passed the
+layer on the other end, found seven defects. Every one of them passed the
 existing suite. That is the release note: the gap was not test coverage, it was
 that a fake never disagrees with you.
+
+A NONEXISTENT REPO RETURNED 502 BAD GATEWAY
+
+Docker Hub and ghcr refuse to leak existence. For a repo that does not exist
+they issue a VALID anonymous token and then answer 401 to the request carrying
+it, so "you mistyped the name" and "this is private and you cannot see it"
+arrive as the same response. The cache mapped every upstream 401 to 502, so the
+most common mistake anyone makes -- mistyping an image name -- rendered as Bad
+Gateway and sent the reader off to check whether the cache, the host or the
+registry was down.
+
+An error is a routing instruction for whoever reads it next. 404 costs the
+reader nothing; 502 costs them an afternoon. The cache now distinguishes being
+refused AFTER authenticating -- an answer, rendered 404 -- from being unable to
+authenticate at all, which is a real gateway problem and stays 502, as does a
+configured credential that was rejected. A regression from this release's own
+three-state error work, caught before it shipped.
 
 THE TWO THAT ONLY A LARGE REAL LAYER COULD FIND
 
 A 3 MiB blob failed with an empty-message ReadError while a 463-byte blob on the
-same session succeeded. The cause is challenge-response plus a body: Muninn sent
-the upload unauthenticated, the registry answered 401 as soon as it had the
+same session succeeded. The cause is challenge-response plus a body: the upload
+went out unauthenticated, the registry answered 401 as soon as it had the
 headers and closed WITHOUT DRAINING, and the remaining writes failed. A small
 body already sits in socket buffers and survives; a large one does not. Once an
-upstream has challenged for Basic, credentials now go up front. The first request
-to any upstream is still challenge-response, so credentials are never sent to a
-registry that has not asked -- there is a test for that specifically, because the
-failure mode of getting this wrong in the other direction is leaking them.
+upstream has challenged for Basic, credentials now go up front. The first
+request to any upstream is still challenge-response, so credentials are never
+sent to a registry that has not asked -- there is a test for that specifically,
+because the failure mode of getting this wrong in the other direction is
+leaking them.
 
 A push stalled for 223 seconds at ~0% CPU. Writing client chunks to disk ran on
 the event loop; docker sends a layer as many small writes, and each one blocked
@@ -64,6 +83,11 @@ one, which is the failure store-forward exists to prevent. GET /_cache/docker/pe
 shows state, error, attempts and pin status per outstanding forward; DELETE
 abandons one, which is an explicit decision to break the promise made to whoever
 pushed and to make the only copy evictable. Nothing does that automatically.
+
+Also new: what a failed pull means, by status. The docker CLI discards the body
+and headers and prints only the status, so the status is the whole message most
+people ever see -- and 404 is the only one that hides itself, rendering as "not
+found" with no code at all.
 
 KNOWN GAP, filed not fixed: XHC_DOCKER_TAG_TTL has no value meaning "always
 revalidate". 0 means never. The default of 300s is unaffected.
