@@ -28,9 +28,23 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import registry
+
+
+@pytest.fixture(autouse=True)
+def _isolate_remembered_upstreams():
+    """`_basic_upstreams` is module-level and now persists between requests by
+    design. Without this, one test teaching the module that an upstream uses
+    Basic makes a later test see credentials sent unasked -- which is exactly
+    the property the later test exists to protect.
+    """
+    registry._basic_upstreams.clear()
+    yield
+    registry._basic_upstreams.clear()
 
 
 def _enters_bearer_dance(header: str) -> bool:
@@ -151,9 +165,13 @@ class _FakeClient:
 
     async def send(self, req, stream=False):
         self.sent.append(dict(req.headers))
-        if len(self.sent) == 1:
-            return _FakeResponse(401, {"www-authenticate": self.challenge})
-        return _FakeResponse(200)
+        # Model a server, not a counter: it challenges an UNAUTHENTICATED
+        # request and accepts an authenticated one. Keying off the request
+        # number instead made a preemptively-authenticated request still get
+        # a 401, which is not something any registry does.
+        if "authorization" in {k.lower() for k in req.headers}:
+            return _FakeResponse(200)
+        return _FakeResponse(401, {"www-authenticate": self.challenge})
 
 
 def _run_authed(monkeypatch, challenge, creds):
@@ -223,3 +241,53 @@ def test_a_bearer_challenge_does_not_take_the_basic_path(monkeypatch):
     )
     assert resp.status_code == 401
     assert len(sent) == 1
+
+
+# --------------------------------------------------------------------------
+# Preemptive Basic after a first challenge.
+#
+# Challenge-response means sending the whole body, being told 401, and sending
+# it again. For a small body that is wasteful. For a large one it BREAKS: the
+# server answers 401 and closes as soon as it has the headers, without draining
+# the body, so the remaining writes fail and httpx raises ReadError -- fast,
+# and nothing to do with size limits or timeouts.
+#
+# Measured against a server that 401s without draining: a 64 KiB body gets a
+# clean 401 because it fits in socket buffers; a 3 MiB body raises ReadError.
+# That is the reported asymmetry exactly -- a small config blob succeeding
+# while a 3 MiB layer failed 0.6s into a freshly opened session.
+# --------------------------------------------------------------------------
+
+def test_credentials_go_preemptively_only_after_a_challenge(monkeypatch):
+    """The property that keeps this safe.
+
+    A registry that has never challenged us must still not receive
+    credentials, or configuring an auth file leaks them to every upstream.
+    """
+    registry._basic_upstreams.clear()
+    monkeypatch.setattr(registry, "_basic_for", lambda u: "dTpw")
+
+    _, sent = _run_authed(monkeypatch, 'Basic realm="r"', "dTpw")
+    assert "authorization" not in sent[0], \
+        "credentials were sent to an upstream that had not asked"
+    assert sent[1]["authorization"] == "Basic dTpw"
+    assert "registry.example.com" in registry._basic_upstreams, \
+        "the challenge was not remembered, so the next large upload still breaks"
+
+
+def test_a_remembered_upstream_gets_credentials_on_the_first_request(monkeypatch):
+    """The fix itself: no second send, so no body sent twice and no 401
+    arriving mid-upload."""
+    registry._basic_upstreams.clear()
+    registry._basic_upstreams.add("registry.example.com")
+    monkeypatch.setattr(registry, "_basic_for", lambda u: "dTpw")
+
+    resp, sent = _run_authed(monkeypatch, 'Basic realm="r"', "dTpw")
+    assert sent[0].get("authorization") == "Basic dTpw"
+    assert len(sent) == 1, "a remembered upstream still round-tripped a challenge"
+
+
+def test_clearing_tokens_also_forgets_basic_upstreams():
+    registry._basic_upstreams.add("x.example.com")
+    registry.clear_tokens()
+    assert not registry._basic_upstreams

@@ -47,6 +47,12 @@ _CHALLENGE_RE = re.compile(r'(\w+)="([^"]*)"')
 # guard in _authed_request has (an internal issue).
 _SCHEME_RE = re.compile(r"^\s*([A-Za-z]+)")
 
+# Upstreams that have answered a Basic challenge. Once a registry has ASKED,
+# subsequent requests carry credentials up front rather than being challenged
+# again -- see _authed_request for why that is a correctness fix and not an
+# optimisation.
+_basic_upstreams: set[str] = set()
+
 _client: httpx.AsyncClient | None = None
 _tokens: dict[tuple[str, str], tuple[str, float]] = {}
 _token_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -223,6 +229,7 @@ def _cached_token(ref: Ref) -> str | None:
 
 def clear_tokens() -> None:
     _tokens.clear()
+    _basic_upstreams.clear()
 
 
 async def _authed_request(
@@ -243,6 +250,29 @@ async def _authed_request(
     token = _cached_token(ref)
     if token:
         hdrs["authorization"] = f"Bearer {token}"
+    elif ref.upstream in _basic_upstreams and "authorization" not in hdrs:
+        # PREEMPTIVE, AND IT IS A CORRECTNESS FIX RATHER THAN A SAVED ROUND TRIP.
+        #
+        # Challenge-response means sending the whole body, being told 401, and
+        # sending it again. For a small body that is merely wasteful. For a
+        # large one it BREAKS: the server answers 401 and closes as soon as it
+        # has the headers, without draining the body, so our remaining writes
+        # fail and httpx raises ReadError -- fast, and nothing to do with size
+        # limits or timeouts.
+        #
+        # Measured against a server that 401s without draining: a 64 KiB body
+        # gets a clean 401 because it fits in socket buffers, a 3 MiB body
+        # raises ReadError. That is exactly the reported asymmetry -- a small
+        # config blob succeeding while a 3 MiB layer failed 0.6s into a freshly
+        # opened session.
+        #
+        # Credentials still go ONLY to an upstream that has already challenged
+        # us for Basic, so configuring an auth file cannot leak them to a
+        # registry that never asked. The first request to a registry is still
+        # challenge-response; every one after it is not.
+        basic = _basic_for(ref.upstream)
+        if basic:
+            hdrs["authorization"] = f"Basic {basic}"
 
     async def send(h):
         # `content` is a CALLABLE returning a fresh body, not a body. The auth
@@ -288,6 +318,7 @@ async def _authed_request(
         # Challenge-response rather than preemptive: credentials go only to an
         # upstream that actually asked for them, so configuring an auth file
         # cannot leak them to a registry that never challenges.
+        _basic_upstreams.add(ref.upstream)
         basic = _basic_for(ref.upstream)
         if not basic:
             # Challenged for Basic and we hold nothing for this upstream. Hand
