@@ -272,3 +272,77 @@ def test_bogus_repo_name_returns_404(client, monkeypatch):
         "a nonexistent repo must be 404; 502 tells the operator their "
         "infrastructure is broken when they have simply mistyped a name"
     )
+
+
+# ---------------------------------------------------------------------------
+# ASSERT THE CONSUMER, NOT THE PRESENCE OF A CONSUMER.
+#
+# Every case above pins a behaviour someone outside this repo depends on, and
+# each names WHO in a `CONSUMER:` line. Nothing asserted those lines survive an
+# edit -- so a tidy-up that generalised "a blackbox probe matching the body of
+# /healthz" into "monitoring" would pass every test here while destroying the
+# only thing that makes a failure actionable. A red contract test tells you a
+# behaviour changed; the CONSUMER line tells you who to warn.
+#
+# The fleet's private records assert this by grepping for literal agent names,
+# because there identity IS the name. THIS REPO IS PUBLIC and consumers are deliberately named by
+# ROLE -- so the portable version is: the slot must be filled, and two consumers
+# must not collapse into the same description. A check that merely requires SOME
+# attribution passes on a file that has quietly stopped distinguishing them.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+def _contract_docstrings() -> dict[str, str]:
+    """Every test in THIS file, with its docstring. Read from source rather than
+    from imported objects so a docstring stripped by an optimiser still fails."""
+    src = Path(__file__).read_text()
+    out = {}
+    for m in _re.finditer(r'^def (test_\w+)\([^)]*\):\n(\s*"""(.*?)""")?', src, _re.S | _re.M):
+        out[m.group(1)] = (m.group(3) or "")
+    return out
+
+
+def test_every_contract_names_its_consumer():
+    """The slot must be filled. A contract with no consumer is a behaviour
+    nobody has claimed, which is a test looking for a reason to exist."""
+    missing = []
+    for name, doc in _contract_docstrings().items():
+        if name.startswith("test_every_contract") or name.startswith("test_consumers_"):
+            continue  # these police the file; they pin nothing external
+        if "NOT A CONTRACT" in doc:
+            continue  # explicitly exempt, and the exemption is in the text
+        if "CONSUMER:" not in doc:
+            missing.append(name)
+    assert not missing, (
+        "contract tests with no CONSUMER line, so a failure names no one to "
+        f"warn: {sorted(missing)}"
+    )
+
+
+def test_consumers_are_distinct_and_not_generic():
+    """Two contracts must not collapse into the same description.
+
+    This is the public-repo form of 'assert the name'. Names cannot appear here,
+    so the property that stands in for identity is DISTINCTNESS: if a tidy-up
+    generalises two different consumers into one phrase, the file has stopped
+    telling you they are different parties even though every test still passes.
+    """
+    firsts = {}
+    for name, doc in _contract_docstrings().items():
+        m = _re.search(r"CONSUMER:\s*(.+)", doc)
+        if not m:
+            continue
+        # First clause only -- the identifying phrase, not the explanation.
+        phrase = _re.split(r"[.,]", m.group(1).strip())[0].strip().lower()
+        assert len(phrase) > 12, f"{name}: CONSUMER phrase too vague to act on: {phrase!r}"
+        assert phrase not in {"monitoring", "a consumer", "a peer", "another team"}, (
+            f"{name}: CONSUMER generalised to a placeholder: {phrase!r}"
+        )
+        firsts.setdefault(phrase, []).append(name)
+    collapsed = {p: n for p, n in firsts.items() if len(n) > 1}
+    assert not collapsed, (
+        "two contracts now claim the same consumer, so the file no longer "
+        f"distinguishes them: {collapsed}"
+    )
