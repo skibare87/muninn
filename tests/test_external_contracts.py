@@ -25,6 +25,17 @@ case here with a comment naming who depends on it and why.
 These tests are not about whether the behaviour is GOOD. They are about it not
 changing silently. If one fails, the fix may well be to update the contract --
 after telling the consumer named in the comment.
+
+AND THE SAME OBLIGATION RUNS WHEN THIS FILE CHANGES, WHICH IS THE HALF THAT IS
+EASY TO MISS. Telling a consumer "your behaviour is pinned" is a verdict frozen
+at the moment it was sent. REMOVING a case, or narrowing what one asserts, makes
+that verdict stale -- and the consumer has no way to know, because they were
+handed a result by the party who owns the check. They will not re-derive it.
+
+So: adding a case means naming the consumer. CHANGING OR REMOVING ONE MEANS
+TELLING THEM, before the change is relied on elsewhere. A pin quietly withdrawn
+is worse than one that was never made, because the consumer stopped watching for
+that behaviour on the strength of it.
 """
 
 from __future__ import annotations
