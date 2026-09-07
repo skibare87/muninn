@@ -310,6 +310,12 @@ Two limits, stated here rather than left to be discovered:
   What is *not* known is whether `hf_xet` independently detects a corrupt chunk
   during reconstruction. That is defence in depth, not coverage: a corrupt
   reconstruction fails the post-ingest hash either way.
+- **Snapshot ingest is verified too**, over the landed tree rather than per file,
+  because `snapshot_download` offers no per-file hook. Blobs are deduplicated by
+  inode, so content shared between files is hashed once, and blobs that were
+  *not* fetched on this run are skipped — a repeat prewarm does not re-hash the
+  half it already had. That makes it a check on ingest and not a scrub: on-disk
+  rot in a blob nobody re-fetched is a different problem and is not covered.
 
 Why the default is on: sha256 runs about **8.8× faster than bytes arrive** from
 upstream on the host this was measured on, so hashing is not the bottleneck.

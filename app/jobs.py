@@ -296,6 +296,22 @@ class JobManager:
                     fetched = _tree_bytes(Path(path), since=job.started_at or 0)
                     job.final_bytes = fetched
                     metrics.record_ingested(fetched)
+                    if settings.hf_verify_ingest:
+                        # A snapshot is many files and snapshot_download offers no
+                        # per-file hook, so this runs once the tree has landed.
+                        # Bad blobs are already deleted by then; failing the job
+                        # is what stops the rest being treated as a good prewarm.
+                        ok, unver, bad = await asyncio.to_thread(
+                            verify_tree, Path(path), job.started_at or 0
+                        )
+                        log.info(
+                            "snapshot verify %s: %d verified, %d unverifiable, %d mismatched",
+                            job.id, ok, unver, len(bad),
+                        )
+                        if bad:
+                            raise IngestDigestMismatch(
+                                f"{len(bad)} file(s) failed verification: " + "; ".join(bad[:5])
+                            )
                 log.info("ingest done %s in %.1fs", job.id, time.time() - (job.started_at or 0))
         except asyncio.CancelledError:
             job.state = "error"
@@ -366,6 +382,51 @@ class JobManager:
                 max_workers=8,
             )
         )
+
+
+def verify_tree(root: Path, since: float = 0.0) -> tuple[int, int, list[str]]:
+    """Verify every file freshly written under a snapshot root.
+
+    Returns (verified, unverifiable, mismatches). Mismatched blobs are deleted
+    by verify_ingested before this returns, so the caller decides what to do
+    about a failed ingest with the bad bytes already gone.
+
+    THE mtime FILTER IS THE SAME ONE _tree_bytes USES, and for the same reason:
+    a snapshot that was already half-cached must not re-hash the half it did not
+    fetch. That keeps a repeat prewarm cheap. It also means this is a check on
+    INGEST and not a scrub -- on-disk rot in a blob nobody re-fetched is a
+    different job, and calling this one a scrub would be the adjacent-measure
+    mistake.
+
+    Deduplicated by inode, because the HF layout points many snapshot entries at
+    one blob and hashing it once per reference would be the same work repeated.
+    """
+    verified = unverifiable = 0
+    mismatches: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    if not root.exists():
+        return 0, 0, []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            path = Path(dirpath) / fn
+            try:
+                st = os.stat(path)  # follows symlinks
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            if st.st_mtime < since - 1:
+                continue
+            try:
+                if verify_ingested(path) == "VERIFIED":
+                    verified += 1
+                else:
+                    unverifiable += 1
+            except IngestDigestMismatch as exc:
+                mismatches.append(f"{path.name}: {exc}")
+    return verified, unverifiable, mismatches
 
 
 def _tree_bytes(root: Path, since: float = 0.0) -> int:

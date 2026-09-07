@@ -348,3 +348,75 @@ def test_the_knob_is_what_makes_the_difference(ingest):
 
     assert path.resolve().name == LYING_ETAG
     assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 0
+
+
+# --------------------------------------------------------------------------
+# Snapshot ingest. A prewarm pulls many files and snapshot_download offers no
+# per-file hook, so verification runs over the landed tree.
+# --------------------------------------------------------------------------
+
+
+def _plant(root, name, content, etag):
+    """Build the HF on-disk shape: snapshots/<commit>/<name> -> blobs/<etag>."""
+    repo = root / f"models--{REPO.replace('/', '--')}"
+    blobs = repo / "blobs"
+    snap = repo / "snapshots" / COMMIT
+    blobs.mkdir(parents=True, exist_ok=True)
+    snap.mkdir(parents=True, exist_ok=True)
+    blob = blobs / etag
+    blob.write_bytes(content)
+    link = snap / name
+    link.symlink_to(blob)
+    return snap, link, blob
+
+
+def test_verify_tree_hashes_each_blob_once_and_reports_all_three_outcomes(tmp_path):
+    """One honest file, one unverifiable, one corrupt, plus a second reference
+    to the honest blob to prove inode dedup.
+
+    Hashing a blob once per snapshot ENTRY rather than once per blob would be
+    the same work repeated on a repo whose files share content -- and the HF
+    layout makes that the normal case, not an edge one.
+    """
+    from app import jobs, metrics
+
+    root = tmp_path
+    snap, _, _ = _plant(root, "good.bin", TRUE_BYTES, HONEST_ETAG)
+    _plant(root, "gitfile.txt", b"small config", "b" * 40)  # git oid: unverifiable
+    _plant(root, "bad.bin", b"x" * len(TRUE_BYTES), LYING_ETAG)  # wrong content
+    (snap / "alias.bin").symlink_to(snap / "good.bin")  # second ref, same inode
+
+    metrics.reset()
+    verified, unverifiable, mismatches = jobs.verify_tree(snap, since=0)
+
+    assert verified == 1, "the duplicate reference must not be hashed twice"
+    assert unverifiable == 1
+    assert len(mismatches) == 1
+    assert "bad" in mismatches[0] or LYING_ETAG in mismatches[0]
+    snapshot = metrics.snapshot()["ingest_verify"]
+    assert snapshot["VERIFIED"] == 1
+    assert snapshot["UNVERIFIABLE"] == 1
+    assert snapshot["MISMATCH"] == 1
+
+
+def test_verify_tree_skips_blobs_that_were_not_fetched_this_run(tmp_path):
+    """A repeat prewarm must not re-hash the half it already had.
+
+    This is what keeps the check an INGEST check rather than a scrub. Losing it
+    would make every prewarm pay for the whole repo, which is the cost objection
+    that was wrongly assumed about the single-file path.
+    """
+    import os
+    import time
+
+    from app import jobs, metrics
+
+    snap, link, blob = _plant(tmp_path, "old.bin", TRUE_BYTES, HONEST_ETAG)
+    old = time.time() - 3600
+    os.utime(blob, (old, old))
+
+    metrics.reset()
+    verified, unverifiable, mismatches = jobs.verify_tree(snap, since=time.time() - 60)
+
+    assert (verified, unverifiable, mismatches) == (0, 0, [])
+    assert metrics.snapshot()["ingest_verify"]["VERIFIED"] == 0
