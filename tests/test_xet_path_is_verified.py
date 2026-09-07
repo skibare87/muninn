@@ -70,8 +70,8 @@ def test_the_xet_transport_is_taken_and_the_result_is_verified(monkeypatch):
 
     from app import jobs, metrics
 
-    monkeypatch.setenv("HF_XET_CACHE", tempfile.mkdtemp(prefix="xetcache-"))
-
+    # HF_XET_CACHE is set in conftest, before huggingface_hub is imported --
+    # setting it here would be inert, because constants reads it once at import.
     took = {"xet": 0, "http": 0}
     real_xet, real_http = file_download.xet_get, file_download.http_get
 
@@ -90,9 +90,21 @@ def test_the_xet_transport_is_taken_and_the_result_is_verified(monkeypatch):
     path = Path(hf_hub_download(repo_id=REPO, filename=FILENAME, cache_dir=cache))
 
     if took["xet"] == 0:
+        # DISTINGUISH THE TWO CAUSES. An earlier version reported this as "the
+        # Hub did not serve Xet", which blamed a third party for what was
+        # actually another test module disabling xet process-wide. A skip
+        # message naming the wrong cause is worse than no message: it sends the
+        # next reader to the vendor.
+        from huggingface_hub import constants
+
+        assert not constants.HF_HUB_DISABLE_XET, (
+            "xet is disabled IN THIS PROCESS, so this test cannot run -- that is a "
+            "test-environment fault, not a Hub behaviour. HF_HUB_DISABLE_XET is read "
+            "once at import, so whatever set it did so before huggingface_hub loaded."
+        )
         pytest.skip(
-            "the Hub did not serve this file over Xet on this run; the claim under "
-            "test is about the Xet path and cannot be checked from a plain download"
+            "xet is available in-process but the Hub served this file over plain "
+            "HTTP on this run; the claim under test is about the Xet path"
         )
     assert took["http"] == 0, "mixed transports would make the result ambiguous"
 
@@ -117,7 +129,7 @@ def test_a_corrupted_xet_result_is_refused(monkeypatch):
 
     from app import jobs, metrics
 
-    monkeypatch.setenv("HF_XET_CACHE", tempfile.mkdtemp(prefix="xetcache-"))
+    # See conftest: the xet chunk cache is isolated there, not here.
     cache = tempfile.mkdtemp(prefix="hfcache-")
     path = Path(hf_hub_download(repo_id=REPO, filename=FILENAME, cache_dir=cache))
 

@@ -122,10 +122,25 @@ def _download(endpoint: str, cache_dir: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _no_xet(monkeypatch):
-    # The fake endpoint speaks plain HTTP resolve, not xet. Muninn sets this on
-    # edge nodes only; here it keeps the test on the path being measured.
-    monkeypatch.setenv("HF_HUB_DISABLE_XET", "1")
+def _quiet(monkeypatch):
+    """NOTE: this deliberately does NOT set HF_HUB_DISABLE_XET.
+
+    It used to. That was wrong in a way worth recording, because it looked
+    correct and worked for the wrong reason. `constants.HF_HUB_DISABLE_XET` is
+    read ONCE at import; setting the variable afterwards is inert. It appeared
+    to work here only because huggingface_hub happened to be imported lazily,
+    inside a test, after the fixture had run -- so the constant captured True
+    and stayed True FOR THE WHOLE PROCESS.
+
+    That leaked into tests/test_xet_path_is_verified.py, whose entire subject is
+    the xet transport: it silently took the plain path and skipped, reporting
+    "the Hub did not serve this file over Xet" -- blaming a third party for
+    contamination from this file.
+
+    It is also unnecessary. The fake endpoint returns no xet metadata, so these
+    tests take the plain path for the right reason rather than by being forced
+    onto it.
+    """
     monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
 
 
