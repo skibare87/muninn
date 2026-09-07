@@ -315,6 +315,43 @@ def _contract_docstrings() -> dict[str, str]:
     return out
 
 
+def test_ingest_verify_series_are_seeded_and_keep_three_distinct_results(client):
+    """CONSUMER: the fleet monitoring team's alerting, told on 2026-09-06 to
+    page on muninn_ingest_verify_total{result="MISMATCH"} and explicitly NOT to
+    alarm on UNVERIFIABLE.
+
+    I created this contract by asking them to watch it, which is why it is
+    pinned the same day rather than after something breaks.
+
+    TWO PROPERTIES, AND BOTH ARE LOAD-BEARING FOR THEIR ALERT:
+
+    Seeded at zero. An absent series and a zero series mean different things --
+    "nothing has been ingested" versus "the process is down" -- and an alert on
+    a missing metric fires differently from one on a zero. Unseeding these turns
+    a live zero into a gap.
+
+    THREE results, never a boolean. UNVERIFIABLE exists precisely so that "could
+    not check" can never render as "checked". Collapsing it into VERIFIED would
+    leave their dashboard green while nothing was being verified, which is the
+    fail-open this project keeps recording -- and it would do it silently,
+    because the count would still be moving.
+    """
+    from app import metrics
+
+    body = client.get("/metrics").text
+    assert "muninn_ingest_verify_total" in body
+
+    for result in ("VERIFIED", "UNVERIFIABLE", "MISMATCH"):
+        assert result in metrics._INGEST_VERIFY_SERIES, (
+            f"{result} is a distinct outcome the monitoring consumer "
+            f"distinguishes; removing it changes what their alert means"
+        )
+        assert f'muninn_ingest_verify_total{{result="{result}"}}' in body, (
+            f"{result} must be present at zero rather than absent -- a gap and a "
+            f"zero are different facts to their alerting"
+        )
+
+
 def test_every_contract_names_its_consumer():
     """The slot must be filled. A contract with no consumer is a behaviour
     nobody has claimed, which is a test looking for a reason to exist."""
