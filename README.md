@@ -301,10 +301,15 @@ Two limits, stated here rather than left to be discovered:
   served as they arrive, so verification can stop a bad blob being *kept* but
   cannot retract what was already sent. Use `wait` if that matters more than
   first-byte latency.
-- **The Xet download path is not covered by this check and has not been
-  measured here.** It reconstructs files from content-addressed chunks, so it
-  is likely sound by construction — but "likely sound by construction" is a
-  reading of someone else's code, not a measurement, and it is marked as such.
+- **The Xet transport IS covered — an earlier version of this section said it
+  was not, and that was wrong.** The check runs on the file after the download
+  returns, so it hashes whatever landed regardless of how it arrived. Measured
+  against the real Hub: the download takes the Xet path, the blob's filename is
+  the sha256 of its bytes, and verification passes. `tests/test_xet_path_is_verified.py`
+  pins it, with a bit-flip case as the negative control.
+  What is *not* known is whether `hf_xet` independently detects a corrupt chunk
+  during reconstruction. That is defence in depth, not coverage: a corrupt
+  reconstruction fails the post-ingest hash either way.
 
 Why the default is on: sha256 runs about **8.8× faster than bytes arrive** from
 upstream on the host this was measured on, so hashing is not the bottleneck.
