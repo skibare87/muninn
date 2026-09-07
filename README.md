@@ -310,6 +310,13 @@ Two limits, stated here rather than left to be discovered:
   What is *not* known is whether `hf_xet` independently detects a corrupt chunk
   during reconstruction. That is defence in depth, not coverage: a corrupt
   reconstruction fails the post-ingest hash either way.
+- **Verification covers INGEST, never the existing cache.** It runs only on bytes
+  fetched on that run — a cache hit resolves locally and never reaches the ingest
+  path, and the snapshot check skips any blob not written that run. So a flat
+  `MISMATCH` counter says new ingests are healthy and says **nothing** about
+  blobs already on disk, including every blob ingested before this feature
+  existed. Answering that would need a full re-read of the cache, which this does
+  not do.
 - **Snapshot ingest is verified too**, over the landed tree rather than per file,
   because `snapshot_download` offers no per-file hook. Blobs are deduplicated by
   inode, so content shared between files is hashed once, and blobs that were
