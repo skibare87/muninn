@@ -9,6 +9,54 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.4 — 2026-09-06
+
+A CORRECTION TO WHAT v0.9.3 CLAIMED ABOUT ITSELF. No behaviour change.
+
+v0.9.3 shipped byte verification for HF ingest and said, in the README, in its
+own tag message and in the decision record, that "the Xet download path is not
+covered by this check and has not been measured here."
+
+The second half was true. THE FIRST HALF WAS WRONG.
+
+Verification runs on the file after the download returns, so it hashes whatever
+landed regardless of which transport delivered it. Measured against the real
+Hub: the download takes the Xet path -- xet_get called, http_get not -- the
+blob's filename is the sha256 of the bytes, and verification returns VERIFIED.
+
+So the guarantee is BROADER than v0.9.3 claimed. Both transports are covered.
+
+HOW THE WRONG SENTENCE HAPPENED, because it is the more useful half.
+
+I asserted a limitation of my own code without running it. A limitation is a
+negative claim, and negative claims get accepted without evidence -- so a
+one-command check went unrun and the sentence propagated to three documents in
+the session where the same rule was being written down for something else.
+
+It understated the guarantee. That is the direction that gets least scrutiny:
+nobody audits a claim whose author is being modest, and an overstated limitation
+reads as diligence. It is the mirror of severity inflation in a confession.
+
+Note also that the first probe pointed the wrong way. A manual HEAD against the
+resolve URL showed no Xet headers on any candidate file, which looked like
+evidence the path was not used. The library's own request differs from a
+hand-rolled one, so the probe answered a question about my probe. Observing
+which branch the REAL client took settled it -- the same lesson as reading a
+repeated header with a client that only sends one.
+
+WHAT REMAINS UNMEASURED, stated precisely so it is not overstated again: whether
+hf_xet independently detects a corrupt chunk during reconstruction. That is
+defence in depth, not coverage. A corrupt reconstruction fails the post-ingest
+hash whatever hf_xet did or did not notice.
+
+tests/test_xet_path_is_verified.py asserts both halves together -- the transport
+taken AND the verification result -- because asserting only the second would
+pass identically on the plain HTTP path and prove nothing about Xet. It skips
+rather than passes when the Hub is unreachable, because a test that quietly
+passes offline restores the unverified claim it exists to prevent. The negative
+control is a single bit-flip: same length, so no length check could see it.
+
+
 ## v0.9.3 — 2026-09-06
 
 Both protocols are content-addressed. Only one of them checked.
