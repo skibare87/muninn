@@ -9,6 +9,38 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.5 — 2026-09-06
+
+SNAPSHOT INGEST IS VERIFIED TOO.
+
+v0.9.3 verified the single-file ingest path and left the snapshot path trusting
+whatever landed -- so everything a prewarm brought in was in exactly the state
+every HF file used to be in. A prewarm is the primary path into this cache, so
+that was the larger exposure of the two, not the smaller one.
+
+snapshot_download offers no per-file hook, so verification runs once the tree
+has landed. Mismatched blobs are already deleted by then; failing the job is
+what stops the rest being treated as a good prewarm.
+
+TWO PROPERTIES THAT KEEP IT FROM BECOMING THE WRONG CHECK
+
+Deduplicated by inode. The Hugging Face layout points many snapshot entries at
+one blob, so hashing per ENTRY would repeat the same work precisely on the
+repos where content is shared -- the normal case, not an edge one.
+
+Skips blobs that were not written on this run, using the same mtime filter the
+byte accounting already uses and for the same reason: a repeat prewarm must not
+re-hash the half it already had.
+
+That second property also fixes what this check IS. It is an INGEST check, not
+a scrub. On-disk rot in a blob nobody re-fetched is a different problem and is
+not covered, and calling this a scrub would be the adjacent-measure mistake --
+a check that is true, green, and not a test of the thing its name implies.
+
+Costs about 0.6s per GB actually fetched, on the same measurement that put
+sha256 at roughly 8.8x the rate bytes arrive.
+
+
 ## v0.9.4 — 2026-09-06
 
 A CORRECTION TO WHAT v0.9.3 CLAIMED ABOUT ITSELF. No behaviour change.
