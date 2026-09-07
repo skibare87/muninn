@@ -120,6 +120,18 @@ class Settings:
     # casUrl and pull bytes straight from HF, bypassing this cache.
     block_client_xet: bool = True
     ingest_concurrency: int = 4
+    # Hash an ingested HF file against its upstream ETag and REFUSE to keep it
+    # on a mismatch, matching what the OCI path already does for blobs.
+    #
+    # Only possible when the ETag is a sha256, which the Hub returns for LFS
+    # files -- i.e. every weight file that matters. For anything else the file
+    # is recorded as UNVERIFIABLE rather than passed off as checked: an
+    # unverifiable file and a verified one must never render the same.
+    #
+    # MEASURED before defaulting this on: sha256 runs ~8.8x faster than bytes
+    # arrive from upstream on this host, so the check is not the bottleneck the
+    # ticket assumed it would be.
+    hf_verify_ingest: bool = True
     # Seconds to remember that a file 404s upstream. 0 disables. Short by
     # design -- see the negative cache note in hfcompat.
     negative_ttl_s: float = 60.0
@@ -289,6 +301,7 @@ class Settings:
             evict_interval_s=_env_int("XHC_EVICT_INTERVAL", 900),
             miss_policy=miss_policy,
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
+            hf_verify_ingest=_env_bool("XHC_HF_VERIFY", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
             orphan_policy=orphan_policy,

@@ -33,6 +33,7 @@ _lock = threading.Lock()
 # Labelled counters, kept as flat dicts so the exposition loop stays trivial.
 _requests: Counter[str] = Counter()  # by result: HIT, MISS-STREAM, SYNTHESIZED, ...
 _upstream: Counter[str] = Counter()  # by status class: 2xx, 4xx, 404, 5xx, error
+_ingest_verify: Counter[str] = Counter()  # VERIFIED | UNVERIFIABLE | MISMATCH
 _clients: Counter[str] = Counter()  # by X-Muninn-Client, when sent
 _bytes_served = 0
 _bytes_ingested = 0
@@ -65,6 +66,12 @@ _DOCKER_SERIES: tuple[tuple[str, str], ...] = (
     ("BYPASS", "blob"),
 )
 
+# Ingest verification outcomes. VERIFIED and UNVERIFIABLE are both normal; the
+# distinction is the entire point, because an unverifiable file must never be
+# indistinguishable from a checked one. MISMATCH is the one that should be zero,
+# and it is seeded so that a zero means zero rather than "nothing reported yet".
+_INGEST_VERIFY_SERIES: tuple[str, ...] = ("VERIFIED", "UNVERIFIABLE", "MISMATCH")
+
 # Results carrying no kind dimension are seeded the same way.
 _REQUEST_SERIES: tuple[str, ...] = (
     "DSSERVER-HIT", "DSSERVER-MISS", "DSSERVER-SYNTHESIZED",
@@ -79,6 +86,8 @@ def _seed() -> None:
         _docker.setdefault(f"{result}|{kind}", 0)
     for result in _REQUEST_SERIES:
         _requests.setdefault(result, 0)
+    for result in _INGEST_VERIFY_SERIES:
+        _ingest_verify.setdefault(result, 0)
 
 
 _seed()
@@ -102,6 +111,12 @@ def record_upstream(status: int | None) -> None:
             _upstream["404"] += 1
         else:
             _upstream[f"{status // 100}xx"] += 1
+
+
+def record_ingest_verify(result: str) -> None:
+    """One of VERIFIED / UNVERIFIABLE / MISMATCH, per file ingested."""
+    with _lock:
+        _ingest_verify[result] += 1
 
 
 def record_docker(result: str, kind: str) -> None:
@@ -143,6 +158,7 @@ def snapshot() -> dict:
     with _lock:
         return {
             "requests": dict(_requests),
+            "ingest_verify": dict(_ingest_verify),
             "upstream": dict(_upstream),
             "clients": dict(_clients),
             "bytes_served": _bytes_served,
@@ -159,6 +175,7 @@ def reset() -> None:
     global _docker_bytes_served, _docker_bytes_ingested  # noqa: PLW0603 - test helper
     with _lock:
         _requests.clear()
+        _ingest_verify.clear()
         _upstream.clear()
         _clients.clear()
         _docker.clear()
@@ -167,6 +184,14 @@ def reset() -> None:
         _bytes_ingested = 0
         _docker_bytes_served = 0
         _docker_bytes_ingested = 0
+        # Re-seed INSIDE the lock. _seed() does not take it, and a reader
+        # between the clear and the seed would see every series missing.
+        #
+        # Without this a reset leaves each series ABSENT rather than zero,
+        # which destroys the distinction _seed exists to preserve: a zero means
+        # zero, a missing series means the process was down. Found by a test
+        # asserting a MISMATCH count of 0 after a reset and getting KeyError.
+        _seed()
 
 
 def _escape(v: str) -> str:
@@ -189,6 +214,11 @@ def render(gauges: dict[str, float], help_text: dict[str, str] | None = None) ->
         "muninn_requests_total",
         "counter",
         [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap["requests"].items())],
+    )
+    emit(
+        "muninn_ingest_verify_total",
+        "counter",
+        [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap["ingest_verify"].items())],
     )
     emit(
         "muninn_upstream_requests_total",

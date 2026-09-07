@@ -14,8 +14,10 @@ upstream fetch happens.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +30,80 @@ from . import cachefs, metrics
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
+
+# The Hub returns a sha256 as the ETag for LFS files and a git object id for
+# everything else. huggingface_hub uses exactly this test to decide whether an
+# ETag is a content hash (file_download.REGEX_SHA256) and does the same
+# comparison itself -- but only in local_dir mode, which this cache does not
+# use. So this is not a guarantee invented here; it is one the library already
+# implements on a path we do not take.
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class IngestDigestMismatch(Exception):
+    """Ingested bytes do not hash to the ETag they were stored under.
+
+    Named to sit beside ocistore.DigestMismatch: the two protocols now refuse
+    the same way, which was the asymmetry this closes.
+    """
+
+
+def verify_ingested(path: Path) -> str:
+    """Hash a just-ingested file against the ETag it was stored under.
+
+    Returns VERIFIED, UNVERIFIABLE or raises IngestDigestMismatch.
+
+    The blob's FILENAME is the upstream ETag -- that is huggingface_hub's
+    on-disk layout, and it is why nothing here recomputed anything before. The
+    snapshot entry is a symlink into blobs/<etag>, so resolving gives both the
+    bytes and the claimed digest from one path.
+
+    WHY A MISMATCH DELETES THE BLOB RATHER THAN JUST REPORTING IT. Leaving it on
+    disk leaves a file whose NAME asserts a digest its bytes do not have, and
+    every later check in this service keys on that name -- the cache would be
+    self-consistently wrong and would serve those bytes forever. That is the
+    failure the OCI path already refuses.
+
+    WHAT THIS CANNOT DO, stated here because the guarantee gets read off this
+    docstring: under the `stream` miss policy the bytes are served to the first
+    caller AS THEY ARRIVE, so this can stop a bad blob being KEPT but cannot
+    retract what was already sent. It also does not cover the xet download path,
+    which reconstructs from content-addressed chunks and has NOT been measured
+    from here.
+    """
+    blob = path.resolve()
+    etag = blob.name
+    if not _SHA256_RE.match(etag):
+        # A git object id, or a copy-mode cache with no symlink to read. Not a
+        # failure -- but it must not be counted as a pass either.
+        metrics.record_ingest_verify("UNVERIFIABLE")
+        log.debug("ingest unverifiable (etag is not a sha256): %s", blob)
+        return "UNVERIFIABLE"
+
+    h = hashlib.sha256()
+    try:
+        with blob.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(4 << 20), b""):
+                h.update(chunk)
+    except OSError as exc:
+        # UNREADABLE IS NOT VERIFIED. Collapsing those two is the fail-open this
+        # project keeps confessing, so this refuses rather than passing.
+        metrics.record_ingest_verify("MISMATCH")
+        raise IngestDigestMismatch(f"could not read {blob} to verify: {exc}") from exc
+
+    got = h.hexdigest()
+    if got != etag:
+        metrics.record_ingest_verify("MISMATCH")
+        try:
+            path.unlink(missing_ok=True)  # the snapshot symlink
+            blob.unlink(missing_ok=True)  # the bytes themselves
+        except OSError as exc:
+            log.warning("could not remove mismatched blob %s: %s", blob, exc)
+        raise IngestDigestMismatch(f"expected {etag}, computed {got}")
+
+    metrics.record_ingest_verify("VERIFIED")
+    return "VERIFIED"
+
 
 JobState = Literal["pending", "running", "done", "error"]
 _HISTORY_LIMIT = 200
@@ -242,7 +318,7 @@ class JobManager:
                 self._by_id.pop(dropped.id, None)
 
     def _download_file(self, job: Job) -> Path:
-        return Path(
+        path = Path(
             hf_hub_download(
                 repo_id=job.repo_id,
                 filename=job.filename,
@@ -253,6 +329,9 @@ class JobManager:
                 endpoint=settings.upstream,
             )
         )
+        if settings.hf_verify_ingest:
+            verify_ingested(path)
+        return path
 
     async def _watch_snapshot(self, job: Job) -> None:
         """Keep job.final_bytes roughly current while a snapshot runs.

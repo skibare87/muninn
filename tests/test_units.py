@@ -608,6 +608,7 @@ ENV_TO_SETTING = [
     ("XHC_LOW_WATER", "0.6", "low_water", 0.6),
     ("XHC_EVICT_INTERVAL", "123", "evict_interval_s", 123),
     ("XHC_BLOCK_CLIENT_XET", "0", "block_client_xet", False),
+    ("XHC_HF_VERIFY", "0", "hf_verify_ingest", False),
     ("XHC_INGEST_CONCURRENCY", "9", "ingest_concurrency", 9),
     ("XHC_NEGATIVE_TTL", "11", "negative_ttl_s", 11.0),
     ("XHC_ORPHAN_POLICY", "evict", "orphan_policy", "evict"),

@@ -275,6 +275,41 @@ which is the exact traffic multiplication the cache exists to prevent.
 
 If you prewarm properly, misses are rare and this choice barely matters.
 
+### What is verified on ingest, and what is not
+
+Both protocols are content-addressed. Until 0.9.3 only one of them **checked**.
+
+An OCI blob is hashed as it is ingested and refused if it does not match its
+digest. A Hugging Face file was written under whatever ETag the Hub declared,
+and nothing recomputed it — the blob's filename *is* the upstream ETag. Two
+protocols, two different guarantees, and nothing said so.
+
+They now refuse the same way. Each ingested HF file is hashed and compared
+against its ETag; a mismatch deletes the blob and fails the ingest rather than
+caching it. Set `XHC_HF_VERIFY=0` to turn this off.
+
+**A file whose ETag is not a content hash is reported as `UNVERIFIABLE`, never
+as verified.** The Hub returns a sha256 for LFS files — every weight file — and
+a git object id for the rest, which says nothing about the bytes on disk.
+`muninn_ingest_verify_total{result="..."}` carries all three outcomes and each
+is seeded at zero, so a zero means zero and a missing series means the process
+was down.
+
+Two limits, stated here rather than left to be discovered:
+
+- **Under `stream`, the first caller may already have the bad bytes.** They are
+  served as they arrive, so verification can stop a bad blob being *kept* but
+  cannot retract what was already sent. Use `wait` if that matters more than
+  first-byte latency.
+- **The Xet download path is not covered by this check and has not been
+  measured here.** It reconstructs files from content-addressed chunks, so it
+  is likely sound by construction — but "likely sound by construction" is a
+  reading of someone else's code, not a measurement, and it is marked as such.
+
+Why the default is on: sha256 runs about **8.8× faster than bytes arrive** from
+upstream on the host this was measured on, so hashing is not the bottleneck.
+Verify it on your own hardware before assuming it holds on yours.
+
 ## Two request headers: prewarm, and local-only
 
 Both are opt-in headers on the ordinary resolve path. **No management token, no
@@ -1111,6 +1146,7 @@ experiments age out.
 | `XHC_EVICT_INTERVAL` | `900` | background sweep, seconds |
 | `XHC_MISS_POLICY` | `stream` | `stream` \| `redirect` \| `wait` |
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
+| `XHC_HF_VERIFY` | `1` | hash each ingested HF file against its ETag and refuse a mismatch |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |

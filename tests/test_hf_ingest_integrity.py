@@ -224,3 +224,127 @@ def test_the_asymmetry_with_oci_is_real_and_not_recalled(tmp_path):
     src = inspect.getsource(ocistore)
     assert "DigestMismatch" in src
     assert "hashlib" in src, "OCI ingest is expected to hash what it stores"
+
+
+# --------------------------------------------------------------------------
+# What MUNINN does, now that the library's behaviour above is known.
+#
+# The cases above characterise huggingface_hub and stay true whatever this
+# service does. These drive the real ingest entry point instead, so they fail
+# if the verification is removed, disabled by accident, or moved somewhere it
+# no longer runs.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ingest(hub, tmp_path, monkeypatch):
+    """The real _download_file, pointed at the fake Hub."""
+    from app import jobs, metrics
+    from app.config import settings
+
+    endpoint, handler = hub
+    monkeypatch.setattr(settings, "upstream", endpoint)
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "hf_token", None)
+    monkeypatch.setattr(settings, "hf_verify_ingest", True)
+    metrics.reset()
+
+    mgr = jobs.JobManager()
+    job = jobs.Job(
+        id="test",
+        kind="file",
+        repo_type="model",
+        repo_id=REPO,
+        revision=REVISION,
+        filename=FILENAME,
+    )
+    return mgr, job, handler, metrics
+
+
+def test_muninn_refuses_bytes_that_contradict_the_etag(ingest, tmp_path):
+    """The fix. A mismatch is refused and the bytes do not survive on disk.
+
+    The OCI path has always done this (ocistore.DigestMismatch). This is the
+    same refusal on the other protocol, which is the asymmetry that was the
+    whole ticket.
+    """
+    from app import jobs
+
+    mgr, job, handler, metrics = ingest
+    handler.etag = LYING_ETAG
+
+    with pytest.raises(jobs.IngestDigestMismatch) as excinfo:
+        mgr._download_file(job)
+
+    assert LYING_ETAG in str(excinfo.value), "the refusal names the digest it expected"
+    blob = tmp_path / f"models--{REPO.replace('/', '--')}" / "blobs" / LYING_ETAG
+    assert not blob.exists(), (
+        "a blob whose NAME asserts a digest its bytes do not have must not survive: "
+        "every later check in this service keys on that name"
+    )
+    assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 1
+
+
+def test_muninn_accepts_an_honest_file_and_records_it_verified(ingest):
+    """NEGATIVE CONTROL for the refusal. Without this, a check that refuses
+    everything would look identical to a correct one."""
+    mgr, job, handler, metrics = ingest
+    path = mgr._download_file(job)
+    assert path.read_bytes() == TRUE_BYTES
+    snap = metrics.snapshot()["ingest_verify"]
+    assert snap["VERIFIED"] == 1
+    assert snap["MISMATCH"] == 0
+
+
+def test_a_non_sha256_etag_is_UNVERIFIABLE_and_not_counted_as_verified(ingest):
+    """An ETag that is a git object id rather than a content hash cannot be
+    checked. That is normal and it must not render the same as a pass -- an
+    unverifiable file passed off as verified is the fail-open this project
+    keeps confessing.
+    """
+    mgr, job, handler, metrics = ingest
+    handler.etag = "a" * 40  # a git object id, not a sha256
+    handler.body = TRUE_BYTES
+
+    path = mgr._download_file(job)  # accepted: nothing to check against
+
+    assert path.read_bytes() == TRUE_BYTES
+    snap = metrics.snapshot()["ingest_verify"]
+    assert snap["UNVERIFIABLE"] == 1
+    assert snap["VERIFIED"] == 0, "unverifiable must never be counted as verified"
+
+
+def test_truncation_by_under_declared_length_is_now_caught_too(ingest, tmp_path):
+    """Finding 2 from the measurement above, closed by the same mechanism.
+
+    An under-declared Content-Length silently truncates the file. Length checks
+    cannot see it, because the client compares the declared count against
+    itself. The hash can, because truncated bytes do not hash to the ETag.
+    """
+    from app import jobs
+
+    mgr, job, handler, metrics = ingest
+    handler.etag = HONEST_ETAG  # honest about the hash
+    handler.declared_size = len(TRUE_BYTES) - 1  # lying about the length
+
+    with pytest.raises(jobs.IngestDigestMismatch):
+        mgr._download_file(job)
+    assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 1
+
+
+def test_the_knob_is_what_makes_the_difference(ingest):
+    """Turning verification off restores the old behaviour exactly.
+
+    This is what proves the refusal above comes from this check and not from
+    something incidental in the harness.
+    """
+    from app.config import settings
+
+    mgr, job, handler, metrics = ingest
+    handler.etag = LYING_ETAG
+    settings.hf_verify_ingest = False
+
+    path = mgr._download_file(job)  # no refusal
+
+    assert path.resolve().name == LYING_ETAG
+    assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 0
