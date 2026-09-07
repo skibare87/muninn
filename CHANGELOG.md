@@ -9,6 +9,77 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.3 — 2026-09-06
+
+Both protocols are content-addressed. Only one of them checked.
+
+THE HF PATH TRUSTED THE UPSTREAM ETAG AND NEVER VERIFIED BYTES
+
+An OCI blob is hashed as it is ingested and refused if it does not match its
+digest. A Hugging Face file was written under whatever ETag the Hub declared and
+nothing recomputed it -- the blob's filename IS that ETag, inherited from
+huggingface_hub's on-disk layout. So a corrupt upstream response was cached
+faithfully and re-served forever, and every check here stayed green, because
+they all key on the same ETag that was never independently checked.
+
+The integrity check and the corrupt source shared their only reference.
+
+MEASURED FIRST, AND IT WAS WORSE IN ONE DIRECTION THAN ASSUMED
+
+Driven end to end against a local stand-in for the Hub, because the whole
+download belongs to huggingface_hub rather than to code here and mocking its
+internals would have measured a model of the library instead of the library.
+
+  - bytes contradicting the ETag are cached silently when the length matches
+  - an UNDER-declared Content-Length truncates the file and is accepted, with no
+    error at all: the client reads exactly the declared count and discards the
+    remainder, so the consistency check compares that count against itself and
+    can never fire in this direction
+
+The refusal that did exist -- more bytes declared than sent -- comes from the
+HTTP transport as an IncompleteRead, one layer below huggingface_hub's own
+consistency check. That is a property of the connection and is not integrity
+checking. Length guards against a sender that DROPS, not against one that lies.
+
+BOTH ARE CLOSED BY ONE MECHANISM
+
+Each ingested HF file is hashed against its ETag and refused on a mismatch,
+which deletes the blob rather than leaving a file whose NAME asserts a digest
+its bytes do not have. Truncated bytes fail the hash too.
+
+UNVERIFIABLE IS NOT VERIFIED
+
+The Hub returns a sha256 for LFS files and a git object id for the rest. Only
+the former can be checked, and a file that cannot be checked is counted
+UNVERIFIABLE rather than passed off as verified. An unreadable blob refuses for
+the same reason. Collapsing "could not check" into "checked" is the same
+fail-open as an unreadable state file reading as an empty one.
+
+muninn_ingest_verify_total{result=VERIFIED|UNVERIFIABLE|MISMATCH}, all three
+seeded at zero so a zero means zero and a gap means the process was down.
+
+metrics.reset() now re-seeds inside the lock. It cleared without seeding, so a
+reset left every series absent rather than zero -- destroying the distinction
+the seeding exists to preserve. Found by a test, not by reading the code.
+
+DEFAULT ON, AND THE COST WAS MEASURED RATHER THAN ASSUMED
+
+sha256 runs about 8.8x faster than bytes arrive from upstream on the host this
+was measured on. XHC_HF_VERIFY=0 turns it off. Measure it on your own hardware
+before assuming the ratio holds there.
+
+TWO LIMITS, DOCUMENTED RATHER THAN LEFT TO BE DISCOVERED
+
+Under the stream miss policy the first caller may already have received the bad
+bytes; this stops a bad blob being KEPT and cannot retract what was sent. Use
+wait if that matters more than first-byte latency.
+
+The Xet download path is NOT covered by this check and has not been measured
+here. It reconstructs from content-addressed chunks and is likely sound by
+construction -- but that is a reading of someone else's code rather than a
+measurement, and it is marked as such wherever it appears.
+
+
 ## v0.9.2 — 2026-09-02
 
 A pull failed with 404 through the cache while working directly against the same
