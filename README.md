@@ -324,8 +324,11 @@ Two limits, stated here rather than left to be discovered:
   half it already had. That makes it a check on ingest and not a scrub: on-disk
   rot in a blob nobody re-fetched is a different problem and is not covered.
 
-Why the default is on: sha256 runs about **8.8× faster than bytes arrive** from
-upstream on the host this was measured on, so hashing is not the bottleneck.
+Why the default is on: sha256 measured at **1692 MiB/s** on this host against an
+observed ingest rate of **192 MB/s** — about **9.2× faster than bytes arrive**,
+so hashing is not the bottleneck. Both raw figures are given because the ratio
+is a derived number and inherits their units: an earlier version of this line
+said 8.8×, which divided MiB/s by MB/s.
 Verify it on your own hardware before assuming it holds on yours.
 
 ## Two request headers: prewarm, and local-only
