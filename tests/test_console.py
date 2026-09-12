@@ -343,3 +343,66 @@ def test_a_user_cannot_scope_another_users_key(console):
     r = as_user("sub-user").put(f"/_console/keys/{victim['key_id']}/scope",
                                 json={"rules": []})
     assert r.status_code == 404, "404 not 403: a 403 confirms the key id is real"
+
+
+def test_a_wildcard_scope_is_refused(console):
+    """A scope of "*" narrows to everything, which is no narrowing at all -- a
+    setting that reads as a restriction and is not.
+
+    It is the value a reader reaches for, because "*" IS the correct
+    unrestricted value in the ALLOWLIST. Two consumer keys were silently reset
+    to unrestricted this way, and it took a consumer measuring their own access
+    to discover it.
+
+    Refused at the API, not only in the page: a guard that lives in the browser
+    is a suggestion, and this endpoint is reachable directly.
+    """
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("*", pull=True, push=True)])
+    c = as_user("sub-user")
+    kid = c.post("/_console/keys", json={}).json()["key_id"]
+    c.put(f"/_console/keys/{kid}/scope",
+          json={"rules": [{"pattern": "docker.io/*", "pull": True, "push": False}]})
+
+    r = c.put(f"/_console/keys/{kid}/scope",
+              json={"rules": [{"pattern": "*", "pull": True, "push": True}]})
+    assert r.status_code == 400
+    assert "restricts nothing" in r.json()["detail"]
+
+    # and the narrowing it would have removed is still in place
+    key = next(k for k in store.list_keys() if k.key_id == kid)
+    assert [x.pattern for x in key.scope] == ["docker.io/*"]
+
+
+def test_a_wildcard_mixed_with_real_patterns_is_also_refused(console):
+    """`docker.io/*, *` is the same no-op with camouflage."""
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("*", pull=True)])
+    c = as_user("sub-user")
+    kid = c.post("/_console/keys", json={}).json()["key_id"]
+    r = c.put(f"/_console/keys/{kid}/scope", json={"rules": [
+        {"pattern": "docker.io/*", "pull": True, "push": False},
+        {"pattern": "*", "pull": True, "push": False},
+    ]})
+    assert r.status_code == 400
+
+
+def test_an_empty_scope_is_still_allowed(console):
+    """Removing a narrowing must remain possible -- the guard is against a
+    wildcard PRETENDING to be one, not against widening deliberately."""
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("*", pull=True)])
+    c = as_user("sub-user")
+    kid = c.post("/_console/keys", json={}).json()["key_id"]
+    c.put(f"/_console/keys/{kid}/scope",
+          json={"rules": [{"pattern": "docker.io/*", "pull": True, "push": False}]})
+    r = c.put(f"/_console/keys/{kid}/scope", json={"rules": []})
+    assert r.status_code == 200
+    key = next(k for k in store.list_keys() if k.key_id == kid)
+    assert key.scope == []

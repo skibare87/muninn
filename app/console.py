@@ -162,6 +162,17 @@ async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
     """
     key = _owned_key(request, key_id)
     parsed = [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
+    # A scope containing "*" narrows to everything, which is not a narrowing at
+    # all -- it is a no-op wearing a restriction's clothes, and the value a
+    # reader reaches for because "*" IS the correct unrestricted value in an
+    # allowlist. Refused here as well as in the page, because a guard that lives
+    # only in the browser is a suggestion: this endpoint is reachable directly.
+    if any(r.pattern == "*" for r in parsed):
+        raise HTTPException(
+            status_code=400,
+            detail='a scope of "*" restricts nothing; send an empty list for no '
+                   "limit, or name the repositories this key is held to",
+        )
     _store().set_key_scope(key.key_id, parsed)
     log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))
     return {"key_id": key.key_id, "scope": [_rule_out(r) for r in parsed]}
