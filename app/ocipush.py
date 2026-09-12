@@ -92,6 +92,18 @@ class Upload:
     path: Path
     offset: int = 0
     digest: hashlib._Hash = field(default_factory=hashlib.sha256)
+    # THE KEY THAT OPENED THIS SESSION, and the reason it is recorded.
+    #
+    # A push is four requests: POST to open, PATCH to send, PUT to finish, and
+    # the authorisation decision is made on the FIRST one. The later three carry
+    # only the session uuid, and the repository they write to comes from this
+    # object rather than from their own path -- so without this field, any
+    # authenticated caller who learns a uuid can finish someone else's upload
+    # into a repository they were never allowed to push to.
+    #
+    # None means the session was opened with per-key authz off, in which case
+    # there is no key to bind to and nothing to compare.
+    key_id: str | None = None
 
     @property
     def computed(self) -> str:
@@ -196,17 +208,30 @@ def _staging(upstream: str) -> Path:
     return d
 
 
-def begin(ref: registry.Ref) -> Upload:
+def begin(ref: registry.Ref, key_id: str | None = None) -> Upload:
     u = str(uuidlib.uuid4())
-    up = Upload(uuid=u, ref=ref, path=_staging(ref.upstream) / u)
+    up = Upload(uuid=u, ref=ref, path=_staging(ref.upstream) / u, key_id=key_id)
     up.path.touch()
     _sessions[u] = up
     return up
 
 
-def get(uuid: str) -> Upload:
+def get(uuid: str, key_id: str | None = None) -> Upload:
+    """Fetch a session, refusing one opened by a different key.
+
+    The mismatch is reported as BLOB_UPLOAD_UNKNOWN -- the same answer as a uuid
+    that does not exist. Distinguishing them would confirm to a caller that
+    someone else's session is live, which is the first half of hijacking it.
+
+    A session opened WITHOUT a key (authz off at the time) is not bound, and a
+    request carrying a key still gets it: that combination only arises if authz
+    was switched on mid-upload, and failing a push in flight is the wrong answer
+    to a configuration change.
+    """
     up = _sessions.get(uuid)
     if up is None:
+        raise PushError(404, "BLOB_UPLOAD_UNKNOWN", f"no upload session {uuid}")
+    if up.key_id is not None and up.key_id != key_id:
         raise PushError(404, "BLOB_UPLOAD_UNKNOWN", f"no upload session {uuid}")
     return up
 

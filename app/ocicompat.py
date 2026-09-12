@@ -511,6 +511,18 @@ def _accept_header(request: Request) -> str | None:
     return ", ".join(values)
 
 
+def _key_id(request: Request) -> str | None:
+    """The key that authenticated this request, or None when authz is off.
+
+    PATCH and PUT on an upload session cannot re-run _resolve_or_error: the
+    repository they write to comes from the SESSION, not from their own path,
+    so authorising the path would authorise the wrong thing. Binding the
+    session to its opener is what covers them instead.
+    """
+    key = getattr(request.state, "authz_key", None)
+    return key.key_id if key is not None else None
+
+
 def _resolve_or_error(name: str, request: Request | None = None, operation: str = "pull"):
     """Resolve a reference AND authorise the operation on it.
 
@@ -889,7 +901,7 @@ async def blob_upload_start(name: str, request: Request) -> Response:
     if not verdict.allowed:
         return _denied(verdict.reason, "blob")
 
-    up = ocipush.begin(ref)
+    up = ocipush.begin(ref, _key_id(request))
     digest = request.query_params.get("digest")
     if digest:
         # Single-POST monolithic upload: body and digest in one request.
@@ -913,7 +925,7 @@ async def blob_upload_chunk(name: str, uuid: str, request: Request) -> Response:
     if not settings.docker_push_enabled:
         return _push_disabled()
     try:
-        up = ocipush.get(uuid)
+        up = ocipush.get(uuid, _key_id(request))
     except ocipush.PushError as exc:
         return _err(exc.status, exc.code, exc.message)
     async for chunk in request.stream():
@@ -933,7 +945,7 @@ async def blob_upload_finish(name: str, uuid: str, request: Request) -> Response
     if not digest or not ocistore.DIGEST_RE.match(digest):
         return _err(400, "DIGEST_INVALID", "PUT requires a ?digest=sha256:...")
     try:
-        up = ocipush.get(uuid)
+        up = ocipush.get(uuid, _key_id(request))
     except ocipush.PushError as exc:
         return _err(exc.status, exc.code, exc.message)
     async for chunk in request.stream():

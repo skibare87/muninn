@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from . import (
@@ -187,9 +188,27 @@ async def healthz() -> JSONResponse:
 
 
 @app.get("/metrics", include_in_schema=False)
-async def prometheus_metrics() -> Response:
-    """Prometheus exposition. Deliberately unauthenticated: it carries no repo
-    names or file paths, only counts, so it is safe to scrape from a LAN."""
+async def prometheus_metrics(
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Prometheus exposition.
+
+    Unauthenticated by default, and that default has a bounded reason: it
+    carries no repo names or file paths, only counts, so it is safe to scrape
+    from a LAN. THE BOUND IS "FROM A LAN" -- the `registry` label names which
+    upstreams are in use and cache_bytes is a capacity signal, so on a public
+    hostname this is an unauthenticated read of how much a shared service holds
+    and who it talks to. Set XHC_METRICS_AUTH=token there.
+
+    The reason it is not simply gated for everyone: this endpoint is an existing
+    monitoring contract, and a scrape that starts returning 401 stops somebody's
+    alerting without anything going red.
+    """
+    if settings.metrics_auth == "token":
+        # compare_digest so the comparison does not leak the token's prefix
+        expected = f"Bearer {settings.manage_token}"
+        if authorization is None or not hmac.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="metrics require a management token")
     view = await cachefs.get_view()
     disk = cachefs.disk_stats()
     jobs = manager.list()

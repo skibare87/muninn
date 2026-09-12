@@ -295,6 +295,22 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8080
     manage_token: str | None = None
+    # Who may read /metrics. DEFAULT IS `none`, i.e. today's behaviour, and that
+    # default is not laziness: /metrics is an existing monitoring contract and
+    # gating it by default would stop somebody's alerting. Stopped alerting is
+    # invisible by construction -- nothing goes red, the page simply never fires
+    # -- so a change that could cause it must be opted into by the operator who
+    # can also update their scrape config.
+    #
+    # It is worth setting on a PUBLIC instance. The endpoint carries no repo
+    # names or paths, which is why it was safe to leave open on a LAN, but the
+    # `registry` label names the upstreams in use and cache_bytes is a capacity
+    # signal. On a shared public cache that is an unauthenticated read of how
+    # much the service holds and who it talks to.
+    #
+    #   none   unauthenticated (default)
+    #   token  requires `Authorization: Bearer <XHC_MANAGE_TOKEN>`
+    metrics_auth: str = "none"
     request_timeout_s: float = 60.0
 
     xet_env: dict[str, str] = field(default_factory=dict)
@@ -372,6 +388,20 @@ class Settings:
                     "the token exchange both carry the client secret."
                 )
 
+        metrics_auth = (
+            os.environ.get("XHC_METRICS_AUTH") or cls.metrics_auth
+        ).strip().lower()
+        if metrics_auth not in ("none", "token"):
+            raise ValueError(f"XHC_METRICS_AUTH must be none|token, got {metrics_auth!r}")
+        # Fails on the ARGUMENTS, before any I/O: asking for a gate with no
+        # credential to check would otherwise start a server whose /metrics
+        # refuses everyone including the monitoring that depends on it.
+        if metrics_auth == "token" and not (os.environ.get("XHC_MANAGE_TOKEN") or "").strip():
+            raise ValueError(
+                "XHC_METRICS_AUTH=token needs XHC_MANAGE_TOKEN: there is no other "
+                "credential for it to check."
+            )
+
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
         return cls(
@@ -443,6 +473,7 @@ class Settings:
             host=os.environ.get("XHC_HOST", "0.0.0.0"),
             port=_env_int("XHC_PORT", 8080),
             manage_token=os.environ.get("XHC_MANAGE_TOKEN") or None,
+            metrics_auth=metrics_auth,
             request_timeout_s=_env_float("XHC_REQUEST_TIMEOUT", 60.0),
             xet_env={k: os.environ[k] for k in XET_ENV_KEYS if k in os.environ},
         )

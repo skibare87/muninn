@@ -38,6 +38,11 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "authz_db", str(db))
     monkeypatch.setattr(settings, "docker_enabled", True)
     monkeypatch.setattr(settings, "docker_push_enabled", True)
+    # The push path writes policy state and staging files. Without these the
+    # handlers 500 on a PermissionError against the default /cache, which looks
+    # exactly like an authorisation failure in a test about authorisation.
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setattr(settings, "docker_dir", str(tmp_path / "oci"))
     monkeypatch.setattr(dockerauth, "_store", None)  # reopen against tmp db
 
     store = AuthzStore(db)
@@ -127,3 +132,99 @@ def test_every_v2_route_that_names_a_repo_authorises_it(wired):
         assert "request" in call, f"resolve without a request cannot authorise: {call}"
         assert '"pull"' in call or '"push"' in call, \
             f"resolve must name its operation explicitly, not inherit a default: {call}"
+
+
+# ---------------------------------------------------------------------------
+# Upload-session hijacking.
+#
+# A push is four requests and only the FIRST is authorised against a
+# repository: POST /blobs/uploads/ resolves the name and checks the rule. PATCH
+# and PUT carry a session uuid, and the repository they write to comes from the
+# session rather than from their own path -- so authorising their path would
+# authorise something they do not use.
+#
+# That leaves the session itself as the thing to protect, which is what these
+# tests are about. They are the reason `_resolve_or_error` being the coupling
+# point is NOT sufficient on its own.
+# ---------------------------------------------------------------------------
+
+
+def _open_upload(client, cred):
+    r = client.post("/v2/docker.io/library/alpine/blobs/uploads/", auth=cred)
+    assert r.status_code == 202, r.text
+    return r.headers["docker-upload-uuid"]
+
+
+def test_a_second_key_cannot_continue_an_upload_it_did_not_open(wired):
+    """The isolation break this binding exists to close.
+
+    Both keys here are legitimate and authenticated. The attacker's key has no
+    push rule at all, so it could never have OPENED this session -- and without
+    binding it can still finish one, writing bytes into a repository it was
+    refused. On a shared cache that is one tenant completing another's push.
+    """
+    client, puller, pusher = wired
+    uuid = _open_upload(client, pusher)
+
+    hijack = client.patch(
+        f"/v2/docker.io/library/alpine/blobs/uploads/{uuid}",
+        auth=puller, content=b"malicious",
+    )
+    assert hijack.status_code == 404, hijack.text
+
+    finish = client.put(
+        f"/v2/docker.io/library/alpine/blobs/uploads/{uuid}"
+        "?digest=sha256:" + "0" * 64,
+        auth=puller, content=b"malicious",
+    )
+    assert finish.status_code == 404, finish.text
+
+
+def test_an_unknown_session_and_a_stolen_one_are_indistinguishable(wired):
+    """Same status, same code. Telling the caller a uuid is real but not theirs
+    confirms someone else's session is live, which is the first half of
+    hijacking it."""
+    client, puller, pusher = wired
+    stolen = _open_upload(client, pusher)
+
+    absent = "00000000-0000-4000-8000-000000000000"
+    a = client.patch(f"/v2/docker.io/library/alpine/blobs/uploads/{stolen}",
+                     auth=puller, content=b"x")
+    b = client.patch(f"/v2/docker.io/library/alpine/blobs/uploads/{absent}",
+                     auth=puller, content=b"x")
+    assert a.status_code == b.status_code == 404
+
+    # Each body echoes the uuid THE CALLER SUPPLIED, which tells them nothing
+    # they did not already have. Compare with their own input normalised out --
+    # comparing the raw bodies would fail on that echo and would be asserting
+    # something stricter than the property, which is that the two cases are
+    # indistinguishable to the caller.
+    assert a.json()["errors"][0]["code"] == b.json()["errors"][0]["code"]
+    assert (
+        a.text.replace(stolen, "UUID") == b.text.replace(absent, "UUID")
+    ), "a stolen uuid must be reported exactly as an absent one"
+
+
+def test_the_opening_key_can_still_finish_its_own_upload(wired):
+    """THE POSITIVE CONTROL. Without it, the two tests above are satisfied by a
+    binding that refuses every PATCH and PUT, which would break all pushes and
+    still look like a passing security test."""
+    import hashlib
+
+    client, _, pusher = wired
+    uuid = _open_upload(client, pusher)
+
+    body = b"a legitimate layer"
+    cont = client.patch(f"/v2/docker.io/library/alpine/blobs/uploads/{uuid}",
+                        auth=pusher, content=body)
+    assert cont.status_code == 202, cont.text
+    # The PUT forwards upstream, which these tests do not reach -- what is being
+    # asserted is that the session was ACCEPTED, i.e. not a 404 from the binding.
+    done = client.put(
+        f"/v2/docker.io/library/alpine/blobs/uploads/{uuid}"
+        "?digest=sha256:" + hashlib.sha256(body).hexdigest(),
+        auth=pusher, content=b"",
+    )
+    assert done.status_code != 404, (
+        "the opening key must not be refused its own session: " + done.text
+    )

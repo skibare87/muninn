@@ -632,6 +632,9 @@ ENV_TO_SETTING = [
     ("XHC_PORT", "9999", "port", 9999),
     ("XHC_REQUEST_TIMEOUT", "13", "request_timeout_s", 13.0),
     ("XHC_MANAGE_TOKEN", "sekrit", "manage_token", "sekrit"),
+    # `token` needs XHC_MANAGE_TOKEN, so only `none` is valid on its own here;
+    # the gated case is exercised in test_metrics_auth.py.
+    ("XHC_METRICS_AUTH", "none", "metrics_auth", "none"),
     # --- docker / OCI (0.5.0) ---
     ("XHC_DOCKER_ENABLED", "0", "docker_enabled", False),
     ("XHC_DOCKER_DIR", "/mnt/oci", "docker_dir", "/mnt/oci"),

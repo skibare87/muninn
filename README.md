@@ -962,11 +962,71 @@ Then `docker login <cache-host>` as usual. **bcrypt only** — Apache's other fo
 unsalted or broken, and silently accepting one would make a weak file look configured, so
 they are refused at startup with the line number.
 
-> **This is a GATE, not per-client isolation.** Everyone who authenticates sees
-> **everything the cache holds**. Per-client authorization is not possible here and Muninn
-> will not pretend otherwise: a cached hit consults no credentials at all, so any such
-> scheme would be enforced on the miss and silently absent on every hit after it — false
-> from the first cache fill. See *The trust boundary is the network* above.
+> **On its own this is a GATE, not per-client isolation.** With `XHC_DOCKER_AUTH=basic`
+> alone, everyone who authenticates sees **everything the cache holds**. One credential per
+> consumer still buys you revocation, which is worth having on a shared cache — but it buys
+> only that.
+>
+> **`XHC_AUTHZ_DB` adds real per-key authorization** to the `/v2` surface. See
+> *Per-key authorization* below, including what it still does not do.
+
+#### Per-key authorization (`XHC_AUTHZ_DB`)
+
+Replaces the flat htpasswd with a SQLite store of principals, keys and rules, so a
+credential can be allowed to pull `docker.io/library/*` and nothing else, or to push to one
+repository while pulling from several.
+
+```yaml
+environment:
+  XHC_AUTHZ_DB: /srv/authz/authz.db
+```
+
+Set it and a Basic credential becomes **key id as the username, key secret as the
+password**. It *replaces* the htpasswd gate rather than layering on it — two credential
+stores answering the same question is how one of them silently stops being consulted.
+
+Rules are patterns over `<upstream>/<repository>`, each granting pull, push or both:
+
+```
+docker.io/library/*   pull
+ghcr.io/myorg/*       pull+push
+*                     pull+push        # anything, anywhere
+```
+
+`*` spans `/`. Patterns match the repository and **never the tag**, so
+`docker.io/library/alpine pull` covers every tag of alpine. The list is **allow-only with
+no precedence**: a rule can grant, nothing can deny, and an **empty list grants nothing**.
+There is no ordering to get wrong and no deny rule that a later grant can quietly override.
+
+Revocation beats every grant: disabling a key, or the principal holding it, refuses
+everything immediately — including authentication, so `docker login` fails rather than
+succeeding and leaving the user to discover the revocation on their next pull.
+
+With `XHC_OIDC_ISSUER` also set, users manage their own keys through a browser login on the
+cache's own homepage, and an administrator sets each user's allowlist. See
+*Interactive login* below.
+
+**Authorization runs at reference resolution, before hit-or-miss is decided.** That is what
+makes it honest rather than decorative, and it is worth stating because the obvious
+implementation is not honest: a check performed only when fetching from upstream would be
+enforced on the miss and silently absent on every hit after it — false from the first cache
+fill. Here the decision is coupled to `_resolve_or_error` in the same call that parses the
+reference, so a route cannot serve a repository it did not authorise without also failing
+to work out which repository it is.
+
+**What it still does not do, and these are limits rather than bugs:**
+
+- **It does not cover the Hugging Face path.** `XHC_AUTHZ_DB` authorises `/v2/*` only.
+  Model and dataset traffic is gated by `XHC_INGEST_POLICY` / `XHC_ALLOW_REPOS`, which are
+  **server-wide**, not per-credential.
+- **Allowing a path grants whatever is already cached there.** The cache is shared storage
+  and holds no per-tenant copies. If one tenant pulls a private image, a second tenant whose
+  rules cover that path is served it from disk — Muninn does not re-check their entitlement
+  with the upstream registry, because on a hit it never contacts the upstream at all. **Do
+  not use one Muninn to separate tenants who must not read each other's private images.**
+  Rules decide which *paths* a key may use; they do not re-derive upstream entitlement.
+- **The blast radius of the cache's own upstream credentials is unchanged.** Anything
+  `XHC_REGISTRY_AUTH_FILE` can reach, any key allowed that path can reach through the cache.
 
 **It gates `/v2/*` and nothing else.** `/healthz` and `/metrics` stay unauthenticated by
 design, and `/_cache` keeps its own separate `XHC_MANAGE_TOKEN` — a pull credential does not
@@ -985,6 +1045,65 @@ so it warns at boot rather than refusing.
 identifying header and Muninn's OCI path records no principal, so credentials are the only
 mechanism by which this cache can ever know which node pulled what. A shared secret does not
 defer that, it forecloses it — and revoking one node becomes impossible.
+
+### Interactive login (`XHC_OIDC_ISSUER`)
+
+So that users of a shared cache can manage their own credentials without a shell on the box.
+Entirely optional: with no issuer configured there is no login, no session cookie and no
+management surface — the routes are not mounted at all, rather than mounted and disabled.
+
+```yaml
+environment:
+  XHC_AUTHZ_DB:            /srv/authz/authz.db      # required
+  XHC_OIDC_ISSUER:         https://accounts.example.com
+  XHC_OIDC_CLIENT_ID:      muninn
+  XHC_OIDC_CLIENT_SECRET:  ...
+  XHC_OIDC_REDIRECT_URI:   https://cache.example.com/_auth/callback
+  XHC_SESSION_SECRET:      ...                      # signs the session cookie
+```
+
+Register `https://<your-host>/_auth/callback` with your provider. Any provider with OIDC
+discovery works; nothing here names one.
+
+**Setting `XHC_OIDC_ISSUER` without the rest refuses to start**, naming what is missing. A
+login route that 500s on the first real user is worse than a service that will not boot,
+because by then nobody is watching.
+
+**The first person to log in becomes admin.** The claim is made in a single `BEGIN IMMEDIATE`
+transaction, so two simultaneous first logins cannot both win — a race with exactly one
+correct answer, deciding who administers the service.
+
+After that:
+
+| | |
+| --- | --- |
+| any logged-in user | create, list, disable and delete **their own** keys |
+| admin | see all users, set each user's allowlist, grant/revoke admin, disable a user |
+
+**A user manages the credentials they hold; an admin decides what those credentials may
+do.** The allowlist belongs to the user, not the key, and only an admin can write it — if a
+user could edit their own, "create a key" and "grant myself push to everything" would be the
+same operation. A newly created key therefore grants nothing until an administrator sets an
+allowlist, which the UI says rather than leaving the user to discover.
+
+A key secret is shown **once**, at creation. The store keeps only a SHA-256 hash, which is
+what makes a copy of the database less than a full compromise.
+
+Sessions are a signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) carrying nothing but the
+subject and an expiry. **No role, no key, no rule** — everything is re-read from the store on
+every request, so disabling a user or revoking admin takes effect on their next request
+rather than whenever their cookie happens to expire.
+
+The login is deliberately **not** a second gate on `/v2`. Pulls and pushes authenticate with
+a key, every time; a browser session never authorises one. Keeping the two credential kinds
+disjoint means a stolen cookie cannot pull images and a leaked key cannot manage keys.
+
+*Why application-level OIDC rather than an edge access product:* an access proxy can only
+enforce on hostnames it terminates, and putting the cache's data path behind one imposes that
+proxy's request-body limit on every blob push. A blob `PUT` over that limit returns 413 in a
+way that leaves a tag pointing at the previous manifest — a push that reports failure after
+having half-succeeded. The login is a browser concern; it does not need to sit in front of
+the bytes.
 
 ### Private registries: the cache authenticates as itself
 
@@ -1216,6 +1335,7 @@ experiments age out.
 | `XHC_OIDC_SCOPES` | `openid email profile` | scopes requested at the provider |
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
+| `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |
