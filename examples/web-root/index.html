@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Muninn — a pull-through cache for models and containers</title>
+<meta name="description" content="Muninn is a pull-through cache that speaks two protocols: the Hugging Face Hub API and the OCI registry API. Fetch once, serve many.">
+<style>
+  :root{
+    --bg:#fbfaf8; --fg:#1b1a18; --muted:#5d5a54; --rule:#e4e0d8;
+    --card:#fff; --accent:#7a5c2e; --code-bg:#f3f0ea; --shadow:0 1px 2px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16150f; --fg:#ece8df; --muted:#a8a294; --rule:#2e2c24;
+      --card:#1d1c15; --accent:#d8b26a; --code-bg:#222018; --shadow:none;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.65 ui-serif,Georgia,"Iowan Old Style",Palatino,serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:53rem;margin:0 auto;padding:0 1.5rem}
+  header{border-bottom:1px solid var(--rule);padding:4.5rem 0 3rem}
+  .mark{
+    font:600 .78rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--accent);margin:0 0 1.1rem
+  }
+  h1{font-size:clamp(2.1rem,5.5vw,3.1rem);line-height:1.12;margin:0 0 1rem;font-weight:600;letter-spacing:-.015em}
+  .lede{font-size:1.2rem;color:var(--muted);margin:0;max-width:40rem}
+  h2{
+    font:600 .8rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.15em;
+    text-transform:uppercase;color:var(--accent);margin:3.6rem 0 1.1rem
+  }
+  h3{font-size:1.12rem;margin:2rem 0 .5rem;font-weight:600}
+  p{margin:0 0 1.1rem;max-width:40rem}
+  .muted{color:var(--muted)}
+  code,pre{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace}
+  code{background:var(--code-bg);padding:.12em .38em;border-radius:3px;font-size:.9em}
+  pre{
+    background:var(--card);border:1px solid var(--rule);border-radius:8px;
+    padding:1rem 1.15rem;overflow-x:auto;font-size:.875rem;line-height:1.7;
+    box-shadow:var(--shadow)
+  }
+  pre code{background:none;padding:0;font-size:inherit}
+  .cmt{color:var(--muted)}
+  .grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));margin:1.4rem 0}
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:8px;padding:1.15rem 1.25rem;box-shadow:var(--shadow)}
+  .card h4{margin:0 0 .4rem;font-size:1rem;font-weight:600}
+  .card p{margin:0;font-size:.93rem;color:var(--muted)}
+  .note{border-left:2px solid var(--accent);padding:.1rem 0 .1rem 1.1rem;margin:1.5rem 0;color:var(--muted)}
+  footer{border-top:1px solid var(--rule);margin-top:4.5rem;padding:2rem 0 3.5rem;color:var(--muted);font-size:.9rem}
+  a{color:inherit;text-decoration-color:var(--accent);text-underline-offset:3px}
+  a:hover{color:var(--accent)}
+  .kicker{font:600 .75rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <p class="mark">Muninn</p>
+    <h1>Fetch it once.<br>Serve it everywhere.</h1>
+    <p class="lede">A pull-through cache that speaks two protocols — the Hugging Face Hub API and the OCI registry API — so model weights and container images cross your uplink once instead of once per machine.</p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <h2>What it does</h2>
+  <p>Point a client at Muninn instead of at the upstream. The first request fetches from upstream and keeps a copy; every request after that is served from local disk. Nothing is rewritten, so checksums and signatures still verify at the client exactly as they would have upstream.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h4>Two protocols, one service</h4>
+      <p>Hugging Face file and metadata traffic, and the full OCI registry pull surface. The same host answers both.</p>
+    </div>
+    <div class="card">
+      <h4>Any upstream, by path</h4>
+      <p>Registries are addressed by prefix rather than configured one at a time. No mirror entry per registry.</p>
+    </div>
+    <div class="card">
+      <h4>Bytes pass through unaltered</h4>
+      <p>Muninn is a cache, not a rewriter. Image signatures and file digests keep verifying at the client.</p>
+    </div>
+  </div>
+
+  <h2>Containers</h2>
+  <p>The first path component names the upstream registry. That is the whole configuration:</p>
+<pre><code><span class="cmt"># instead of docker.io/library/redis:7</span>
+docker pull ravencache.io/docker.io/library/redis:7
+
+<span class="cmt"># any registry, same shape</span>
+docker pull ravencache.io/ghcr.io/some/project:v2
+docker pull ravencache.io/quay.io/other/tool:latest</code></pre>
+  <p class="muted">Because the upstream is part of the reference, adding a registry needs no change on the cache and no change to a daemon config. A reference is self-describing: you can see what it pulls and where it came from.</p>
+
+  <h2>Models and datasets</h2>
+  <p>Set one environment variable and the Hugging Face libraries do the rest:</p>
+<pre><code>export HF_ENDPOINT=https://ravencache.io
+
+<span class="cmt"># unchanged code, now served from cache</span>
+python -c "from huggingface_hub import snapshot_download;
+           snapshot_download('openai-community/gpt2')"</code></pre>
+  <p class="muted">Metadata is proxied; file bytes are intercepted and cached. The second machine to ask for a checkpoint reads it off local disk at NVMe speed rather than pulling it again.</p>
+
+  <h2>Why bother</h2>
+  <h3>The uplink is the bottleneck, not the disk</h3>
+  <p>A cluster of machines pulling the same multi-gigabyte checkpoint pays for it once per machine. A cache turns that into once, total — and every subsequent read is local, which is faster than any CDN can be.</p>
+
+  <h3>Upstream is not forever</h3>
+  <p>Repositories get renamed, gated, or removed. A cache that already holds the bytes keeps working. Muninn can be configured to retain content whose upstream has disappeared, which makes it a reproducibility archive rather than just an accelerator.</p>
+
+  <h3>Ingested bytes are verified</h3>
+  <p>Content is hashed on the way in and refused when it does not match the digest it was fetched under — on both protocols. A corrupt or truncated response is rejected rather than cached and re-served forever.</p>
+  <div class="note">
+    <p style="margin:0">Verification covers <em>ingest</em>. It says nothing about bytes that were already on disk before it was enabled — a distinction worth keeping, because a green counter that silently means “nothing was checked” is worse than no counter at all.</p>
+  </div>
+
+  <h2>What it is not</h2>
+  <p>Muninn is a cache, not a registry and not a mirror. It does not host content of its own, does not rewrite manifests, and does not try to be the source of truth for anything. Where a request cannot be served from cache, it is a proxy to the real upstream and nothing more.</p>
+  <p>Access control is deliberately simple: a credential is a key to the gate, not a per-user scope. Anyone who can authenticate can read anything the cache holds. That is the right model for a shared team cache and the wrong one for multi-tenant isolation, and it is stated here rather than discovered later.</p>
+
+  <h2>Open source</h2>
+  <p>Muninn is MIT licensed and developed in the open at <a href="https://github.com/skibare87/muninn">github.com/skibare87/muninn</a> — including the parts that went wrong. The README documents the traps, the measurements behind each default, and the failures that produced them.</p>
+
+</main>
+
+<footer class="wrap">
+  <p class="kicker">ravencache.io</p>
+  <p style="margin:.5rem 0 0">A Muninn instance. Credentials are required for registry access — if you need one, ask whoever pointed you here.</p>
+</footer>
+</body>
+</html>
