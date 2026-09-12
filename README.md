@@ -1208,6 +1208,14 @@ experiments age out.
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
 | `XHC_HF_VERIFY` | `1` | hash each ingested HF file against its ETag and refuse a mismatch |
 | `XHC_WEB_ROOT` | *(unset)* | serve static files at `/` so one hostname is a homepage **and** a cache |
+| `XHC_AUTHZ_DB` | *(unset)* | SQLite store enabling per-key push/pull authorisation; unset keeps the single shared htpasswd gate |
+| `XHC_OIDC_ISSUER` | *(unset)* | OIDC provider, e.g. `https://accounts.example.com`. Setting it enables the browser login and the key-management console, and **requires** the four variables below plus `XHC_AUTHZ_DB` |
+| `XHC_OIDC_CLIENT_ID` | *(unset)* | OAuth client id |
+| `XHC_OIDC_CLIENT_SECRET` | *(unset)* | OAuth client secret |
+| `XHC_OIDC_REDIRECT_URI` | *(unset)* | exact callback URL, e.g. `https://cache.example.com/_auth/callback`. Pinned, never taken from a query parameter |
+| `XHC_OIDC_SCOPES` | `openid email profile` | scopes requested at the provider |
+| `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
+| `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |

@@ -27,7 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from . import metrics, ocigc, ocipush, ocistore, policy, registry, serving
+from . import dockerauth, metrics, ocigc, ocipush, ocistore, policy, registry, serving
 from .config import settings
 
 log = logging.getLogger("xhc.oci")
@@ -511,11 +511,29 @@ def _accept_header(request: Request) -> str | None:
     return ", ".join(values)
 
 
-def _resolve_or_error(name: str):
+def _resolve_or_error(name: str, request: Request | None = None, operation: str = "pull"):
+    """Resolve a reference AND authorise the operation on it.
+
+    THE TWO ARE COUPLED ON PURPOSE. Every /v2 route that names a repository has to
+    resolve it, so putting the authorisation check here means a route cannot skip
+    authorisation without also failing to resolve -- which fails loudly and
+    immediately rather than silently granting. A separate `authorize()` call that
+    each route must remember is a fail-open waiting for one distracted edit.
+
+    `request` is optional only so the existing internal callers that have no
+    request object keep working; when authz is enabled and no request is passed,
+    dockerauth.authorize refuses, because "I was not told who you are" must not
+    mean "proceed".
+    """
     try:
-        return registry.resolve(name), None
+        ref = registry.resolve(name)
     except registry.ResolveError as exc:
         return None, _err(400, "NAME_INVALID", str(exc))
+    if request is not None:
+        denied = dockerauth.authorize(request, operation, f"{ref.upstream}/{ref.repo}")
+        if denied is not None:
+            return None, denied
+    return ref, None
 
 
 async def _revalidate_tag(
@@ -581,7 +599,7 @@ def _manifest_response(m: ocistore.StoredManifest, head: bool) -> Response:
 async def manifests(name: str, reference: str, request: Request) -> Response:
     if not settings.docker_enabled:
         return _err(404, "UNSUPPORTED", "docker/OCI caching is disabled")
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "pull")
     if err:
         return err
     head = request.method == "HEAD"
@@ -664,7 +682,7 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         return _err(404, "UNSUPPORTED", "docker/OCI caching is disabled")
     if not ocistore.DIGEST_RE.match(digest):
         return _err(400, "DIGEST_INVALID", f"not a sha256 digest: {digest}")
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "pull")
     if err:
         return err
 
@@ -774,7 +792,7 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
 async def tags_list(name: str, request: Request) -> Response:
     if not settings.docker_enabled:
         return _err(404, "UNSUPPORTED", "docker/OCI caching is disabled")
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "pull")
     if err:
         return err
     verdict = policy.check_docker(ref.upstream, ref.repo)
@@ -798,7 +816,7 @@ async def tags_list(name: str, request: Request) -> Response:
 
 
 @router.get("/v2/{name:path}/referrers/{digest}")
-async def referrers(name: str, digest: str) -> Response:
+async def referrers(name: str, digest: str, request: Request) -> Response:
     """Proxy the referrers API (attestations, signatures) upstream, uncached.
 
     Discovered while watching a real `docker pull`: Docker 29 queries this, and
@@ -811,7 +829,7 @@ async def referrers(name: str, digest: str) -> Response:
     """
     if not settings.docker_enabled:
         return _err(404, "UNSUPPORTED", "docker/OCI caching is disabled")
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "pull")
     if err:
         return err
     verdict = policy.check_docker(ref.upstream, ref.repo)
@@ -864,7 +882,7 @@ async def blob_upload_start(name: str, request: Request) -> Response:
     """
     if not settings.docker_push_enabled:
         return _push_disabled()
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "push")
     if err:
         return err
     verdict = policy.check_docker(ref.upstream, ref.repo)
@@ -934,7 +952,7 @@ async def blob_upload_finish(name: str, uuid: str, request: Request) -> Response
 async def manifest_push(name: str, reference: str, request: Request) -> Response:
     if not settings.docker_push_enabled:
         return _push_disabled()
-    ref, err = _resolve_or_error(name)
+    ref, err = _resolve_or_error(name, request, "push")
     if err:
         return err
     verdict = policy.check_docker(ref.upstream, ref.repo)

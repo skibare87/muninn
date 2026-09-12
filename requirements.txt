@@ -3,3 +3,6 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 huggingface_hub[hf_xet]==0.34.4
 bcrypt==5.0.0
+# id_token verification for OIDC login. Hand-rolling JWT verification is how
+# alg=none and algorithm-confusion bugs get shipped in an auth path.
+PyJWT[crypto]==2.10.1

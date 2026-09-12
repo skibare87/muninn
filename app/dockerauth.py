@@ -31,8 +31,9 @@ import logging
 from pathlib import Path
 
 import bcrypt
-from fastapi import Header, HTTPException, Response
+from fastapi import Header, HTTPException, Request, Response
 
+from . import authz, authzstore
 from .config import settings
 
 log = logging.getLogger("xhc.dockerauth")
@@ -145,7 +146,9 @@ def _check(header: str | None) -> bool:
     return bcrypt.checkpw(password.encode(), stored)
 
 
-async def require_pull_auth(authorization: str | None = Header(default=None)) -> None:
+async def require_pull_auth(
+    request: Request, authorization: str | None = Header(default=None)
+) -> None:
     """FastAPI dependency for the /v2/* pull surface.
 
     Emits WWW-Authenticate, which is what makes `docker login` work and is also
@@ -153,6 +156,19 @@ async def require_pull_auth(authorization: str | None = Header(default=None)) ->
     failure is a 502 carrying x-xhc-upstream-auth and never a challenge
     (an internal issue). Two actors, two fixes, two shapes on the wire.
     """
+    # AUTHENTICATE first when per-key authz is on. This resolves the credential
+    # onto request.state for the per-reference authorisation that follows, and it
+    # replaces the htpasswd gate rather than layering on top of it -- two
+    # credential stores answering the same question is how one of them silently
+    # stops being consulted.
+    if store() is not None:
+        if authenticate(request, authorization):
+            return
+        raise HTTPException(
+            status_code=401,
+            detail="authenticate to this cache",
+            headers={"www-authenticate": 'Basic realm="muninn"'},
+        )
     if settings.docker_auth == "none":
         return
     if _check(authorization):
@@ -170,4 +186,106 @@ def unauthorized_response() -> Response:
         status_code=401,
         headers={"www-authenticate": 'Basic realm="muninn"',
                  "docker-distribution-api-version": "registry/2.0"},
+    )
+
+# --------------------------------------------------------------------------
+# Per-key authorisation (XHC_AUTHZ_DB). Two STEPS, deliberately:
+#
+#   AUTHENTICATE, at the router -- who is this? Resolves the Basic credential to
+#   a key. Cannot authorise, because a router-level dependency does not know
+#   which operation or which repository the request is for.
+#
+#   AUTHORISE, at the reference -- may they do THIS to THAT? Called from
+#   _resolve_or_error, which every /v2 route that names a repository already has
+#   to call. Coupling it there means forgetting to authorise requires forgetting
+#   to resolve the reference, which fails loudly instead of silently granting.
+# --------------------------------------------------------------------------
+
+_store: authzstore.AuthzStore | None = None
+
+
+def store() -> authzstore.AuthzStore | None:
+    """The authz store, opened once. None when the feature is off."""
+    global _store  # noqa: PLW0603 - module-level singleton
+    if _store is None and settings.authz_db:
+        _store = authzstore.AuthzStore(settings.authz_db)
+        log.info("per-key authorisation enabled from %s", settings.authz_db)
+    return _store
+
+
+def parse_basic(header: str | None) -> tuple[str, str] | None:
+    """Return (user, password) from a Basic header, or None."""
+    if not header or not header.lower().startswith("basic "):
+        return None
+    try:
+        raw = base64.b64decode(header.split(None, 1)[1], validate=True).decode("utf-8")
+    except (binascii.Error, IndexError, UnicodeDecodeError):
+        return None
+    user, sep, password = raw.partition(":")
+    if not sep:
+        return None
+    return user, password
+
+
+def authenticate(request: Request, authorization: str | None) -> bool:
+    """Resolve the presented credential onto request.state.authz_key.
+
+    Returns False when authz is ON and the credential does not resolve. Returns
+    True when authz is OFF, because in that mode this function has no opinion --
+    the htpasswd gate is the only control and it runs separately.
+    """
+    st = store()
+    if st is None:
+        return True
+    request.state.authz_key = None
+    creds = parse_basic(authorization)
+    if creds is None:
+        return False
+    key = st.resolve(*creds)
+    if key is None:
+        return False
+    # A disabled key -- or a key whose PRINCIPAL is disabled, which the store
+    # folds into the same flag -- must fail AUTHENTICATION, not merely
+    # authorisation.
+    #
+    # decide() already refuses it for every operation naming a repository, so
+    # pulls and pushes were never at risk. What was at risk is /v2/ itself,
+    # which names no repository and therefore never reaches decide(): it is the
+    # endpoint `docker login` calls, so a revoked user still got a cheerful
+    # "Login Succeeded" and only discovered the revocation on their first pull.
+    #
+    # Two authorities disagreeing about whether a credential is live is the bug,
+    # independent of which surface leaks it. Found by a test asserting that
+    # disabling a user stops their key ON THE WIRE rather than asserting that
+    # the management API returned 200.
+    if key.disabled:
+        return False
+    request.state.authz_key = key
+    return True
+
+
+def authorize(request: Request, operation: str, reference: str) -> Response | None:
+    """Authorise one operation on one reference. None means allowed.
+
+    FAILS CLOSED IN EVERY DIRECTION. If authz is on and no key reached
+    request.state -- a route that skipped authentication, a middleware ordering
+    change -- this refuses rather than assuming the gate ran. An authoriser that
+    treats "I was not told who you are" as "proceed" is not an authoriser.
+    """
+    if store() is None:
+        return None
+    key = getattr(request.state, "authz_key", None)
+    allowed, reason = authz.decide(key, operation, reference)  # type: ignore[arg-type]
+    if allowed:
+        log.debug("authz allow: %s", reason)
+        return None
+    # The REASON goes to the log; the client gets a status. Telling an
+    # unauthorised caller which rule refused them describes the policy to
+    # someone who has just failed to satisfy it.
+    log.info("authz deny: %s", reason)
+    if key is None:
+        return unauthorized_response()
+    return Response(
+        status_code=403,
+        headers={"docker-distribution-api-version": "registry/2.0"},
     )

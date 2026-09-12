@@ -68,7 +68,30 @@ CREATE TABLE IF NOT EXISTS rules (
     push    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS rules_by_key ON rules(key_id);
+CREATE TABLE IF NOT EXISTS principal_rules (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject TEXT NOT NULL REFERENCES principals(subject) ON DELETE CASCADE,
+    pattern TEXT NOT NULL,
+    pull    INTEGER NOT NULL DEFAULT 1,
+    push    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS principal_rules_by_subject ON principal_rules(subject);
 """
+
+# TWO PLACES A RULE CAN LIVE, AND THE DISTINCTION IS THE WHOLE AUTHORISATION MODEL.
+#
+#   principal_rules  the USER's allowlist. What this person may pull and push,
+#                    anywhere, through any key they hold. Admin-set.
+#   rules            extra grants for ONE key. Also admin-set.
+#
+# A key's effective rules are the UNION of the two. Union, not intersection,
+# because these are grants and a grant list has no precedence: see authz.py.
+#
+# Union means key rules can only WIDEN, never narrow. That is safe here for one
+# reason and only one: NOTHING LETS A NON-ADMIN SET EITHER LIST. A user creates
+# and deletes their own keys; what those keys may do is not theirs to say. If a
+# future change lets users edit key rules, this union becomes privilege
+# escalation -- so that change must make it an intersection first.
 
 
 def hash_secret(secret: str) -> str:
@@ -165,9 +188,18 @@ class AuthzStore:
         self._invalidate()
 
     def set_principal_disabled(self, subject: str, disabled: bool) -> None:
+        """Raises KeyError for an unknown subject.
+
+        A bare UPDATE matching no rows succeeds, so a typo in a subject reported
+        "user disabled" while disabling nobody -- the operator's evidence that a
+        revocation happened was a 200 from an UPDATE that touched zero rows.
+        rowcount is checked rather than trusted.
+        """
         with self._connect() as c:
-            c.execute("UPDATE principals SET disabled=? WHERE subject=?",
-                      (1 if disabled else 0, subject))
+            cur = c.execute("UPDATE principals SET disabled=? WHERE subject=?",
+                            (1 if disabled else 0, subject))
+            if cur.rowcount == 0:
+                raise KeyError(f"no such principal: {subject}")
         self._invalidate()
 
     # ---------------- keys ----------------
@@ -212,6 +244,39 @@ class AuthzStore:
             if principal is None or k.principal == principal
         ]
 
+    def get_principal_rules(self, subject: str) -> list[Rule]:
+        with self._connect() as c:
+            return [
+                Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
+                for r in c.execute(
+                    "SELECT pattern, pull, push FROM principal_rules WHERE subject=?"
+                    " ORDER BY id", (subject,)
+                )
+            ]
+
+    def set_principal_rules(self, subject: str, rules: list[Rule]) -> None:
+        """Replace a user's allowlist wholesale.
+
+        Replace rather than append, in ONE transaction: an edit that deletes then
+        inserts in two calls leaves a window in which the user has no rules, and
+        a window in which they have the OLD rules plus the new. Whole-list
+        replacement is also what a management form actually submits.
+        """
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            if not c.execute(
+                "SELECT 1 FROM principals WHERE subject=?", (subject,)
+            ).fetchone():
+                raise KeyError(f"no such principal: {subject}")
+            c.execute("DELETE FROM principal_rules WHERE subject=?", (subject,))
+            c.executemany(
+                "INSERT INTO principal_rules(subject, pattern, pull, push)"
+                " VALUES (?,?,?,?)",
+                [(subject, r.pattern, int(r.pull), int(r.push)) for r in rules],
+            )
+            c.commit()
+        self._invalidate()
+
     # ---------------- the read path ----------------
 
     def _all_keys(self) -> dict[str, Key]:
@@ -224,12 +289,21 @@ class AuthzStore:
                 rules.setdefault(r["key_id"], []).append(
                     Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
                 )
+            by_principal: dict[str, list[Rule]] = {}
+            for r in c.execute("SELECT * FROM principal_rules"):
+                by_principal.setdefault(r["subject"], []).append(
+                    Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
+                )
             # A key whose PRINCIPAL is disabled is itself unusable. Enforced in the
             # query rather than at the call site, so no caller can forget it.
             loaded = {
                 r["key_id"]: Key(
                     key_id=r["key_id"], secret_hash=r["secret_hash"],
-                    principal=r["principal"], rules=rules.get(r["key_id"], []),
+                    principal=r["principal"],
+                    rules=(
+                        by_principal.get(r["principal"], [])
+                        + rules.get(r["key_id"], [])
+                    ),
                     label=r["label"],
                     disabled=bool(r["disabled"]) or bool(r["p_disabled"]),
                 )

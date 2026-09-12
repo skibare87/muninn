@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from . import (
     cachefs,
     config,
+    console,
     dockerauth,
     hfcompat,
     manage,
@@ -24,6 +25,7 @@ from . import (
     orphans,
     pushlimits,
     refs,
+    webauth,
 )
 from . import registry as ociregistry
 from .config import settings
@@ -249,5 +251,20 @@ if settings.docker_enabled:
         ocicompat.router,
         dependencies=[Depends(dockerauth.require_pull_auth)],
     )
+# Before hfcompat for the same reason as /v2: /_auth/* would otherwise be
+# swallowed by the HF catch-all, and a login route that resolves to a Hub proxy
+# is a login route that silently does not exist.
+#
+# Mounted ONLY when login is configured. An unconfigured deployment gets no
+# /_auth surface at all rather than routes that 404 with an explanation --
+# there is nothing to explain to an anonymous caller, and a disabled-but-present
+# endpoint is still a place to aim traffic.
+if webauth.enabled():
+    app.include_router(webauth.router)
+    # Same mount condition, deliberately: the key-management surface exists only
+    # where there is a login to put in front of it. Mounting it without one
+    # would leave every handler depending on require_login to 401 -- correct,
+    # and one refactor away from not being.
+    app.include_router(console.router)
 # Must be last: hfcompat owns the catch-all route.
 app.include_router(hfcompat.router)

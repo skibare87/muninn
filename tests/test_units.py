@@ -610,6 +610,8 @@ ENV_TO_SETTING = [
     ("XHC_BLOCK_CLIENT_XET", "0", "block_client_xet", False),
     ("XHC_HF_VERIFY", "0", "hf_verify_ingest", False),
     ("XHC_WEB_ROOT", "/srv/www", "web_root", "/srv/www"),
+    ("XHC_AUTHZ_DB", "/srv/authz.db", "authz_db", "/srv/authz.db"),
+    ("XHC_AUTHZ_DB", "/srv/authz.db", "authz_db", "/srv/authz.db"),
     ("XHC_INGEST_CONCURRENCY", "9", "ingest_concurrency", 9),
     ("XHC_NEGATIVE_TTL", "11", "negative_ttl_s", 11.0),
     ("XHC_ORPHAN_POLICY", "evict", "orphan_policy", "evict"),
@@ -653,7 +655,91 @@ ENV_TO_SETTING = [
     ("XHC_DOCKER_CACHE_ON_PUSH", "0", "docker_cache_on_push", False),
     ("XHC_DOCKER_PUSH_LIMITS", "/cfg/lim.json", "docker_push_limits", "/cfg/lim.json"),
     ("XHC_DOCKER_BLOB_CHUNK", "16Mi", "docker_blob_chunk", 16 * 1024**2),
+    # --- interactive login. Only the ones valid ON THEIR OWN live here; the
+    # rest are in ENV_GROUPS below, because XHC_OIDC_ISSUER on its own is a
+    # configuration error and this table sets exactly one variable per row.
+    ("XHC_OIDC_CLIENT_ID", "abc", "oidc_client_id", "abc"),
+    ("XHC_OIDC_CLIENT_SECRET", "shh", "oidc_client_secret", "shh"),
+    ("XHC_OIDC_REDIRECT_URI", "https://c/cb", "oidc_redirect_uri", "https://c/cb"),
+    ("XHC_OIDC_SCOPES", "openid", "oidc_scopes", "openid"),
+    ("XHC_SESSION_SECRET", "sig", "session_secret", "sig"),
+    ("XHC_SESSION_TTL", "600", "session_ttl_s", 600.0),
 ]
+
+# Settings that CANNOT be set one at a time, because enabling one imposes
+# requirements on the others. A single-variable table cannot express that, and
+# exempting them would have recorded "no env var" for variables that exist --
+# which is the shape of omission this guard is for.
+ENV_GROUPS = [
+    (
+        {
+            "XHC_OIDC_ISSUER": "https://idp.example.com/",
+            "XHC_OIDC_CLIENT_ID": "cid",
+            "XHC_OIDC_CLIENT_SECRET": "csec",
+            "XHC_OIDC_REDIRECT_URI": "https://cache.example/_auth/callback",
+            "XHC_SESSION_SECRET": "signing",
+            "XHC_AUTHZ_DB": "/srv/authz.db",
+        },
+        # the trailing slash is stripped, because discovery appends a path and
+        # a doubled slash is a 404 at some providers and a redirect at others
+        {"oidc_issuer": "https://idp.example.com"},
+    ),
+]
+
+
+@pytest.mark.parametrize("env,expected", ENV_GROUPS)
+def test_env_group_reaches_settings(env, expected, monkeypatch):
+    from app.config import Settings
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    settings = Settings.from_env()
+    for field, value in expected.items():
+        assert getattr(settings, field) == value
+
+
+@pytest.mark.parametrize(
+    "omit",
+    [
+        "XHC_OIDC_CLIENT_ID",
+        "XHC_OIDC_CLIENT_SECRET",
+        "XHC_OIDC_REDIRECT_URI",
+        "XHC_SESSION_SECRET",
+        "XHC_AUTHZ_DB",
+    ],
+)
+def test_login_refuses_to_start_half_configured(omit, monkeypatch):
+    """Each of these is required once XHC_OIDC_ISSUER is set, and the failure
+    must be at STARTUP.
+
+    A missing session secret discovered at the first callback means the first
+    real user gets a 500 and the operator is no longer watching. Refusing to
+    boot is loud, immediate, and lands on whoever just changed the config.
+
+    This is the guard being made to go red deliberately -- a config check that
+    has never been observed to reject anything is decoration.
+    """
+    from app.config import Settings
+
+    env = dict(ENV_GROUPS[0][0])
+    del env[omit]
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv(omit, raising=False)
+    with pytest.raises(ValueError, match=omit):
+        Settings.from_env()
+
+
+def test_a_plaintext_issuer_is_refused(monkeypatch):
+    """Discovery and the token exchange both carry the client secret."""
+    from app.config import Settings
+
+    env = dict(ENV_GROUPS[0][0])
+    env["XHC_OIDC_ISSUER"] = "http://idp.example.com"
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValueError, match="https"):
+        Settings.from_env()
 
 
 @pytest.mark.parametrize("env,value,field,expected", ENV_TO_SETTING)
@@ -680,7 +766,11 @@ def test_every_setting_has_an_env_var_or_is_deliberately_internal():
         "host",  # XHC_HOST, string passthrough
         "xet_env",  # reporting only, mirrors the HF_XET_* process env
     }
-    covered = {field for _, _, field, _ in ENV_TO_SETTING} | exempt
+    covered = (
+        {field for _, _, field, _ in ENV_TO_SETTING}
+        | {field for _, expected in ENV_GROUPS for field in expected}
+        | exempt
+    )
     declared = {f.name for f in dataclasses.fields(Settings)}
     missing = declared - covered
     assert not missing, f"Settings fields with no env-var test: {sorted(missing)}"

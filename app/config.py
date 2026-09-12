@@ -136,6 +136,42 @@ class Settings:
     # Unauthenticated by design: the client-auth gate is on /v2 only. A homepage
     # is public; do not put anything here that is not.
     web_root: str | None = None
+    # Per-key push/pull authorisation, backed by a SQLite store of principals,
+    # keys and rules. UNSET means the feature is entirely off and client auth
+    # behaves exactly as before -- a single shared htpasswd gate. Opt-in, so no
+    # existing deployment changes behaviour on upgrade.
+    #
+    # When set, a Basic credential is USERNAME=key_id, PASSWORD=key_secret, and
+    # pull and push become separately authorised for the first time.
+    authz_db: str | None = None
+    # --- interactive login (OIDC) --------------------------------------------
+    #
+    # Entirely optional and unset by default: a Muninn with no issuer configured
+    # has no login, no session cookie and no management UI, exactly as before.
+    #
+    # This exists so a SHARED cache can let its users manage their own keys
+    # without anyone having a shell on the box. It is deliberately provider-
+    # neutral -- any OIDC provider with discovery works, and nothing here names
+    # one. It is NOT a second gate on /v2: pulls and pushes authenticate with a
+    # key, never with a browser session.
+    #
+    # The first principal to log in becomes admin. That is a race with exactly
+    # one correct answer, so the claim is made in a single IMMEDIATE
+    # transaction in authzstore rather than read-then-write here.
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None
+    # Pinned exactly, never taken from a query parameter. An open redirect in
+    # an OAuth callback hands the authorisation code to whoever supplied the
+    # target, which is the whole credential.
+    oidc_redirect_uri: str | None = None
+    oidc_scopes: str = "openid email profile"
+    # Signs the session cookie. MUST be set when OIDC is on; there is no
+    # generated default, because a per-process random key silently logs
+    # everyone out on restart and silently fails to log anyone out across
+    # replicas -- two opposite bugs from one convenience.
+    session_secret: str | None = None
+    session_ttl_s: float = 43200.0  # 12h
     # Hash an ingested HF file against its upstream ETag and REFUSE to keep it
     # on a mismatch, matching what the OCI path already does for blobs.
     #
@@ -305,6 +341,37 @@ class Settings:
         if docker_auth not in ("none", "basic"):
             raise ValueError(f"XHC_DOCKER_AUTH must be none|basic, got {docker_auth!r}")
 
+        # Refuse to start half-configured rather than failing at the first login.
+        # A login route that 500s on the first real user is worse than a service
+        # that will not boot, because the operator is not watching by then.
+        oidc_issuer = (os.environ.get("XHC_OIDC_ISSUER") or "").strip().rstrip("/") or None
+        if oidc_issuer:
+            missing = [
+                name
+                for name, value in (
+                    ("XHC_OIDC_CLIENT_ID", os.environ.get("XHC_OIDC_CLIENT_ID")),
+                    ("XHC_OIDC_CLIENT_SECRET", os.environ.get("XHC_OIDC_CLIENT_SECRET")),
+                    ("XHC_OIDC_REDIRECT_URI", os.environ.get("XHC_OIDC_REDIRECT_URI")),
+                    ("XHC_SESSION_SECRET", os.environ.get("XHC_SESSION_SECRET")),
+                    # Login exists to manage principals and keys; with no store
+                    # there is nowhere to record who logged in, so the first
+                    # admin could never be claimed.
+                    ("XHC_AUTHZ_DB", os.environ.get("XHC_AUTHZ_DB")),
+                )
+                if not (value or "").strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "XHC_OIDC_ISSUER is set, so login is enabled, but "
+                    + ", ".join(missing)
+                    + " is unset. Set them or unset XHC_OIDC_ISSUER."
+                )
+            if not oidc_issuer.startswith("https://"):
+                raise ValueError(
+                    f"XHC_OIDC_ISSUER must be https, got {oidc_issuer!r}: discovery and "
+                    "the token exchange both carry the client secret."
+                )
+
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
         return cls(
@@ -320,6 +387,14 @@ class Settings:
             hf_verify_ingest=_env_bool("XHC_HF_VERIFY", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
             web_root=os.environ.get("XHC_WEB_ROOT") or None,
+            authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
+            oidc_issuer=oidc_issuer,
+            oidc_client_id=os.environ.get("XHC_OIDC_CLIENT_ID") or None,
+            oidc_client_secret=os.environ.get("XHC_OIDC_CLIENT_SECRET") or None,
+            oidc_redirect_uri=os.environ.get("XHC_OIDC_REDIRECT_URI") or None,
+            oidc_scopes=os.environ.get("XHC_OIDC_SCOPES", cls.oidc_scopes),
+            session_secret=os.environ.get("XHC_SESSION_SECRET") or None,
+            session_ttl_s=_env_float("XHC_SESSION_TTL", cls.session_ttl_s),
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
             orphan_policy=orphan_policy,
             orphan_check_interval_s=_env_float(
