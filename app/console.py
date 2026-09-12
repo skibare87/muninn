@@ -170,8 +170,9 @@ async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
     if any(r.pattern == "*" for r in parsed):
         raise HTTPException(
             status_code=400,
-            detail='a scope of "*" restricts nothing; send an empty list for no '
-                   "limit, or name the repositories this key is held to",
+            detail='a scope of "*" restricts nothing: in a narrowing it means '
+                   '"narrow to everything". Send an EMPTY list to remove the limit '
+                   "entirely, or name the repositories this key is held to",
         )
     _store().set_key_scope(key.key_id, parsed)
     log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))

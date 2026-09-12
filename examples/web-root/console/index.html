@@ -259,6 +259,20 @@
         sc.appendChild(el('span', 'held', 'tag'));
       }
       sc.appendChild(el('span', ' '));
+      // "No limit" as a BUTTON. Clearing a text box is the absence of an
+      // intention rather than an expression of one, and nobody finds it: the
+      // value a reader types to mean unrestricted is "*", which is refused
+      // because in a narrowing it silently means nothing at all.
+      if ((k.scope || []).length) {
+        sc.appendChild(btn('No limit', 'ghost', function () {
+          if (!confirm('Remove the limit on ' + k.key_id + '?\n\nIt is currently held to:\n  ' +
+                       k.scope.map(ruleLine).join('\n  ') +
+                       '\n\nAfterwards it can do everything your allowlist permits.')) return;
+          api('PUT', '/_console/keys/' + encodeURIComponent(k.key_id) + '/scope', { rules: [] })
+            .then(function () { clearError(); return loadKeys(); }).catch(showError);
+        }));
+        sc.appendChild(el('span', ' '));
+      }
       sc.appendChild(btn('Set', 'ghost', function () {
         var rules = [], bad = null;
         si.value.split(',').forEach(function (item) {
@@ -280,9 +294,9 @@
         // unrestricted value in the ALLOWLIST directly above. Refusing it and
         // naming the alternative is the whole guard.
         if (rules.some(function (r) { return r.pattern === '*'; })) {
-          showError('A scope of "*" would not restrict anything — it means ' +
-                    '"narrow to everything". Leave the field EMPTY for no limit, ' +
-                    'or name the registries this key should be held to.');
+          showError('A scope of "*" would not restrict anything — in a limit it ' +
+                    'means "narrow to everything". Press "No limit" to remove the ' +
+                    'limit, or name the registries this key should be held to.');
           return;
         }
         // Removing a narrowing WIDENS the key. That is the direction that
