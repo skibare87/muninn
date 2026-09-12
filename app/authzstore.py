@@ -170,6 +170,36 @@ class AuthzStore:
             )
             return Principal(subject, email, is_admin=is_admin, disabled=False)
 
+    def create_principal(
+        self, subject: str, email: str = "", is_admin: bool = False
+    ) -> Principal:
+        """Create a principal with an EXPLICIT admin flag. Raises if it exists.
+
+        Distinct from claim_or_get_principal, which is the interactive-login path
+        and carries the first-principal-becomes-admin grant. That grant must not
+        be taken by a machine consumer, and — more subtly — must not be CONSUMED
+        by one: creating a service account through that path on an empty store
+        both makes the service account an admin and denies the grant to the first
+        real person, silently.
+
+        So migration tooling uses this, where the admin flag is a parameter
+        somebody had to type rather than a consequence of ordering.
+        """
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute(
+                "SELECT 1 FROM principals WHERE subject=?", (subject,)
+            ).fetchone():
+                raise KeyError(f"principal already exists: {subject}")
+            c.execute(
+                "INSERT INTO principals(subject,email,is_admin,disabled,created_at)"
+                " VALUES (?,?,?,0,?)",
+                (subject, email, 1 if is_admin else 0, _now()),
+            )
+            c.commit()
+        self._invalidate()
+        return Principal(subject, email, is_admin=is_admin, disabled=False)
+
     def list_principals(self) -> list[Principal]:
         with self._connect() as c:
             return [
