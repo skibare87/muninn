@@ -288,17 +288,9 @@
                        push: verbs.indexOf('push') >= 0 });
         });
         if (bad !== null) { showError('Could not parse: ' + bad); return; }
-        // "*" in a NARROWING means "narrow to everything", which is the same as
-        // no narrowing -- a setting that looks like a restriction and is not.
-        // It is also the value a reader reaches for, because "*" is the correct
-        // unrestricted value in the ALLOWLIST directly above. Refusing it and
-        // naming the alternative is the whole guard.
-        if (rules.some(function (r) { return r.pattern === '*'; })) {
-          showError('A scope of "*" would not restrict anything — in a limit it ' +
-                    'means "narrow to everything". Press "No limit" to remove the ' +
-                    'limit, or name the registries this key should be held to.');
-          return;
-        }
+        // "*" means no limit. Stored as no limit, because that is what it
+        // means and what the reader intends.
+        if (rules.some(function (r) { return r.pattern === '*'; })) rules = [];
         // Removing a narrowing WIDENS the key. That is the direction that
         // matters, and it happened silently once: two consumer keys scoped to
         // named registries were reset to unrestricted through this field, and

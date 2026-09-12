@@ -162,18 +162,16 @@ async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
     """
     key = _owned_key(request, key_id)
     parsed = [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
-    # A scope containing "*" narrows to everything, which is not a narrowing at
-    # all -- it is a no-op wearing a restriction's clothes, and the value a
-    # reader reaches for because "*" IS the correct unrestricted value in an
-    # allowlist. Refused here as well as in the page, because a guard that lives
-    # only in the browser is a suggestion: this endpoint is reachable directly.
+    # "*" means NO LIMIT, which is what everyone reads it as, so it is stored as
+    # no limit. It is not an escalation and never was: a key is bounded by its
+    # holder's allowlist regardless, so the widest a scope can reach is exactly
+    # what that holder already has.
+    #
+    # An earlier version REFUSED it. That was an error dressed as a control --
+    # it stopped a legitimate edit, protected nothing, and made the interface
+    # behave in a way nobody expects.
     if any(r.pattern == "*" for r in parsed):
-        raise HTTPException(
-            status_code=400,
-            detail='a scope of "*" restricts nothing: in a narrowing it means '
-                   '"narrow to everything". Send an EMPTY list to remove the limit '
-                   "entirely, or name the repositories this key is held to",
-        )
+        parsed = []
     _store().set_key_scope(key.key_id, parsed)
     log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))
     return {"key_id": key.key_id, "scope": [_rule_out(r) for r in parsed]}

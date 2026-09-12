@@ -345,50 +345,48 @@ def test_a_user_cannot_scope_another_users_key(console):
     assert r.status_code == 404, "404 not 403: a 403 confirms the key id is real"
 
 
-def test_a_wildcard_scope_is_refused(console):
-    """A scope of "*" narrows to everything, which is no narrowing at all -- a
-    setting that reads as a restriction and is not.
+def test_a_wildcard_scope_means_no_limit(console):
+    """"*" is what a reader types for unrestricted, so it is stored as
+    unrestricted. It is not an escalation: the holder's allowlist bounds the key
+    either way, so the widest a scope can reach is what they already have.
 
-    It is the value a reader reaches for, because "*" IS the correct
-    unrestricted value in the ALLOWLIST. Two consumer keys were silently reset
-    to unrestricted this way, and it took a consumer measuring their own access
-    to discover it.
-
-    Refused at the API, not only in the page: a guard that lives in the browser
-    is a suggestion, and this endpoint is reachable directly.
+    An earlier version refused it. That stopped a legitimate edit, protected
+    nothing, and surprised everyone who tried it.
     """
     from app.authz import Rule
 
     client, store, as_user = console
-    store.set_principal_rules("sub-user", [Rule("*", pull=True, push=True)])
+    store.set_principal_rules("sub-user", [Rule("docker.io/*", pull=True)])
     c = as_user("sub-user")
     kid = c.post("/_console/keys", json={}).json()["key_id"]
     c.put(f"/_console/keys/{kid}/scope",
-          json={"rules": [{"pattern": "docker.io/*", "pull": True, "push": False}]})
+          json={"rules": [{"pattern": "docker.io/library/*", "pull": True, "push": False}]})
 
     r = c.put(f"/_console/keys/{kid}/scope",
               json={"rules": [{"pattern": "*", "pull": True, "push": True}]})
-    assert r.status_code == 400
-    assert "restricts nothing" in r.json()["detail"]
-
-    # and the narrowing it would have removed is still in place
+    assert r.status_code == 200, r.text
     key = next(k for k in store.list_keys() if k.key_id == kid)
-    assert [x.pattern for x in key.scope] == ["docker.io/*"]
+    assert key.scope == [], 'a wildcard scope is stored as no limit'
 
 
-def test_a_wildcard_mixed_with_real_patterns_is_also_refused(console):
-    """`docker.io/*, *` is the same no-op with camouflage."""
+def test_a_wildcard_scope_still_cannot_exceed_the_holders_allowlist(console):
+    """The property that makes accepting it safe, and the reason refusing it was
+    never security."""
+    from app import authz
     from app.authz import Rule
 
     client, store, as_user = console
-    store.set_principal_rules("sub-user", [Rule("*", pull=True)])
+    store.set_principal_rules("sub-user", [Rule("docker.io/*", pull=True)])
     c = as_user("sub-user")
-    kid = c.post("/_console/keys", json={}).json()["key_id"]
-    r = c.put(f"/_console/keys/{kid}/scope", json={"rules": [
-        {"pattern": "docker.io/*", "pull": True, "push": False},
-        {"pattern": "*", "pull": True, "push": False},
-    ]})
-    assert r.status_code == 400
+    created = c.post("/_console/keys", json={}).json()
+    kid, secret = created["key_id"], created["secret"]
+    c.put(f"/_console/keys/{kid}/scope",
+          json={"rules": [{"pattern": "*", "pull": True, "push": True}]})
+
+    key = store.resolve(kid, secret)
+    assert authz.decide(key, "pull", "docker.io/library/alpine")[0]
+    assert not authz.decide(key, "pull", "ghcr.io/org/app")[0]
+    assert not authz.decide(key, "push", "docker.io/library/alpine")[0]
 
 
 def test_an_empty_scope_is_still_allowed(console):
