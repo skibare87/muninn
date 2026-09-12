@@ -194,3 +194,69 @@ def test_the_comment_stripper_does_not_eat_code(script_source: str, script: str)
     ):
         assert must_survive in script, must_survive
     assert "// Self-contained on purpose" not in script, "stripper removed nothing"
+
+
+# ---------------------------------------------------------------------------
+# Brand assets.
+#
+# The web root CLAIMS the paths it holds and falls through to the upstream proxy
+# for the ones it does not. That makes a missing asset invisible in a specific
+# and embarrassing way: a browser asking for /favicon.ico gets HUGGING FACE'S
+# favicon, 200, 200 kB, and every tab wears someone else's identity.
+#
+# The same mechanism makes a typo'd <link href> silent -- the browser gets the
+# upstream's 404 page with a 404 status and simply shows no icon.
+# ---------------------------------------------------------------------------
+
+WEB_ROOT = PAGE.parent
+
+
+def test_a_favicon_is_shipped_at_the_root():
+    """Browsers request /favicon.ico without being told to. If it is absent it
+    is proxied upstream, so this file existing is what stops the tab showing
+    another project's icon."""
+    assert (WEB_ROOT / "favicon.ico").is_file()
+    assert (WEB_ROOT / "apple-touch-icon.png").is_file()
+
+
+def test_every_local_asset_the_page_references_actually_exists(html: str):
+    """A broken reference here does not 404 visibly -- it falls through to the
+    upstream proxy. So the failure looks like 'the icon just does not show up',
+    with nothing in any log pointing at a missing file.
+    """
+    refs = set(re.findall(r'\b(?:src|href|content)\s*=\s*"(/[^"]*)"', html))
+    # Application routes are served by the app, not from the web root.
+    refs = {r for r in refs if not r.startswith(("/_auth", "/_console", "/v2", "/_cache"))}
+    assert refs, "expected the page to reference local assets"
+    missing = sorted(r for r in refs if r != "/" and not (WEB_ROOT / r.lstrip("/")).is_file())
+    assert not missing, f"referenced but absent from the web root: {missing}"
+
+
+def test_the_mark_sits_on_a_paper_surface(html: str):
+    """The mark is ink on transparency. On the dark theme it would vanish into
+    the background, so every place it appears is backed by the palette's paper
+    colour -- which is also what sumi-e actually is."""
+    for cls in ("chip", "art"):
+        # findall, not search: a class legitimately has several rule blocks (a
+        # base one and a media-query override), and search returns whichever
+        # comes first in the file rather than the one that sets the background.
+        blocks = re.findall(rf"\.{cls}\{{[^}}]*\}}", html)
+        assert blocks, cls
+        assert any("var(--paper)" in b for b in blocks), f".{cls} must sit on paper"
+
+
+def test_the_brand_palette_is_the_published_one(html: str):
+    """ink #1C222B, gold #C7A764, paper #E1DED1 -- as published with the mark.
+    A landing page drifting off the kit is how two 'official' palettes start."""
+    root = re.search(r":root\{(.*?)\}", html, re.S)
+    assert root
+    for name, value in (("--ink", "#1C222B"), ("--gold", "#C7A764"), ("--paper", "#E1DED1")):
+        assert f"{name}:{value}" in root.group(1).replace(" ", ""), f"{name} must be {value}"
+
+
+def test_the_page_does_not_ship_a_multi_megabyte_hero():
+    """The originals in images/ are 1-2 MB each. The pre-sized brand icons exist
+    so a homepage does not ship one."""
+    for f in WEB_ROOT.rglob("*"):
+        if f.is_file():
+            assert f.stat().st_size < 200_000, f"{f.name} is {f.stat().st_size} bytes"

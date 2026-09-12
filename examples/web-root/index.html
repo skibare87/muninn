@@ -3,197 +3,320 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Muninn — a pull-through cache for models and containers</title>
-<meta name="description" content="Muninn is a pull-through cache that speaks two protocols: the Hugging Face Hub API and the OCI registry API. Fetch once, serve many.">
+<title>Muninn — fetch it once, serve it everywhere</title>
+<meta name="description" content="A pull-through cache that speaks two protocols — the Hugging Face Hub API and the OCI registry API. Model weights and container images cross your uplink once instead of once per machine.">
+
+<!-- Icons are served from THIS host on purpose. Anything absent from the web
+     root falls through to the upstream proxy, so a missing favicon means every
+     browser tab quietly wears Hugging Face's icon. -->
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64">
+<link rel="icon" type="image/png" sizes="32x32" href="/_brand/muninn-icon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/_brand/muninn-icon-64.png">
+<link rel="icon" type="image/png" sizes="128x128" href="/_brand/muninn-icon-128.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#1C222B">
+<!-- Social preview. Crawlers want an ABSOLUTE url here; set it to your own host
+     when you deploy this, or the card renders without an image. -->
+<meta property="og:title" content="Muninn — fetch it once, serve it everywhere">
+<meta property="og:description" content="One pull-through cache for model weights and container images.">
+<meta property="og:image" content="/_brand/muninn-banner-plain.png">
+
 <style>
+  /* Brand palette, as published with the mark:
+       ink #1C222B   gold #C7A764   paper #E1DED1                       */
   :root{
-    --bg:#fbfaf8; --fg:#1b1a18; --muted:#5d5a54; --rule:#e4e0d8;
-    --card:#fff; --accent:#7a5c2e; --code-bg:#f3f0ea; --shadow:0 1px 2px rgba(0,0,0,.04);
+    --ink:#1C222B; --gold:#C7A764; --paper:#E1DED1;
+    --bg:var(--paper); --fg:var(--ink);
+    --muted:#5a6472; --rule:#cbc7b8; --panel:#ebe8de; --card:#f3f1e9;
+    --code-bg:#e6e2d6; --shadow:0 1px 2px rgba(28,34,43,.07);
+    --ink-on-accent:var(--ink);
   }
   @media (prefers-color-scheme:dark){
     :root{
-      --bg:#16150f; --fg:#ece8df; --muted:#a8a294; --rule:#2e2c24;
-      --card:#1d1c15; --accent:#d8b26a; --code-bg:#222018; --shadow:none;
+      --bg:#12171e; --fg:var(--paper);
+      --muted:#9aa5b4; --rule:#2a323d; --panel:#1a2029; --card:#1a2029;
+      --code-bg:#161c24; --shadow:none;
     }
   }
   *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
   body{
     margin:0;background:var(--bg);color:var(--fg);
-    font:16px/1.65 ui-serif,Georgia,"Iowan Old Style",Palatino,serif;
+    font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
     -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:53rem;margin:0 auto;padding:0 1.5rem}
-  header{border-bottom:1px solid var(--rule);padding:4.5rem 0 3rem}
-  .mark{
-    font:600 .78rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.16em;
-    text-transform:uppercase;color:var(--accent);margin:0 0 1.1rem
+  .wrap{max-width:64rem;margin:0 auto;padding:0 1.5rem}
+  .narrow{max-width:44rem}
+
+  /* --- nav ---------------------------------------------------------- */
+  nav{border-bottom:1px solid var(--rule)}
+  nav .wrap{display:flex;align-items:center;gap:1rem;padding-top:.9rem;padding-bottom:.9rem}
+  .brandmark{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:inherit;margin-right:auto}
+  /* The mark is ink on transparent, so it needs paper under it or it vanishes
+     on the dark theme. Ink on paper is also what sumi-e actually is. */
+  .chip{
+    width:34px;height:34px;border-radius:9px;background:var(--paper);
+    display:grid;place-items:center;flex:none
   }
-  h1{font-size:clamp(2.1rem,5.5vw,3.1rem);line-height:1.12;margin:0 0 1rem;font-weight:600;letter-spacing:-.015em}
-  .lede{font-size:1.2rem;color:var(--muted);margin:0;max-width:40rem}
+  .chip img{width:26px;height:26px;display:block}
+  .wordmark{
+    font-weight:800;letter-spacing:.18em;text-transform:uppercase;font-size:.95rem
+  }
+
+  /* --- hero --------------------------------------------------------- */
+  header{padding:5rem 0 3.5rem;position:relative;overflow:hidden}
+  .hero{display:grid;grid-template-columns:1fr auto;gap:3rem;align-items:center}
+  @media (max-width:760px){
+    .hero{grid-template-columns:1fr}
+    .hero .art{order:-1;justify-self:start}
+  }
+  .eyebrow{
+    font-weight:700;letter-spacing:.2em;text-transform:uppercase;
+    font-size:.72rem;color:var(--gold);margin:0 0 1.2rem
+  }
+  h1{
+    font-size:clamp(2.4rem,6vw,4rem);line-height:1.04;margin:0 0 1.2rem;
+    font-weight:800;letter-spacing:-.02em
+  }
+  h1 em{font-style:normal;color:var(--gold)}
+  .lede{font-size:1.2rem;color:var(--muted);margin:0;max-width:34rem}
+  .art{
+    width:clamp(160px,26vw,240px);aspect-ratio:1;border-radius:26px;
+    background:var(--paper);display:grid;place-items:center;
+    box-shadow:0 10px 40px rgba(28,34,43,.18)
+  }
+  .art img{width:78%;height:78%;object-fit:contain;display:block}
+
+  .cta{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:2rem}
+  .btn{
+    font:600 .9rem/1 ui-sans-serif,system-ui,sans-serif;cursor:pointer;
+    background:var(--gold);color:var(--ink);border:1px solid var(--gold);
+    border-radius:8px;padding:.8rem 1.3rem;text-decoration:none;display:inline-block
+  }
+  .btn:hover{filter:brightness(1.07);color:var(--ink)}
+  .btn.ghost{background:none;color:var(--fg);border-color:var(--rule)}
+  .btn.ghost:hover{border-color:var(--gold);color:var(--gold);filter:none}
+  .btn.small{font-size:.8rem;padding:.45rem .8rem}
+
+  /* --- sections ------------------------------------------------------ */
+  section{padding:3.5rem 0;border-top:1px solid var(--rule)}
   h2{
-    font:600 .8rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.15em;
-    text-transform:uppercase;color:var(--accent);margin:3.6rem 0 1.1rem
+    font:800 .78rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--gold);margin:0 0 1.4rem
   }
-  h3{font-size:1.12rem;margin:2rem 0 .5rem;font-weight:600}
-  p{margin:0 0 1.1rem;max-width:40rem}
+  h3{font-size:1.45rem;margin:0 0 .8rem;font-weight:700;letter-spacing:-.01em}
+  p{margin:0 0 1.1rem;max-width:44rem}
   .muted{color:var(--muted)}
+  a{color:var(--gold);text-underline-offset:3px}
+
   code,pre{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace}
-  code{background:var(--code-bg);padding:.12em .38em;border-radius:3px;font-size:.9em}
+  code{background:var(--code-bg);padding:.14em .4em;border-radius:4px;font-size:.88em}
   pre{
-    background:var(--card);border:1px solid var(--rule);border-radius:8px;
-    padding:1rem 1.15rem;overflow-x:auto;font-size:.875rem;line-height:1.7;
+    background:var(--card);border:1px solid var(--rule);border-radius:10px;
+    padding:1.1rem 1.25rem;overflow-x:auto;font-size:.86rem;line-height:1.75;
     box-shadow:var(--shadow)
   }
   pre code{background:none;padding:0;font-size:inherit}
   .cmt{color:var(--muted)}
-  .grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));margin:1.4rem 0}
-  .card{background:var(--card);border:1px solid var(--rule);border-radius:8px;padding:1.15rem 1.25rem;box-shadow:var(--shadow)}
-  .card h4{margin:0 0 .4rem;font-size:1rem;font-weight:600}
-  .card p{margin:0;font-size:.93rem;color:var(--muted)}
-  .note{border-left:2px solid var(--accent);padding:.1rem 0 .1rem 1.1rem;margin:1.5rem 0;color:var(--muted)}
-  footer{border-top:1px solid var(--rule);margin-top:4.5rem;padding:2rem 0 3.5rem;color:var(--muted);font-size:.9rem}
-  a{color:inherit;text-decoration-color:var(--accent);text-underline-offset:3px}
-  a:hover{color:var(--accent)}
-  .kicker{font:600 .75rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
-  /* --- login and key management ------------------------------------- */
-  .btn{
-    font:600 .85rem/1 ui-sans-serif,system-ui,sans-serif;cursor:pointer;
-    background:var(--accent);color:var(--bg);border:1px solid var(--accent);
-    border-radius:6px;padding:.6rem 1.05rem;text-decoration:none;display:inline-block
+  .gold{color:var(--gold)}
+
+  .grid{display:grid;gap:1.1rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));margin:1.6rem 0}
+  .card{
+    background:var(--card);border:1px solid var(--rule);border-radius:12px;
+    padding:1.4rem;box-shadow:var(--shadow)
   }
-  .btn:hover{opacity:.88;color:var(--bg)}
-  .btn.ghost{background:none;color:var(--fg);border-color:var(--rule)}
-  .btn.ghost:hover{color:var(--accent);border-color:var(--accent)}
-  .btn.small{font-size:.78rem;padding:.35rem .7rem}
+  .card h4{margin:0 0 .5rem;font-size:1.02rem;font-weight:700}
+  .card p{margin:0;font-size:.94rem;color:var(--muted)}
+  .num{
+    font-weight:800;font-size:1.9rem;letter-spacing:-.02em;color:var(--gold);
+    display:block;margin-bottom:.2rem;line-height:1
+  }
+  .note{
+    border-left:3px solid var(--gold);padding:.2rem 0 .2rem 1.2rem;
+    margin:1.6rem 0;color:var(--muted)
+  }
+  footer{border-top:1px solid var(--rule);padding:2.5rem 0 4rem;color:var(--muted);font-size:.9rem}
+  .kicker{font:700 .72rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+
+  /* --- login + console ----------------------------------------------- */
   .who{
-    font:.85rem/1.5 ui-sans-serif,system-ui,sans-serif;color:var(--muted);
-    display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;margin-top:1.6rem
+    font-size:.88rem;color:var(--muted);
+    display:flex;gap:.8rem;align-items:center;flex-wrap:wrap
   }
   .tag{
-    font:600 .68rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;
-    text-transform:uppercase;border:1px solid var(--accent);color:var(--accent);
-    border-radius:99px;padding:.24rem .55rem
+    font:700 .65rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.1em;
+    text-transform:uppercase;border:1px solid var(--gold);color:var(--gold);
+    border-radius:99px;padding:.26rem .55rem
   }
-  table.keys{width:100%;border-collapse:collapse;font:.88rem/1.5 ui-sans-serif,system-ui,sans-serif;margin:1rem 0}
+  table.keys{width:100%;border-collapse:collapse;font-size:.9rem;margin:1.1rem 0}
   table.keys th{
-    text-align:left;font:600 .7rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.09em;
-    text-transform:uppercase;color:var(--muted);padding:.5rem .6rem;border-bottom:1px solid var(--rule)
+    text-align:left;font:700 .68rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted);padding:.55rem .6rem;border-bottom:1px solid var(--rule)
   }
-  table.keys td{padding:.6rem;border-bottom:1px solid var(--rule);vertical-align:top}
-  table.keys td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
-  .reveal{
-    background:var(--code-bg);border:1px solid var(--accent);border-radius:8px;
-    padding:1rem 1.15rem;margin:1.2rem 0
+  table.keys td{padding:.65rem .6rem;border-bottom:1px solid var(--rule);vertical-align:top}
+  table.keys td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem}
+  .reveal{background:var(--card);border:1px solid var(--gold);border-radius:12px;padding:1.2rem;margin:1.3rem 0}
+  .reveal code{background:none;padding:0;word-break:break-all}
+  input.txt,textarea.txt{
+    font:.9rem ui-sans-serif,system-ui,sans-serif;padding:.55rem .7rem;
+    border:1px solid var(--rule);border-radius:8px;background:var(--bg);color:var(--fg)
   }
-  .reveal code{background:none;padding:0;word-break:break-all;font-size:.9rem}
-  input.txt{
-    font:.88rem ui-sans-serif,system-ui,sans-serif;padding:.5rem .65rem;
-    border:1px solid var(--rule);border-radius:6px;background:var(--card);color:var(--fg)
-  }
-  .rules{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem}
-  .warn{color:var(--accent);font-weight:600}
+  .rules{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+  .warn{color:var(--gold);font-weight:700}
   .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:1rem 0}
 </style>
 </head>
 <body>
-<header>
+
+<nav>
   <div class="wrap">
-    <p class="mark">Muninn</p>
-    <h1>Fetch it once.<br>Serve it everywhere.</h1>
-    <p class="lede">A pull-through cache that speaks two protocols — the Hugging Face Hub API and the OCI registry API — so model weights and container images cross your uplink once instead of once per machine.</p>
-    <!-- Hidden until /_auth/me says a login exists. A deployment with no
-         identity provider configured shows no sign-in button, rather than one
-         that leads to a 404. -->
+    <a class="brandmark" href="/">
+      <span class="chip"><img src="/_brand/muninn-icon-128.png" alt=""></span>
+      <span class="wordmark">Muninn</span>
+    </a>
     <div class="who" id="who" hidden></div>
+  </div>
+</nav>
+
+<header>
+  <div class="wrap hero">
+    <div>
+      <p class="eyebrow">Pull-through cache</p>
+      <h1>Fetch it once.<br><em>Serve it everywhere.</em></h1>
+      <p class="lede">Model weights and container images cross your uplink <strong>once</strong> — not once per machine. One cache, two protocols, no changes to your code.</p>
+      <div class="cta">
+        <a class="btn" href="#start">Get started</a>
+        <a class="btn ghost" href="https://github.com/skibare87/muninn">View on GitHub</a>
+      </div>
+    </div>
+    <div class="art"><img src="/_brand/muninn-icon-512.png" alt="Muninn"></div>
   </div>
 </header>
 
-<main class="wrap">
+<main>
 
-  <h2>What it does</h2>
-  <p>Point a client at Muninn instead of at the upstream. The first request fetches from upstream and keeps a copy; every request after that is served from local disk. Nothing is rewritten, so checksums and signatures still verify at the client exactly as they would have upstream.</p>
-
-  <div class="grid">
-    <div class="card">
-      <h4>Two protocols, one service</h4>
-      <p>Hugging Face file and metadata traffic, and the full OCI registry pull surface. The same host answers both.</p>
+<section>
+  <div class="wrap">
+    <h2>The problem</h2>
+    <h3>Ten machines pulling the same 40&nbsp;GB model is forty times the bandwidth and none of the benefit.</h3>
+    <p class="muted">Every node re-downloads the same weights. Every CI runner re-pulls the same base image. The bytes are identical, the uplink is not free, and the second machine waits exactly as long as the first.</p>
+    <div class="grid">
+      <div class="card">
+        <h4>One fetch, shared live</h4>
+        <p>Concurrent requests for the same file share a single upstream download — later arrivals stream from the partial file as it lands rather than queueing behind it.</p>
+      </div>
+      <div class="card">
+        <h4>Local disk speed</h4>
+        <p>A cached hit is served off local storage. No round trip, no rate limit, no dependency on anyone else's uptime.</p>
+      </div>
+      <div class="card">
+        <h4>Nothing to rewrite</h4>
+        <p>Point an environment variable at the cache, or prefix an image name. Your training scripts and Dockerfiles stay as they are.</p>
+      </div>
     </div>
-    <div class="card">
-      <h4>Any upstream, by path</h4>
-      <p>Registries are addressed by prefix rather than configured one at a time. No mirror entry per registry.</p>
-    </div>
-    <div class="card">
-      <h4>Bytes pass through unaltered</h4>
-      <p>Muninn is a cache, not a rewriter. Image signatures and file digests keep verifying at the client.</p>
-    </div>
-  </div>
-
-  <h2>Containers</h2>
-  <p>The first path component names the upstream registry. That is the whole configuration:</p>
-<pre><code><span class="cmt"># instead of docker.io/library/redis:7</span>
-docker pull ravencache.io/docker.io/library/redis:7
-
-<span class="cmt"># any registry, same shape</span>
-docker pull ravencache.io/ghcr.io/some/project:v2
-docker pull ravencache.io/quay.io/other/tool:latest</code></pre>
-  <p class="muted">Because the upstream is part of the reference, adding a registry needs no change on the cache and no change to a daemon config. A reference is self-describing: you can see what it pulls and where it came from.</p>
-
-  <h2>Models and datasets</h2>
-  <p>Set one environment variable and the Hugging Face libraries do the rest:</p>
-<pre><code>export HF_ENDPOINT=https://ravencache.io
-
-<span class="cmt"># unchanged code, now served from cache</span>
-python -c "from huggingface_hub import snapshot_download;
-           snapshot_download('openai-community/gpt2')"</code></pre>
-  <p class="muted">Metadata is proxied; file bytes are intercepted and cached. The second machine to ask for a checkpoint reads it off local disk at NVMe speed rather than pulling it again.</p>
-
-  <h2>Why bother</h2>
-  <h3>The uplink is the bottleneck, not the disk</h3>
-  <p>A cluster of machines pulling the same multi-gigabyte checkpoint pays for it once per machine. A cache turns that into once, total — and every subsequent read is local, which is faster than any CDN can be.</p>
-
-  <h3>Upstream is not forever</h3>
-  <p>Repositories get renamed, gated, or removed. A cache that already holds the bytes keeps working. Muninn can be configured to retain content whose upstream has disappeared, which makes it a reproducibility archive rather than just an accelerator.</p>
-
-  <h3>Ingested bytes are verified</h3>
-  <p>Content is hashed on the way in and refused when it does not match the digest it was fetched under — on both protocols. A corrupt or truncated response is rejected rather than cached and re-served forever.</p>
-  <div class="note">
-    <p style="margin:0">Verification covers <em>ingest</em>. It says nothing about bytes that were already on disk before it was enabled — a distinction worth keeping, because a green counter that silently means “nothing was checked” is worse than no counter at all.</p>
-  </div>
-
-  <h2>What it is not</h2>
-  <p>Muninn is a cache, not a registry and not a mirror. It does not host content of its own, does not rewrite manifests, and does not try to be the source of truth for anything. Where a request cannot be served from cache, it is a proxy to the real upstream and nothing more.</p>
-  <p>Access control is deliberately simple: a credential is a key to the gate, not a per-user scope. Anyone who can authenticate can read anything the cache holds. That is the right model for a shared team cache and the wrong one for multi-tenant isolation, and it is stated here rather than discovered later.</p>
-
-  <h2>Open source</h2>
-  <p>Muninn is MIT licensed and developed in the open at <a href="https://github.com/skibare87/muninn">github.com/skibare87/muninn</a> — including the parts that went wrong. The README documents the traps, the measurements behind each default, and the failures that produced them.</p>
-
-</main>
-
-<section class="wrap" id="console" hidden>
-  <h2>Your credentials</h2>
-  <p class="muted">A credential is a key id and a secret, used as the username and password of a <code>docker login</code>. What a key may do is set by an administrator, not by you — so a key you have just created may need an allowlist before it can pull anything.</p>
-
-  <div id="allowlist-mine"></div>
-
-  <div class="row">
-    <input class="txt" id="new-label" placeholder="label, e.g. ci-runner" maxlength="80">
-    <button class="btn small" id="new-key">Create a key</button>
-  </div>
-
-  <div class="reveal" id="reveal" hidden></div>
-  <div id="keys"></div>
-
-  <div id="admin" hidden>
-    <h2>Users</h2>
-    <p class="muted">An allowlist is a list of patterns, each granting pull, push, or both. <code>*</code> matches anything, including slashes, so a single <code>*</code> with both boxes ticked is unrestricted access. Patterns match <code>upstream/repository</code> — never the tag — so <code>docker.io/library/*</code> covers every tag of every official image.</p>
-    <div id="users"></div>
   </div>
 </section>
 
-<footer class="wrap">
-  <p class="kicker">ravencache.io</p>
-  <p style="margin:.5rem 0 0">A Muninn instance. Credentials are required for registry access — if you need one, ask whoever pointed you here.</p>
+<section id="start">
+  <div class="wrap">
+    <h2>Containers</h2>
+    <p>Put the registry in the path. The reference says where it came from, so adding a registry needs no change here and no daemon configuration on your side.</p>
+<pre><code><span class="cmt"># instead of docker.io/library/redis:7</span>
+docker pull <span class="gold">cache.example.com</span>/docker.io/library/redis:7
+
+<span class="cmt"># any registry, same shape</span>
+docker pull <span class="gold">cache.example.com</span>/ghcr.io/your-org/api:v2
+docker pull <span class="gold">cache.example.com</span>/quay.io/prometheus/busybox:latest</code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Models and datasets</h2>
+    <p>One environment variable. Metadata is proxied; file bytes are intercepted and cached, so the second machine to want a checkpoint reads it off local disk.</p>
+<pre><code><span class="cmt"># unchanged code, now served from cache</span>
+export HF_ENDPOINT=<span class="gold">https://cache.example.com</span>
+
+python -c "from huggingface_hub import snapshot_download;
+           snapshot_download('meta-llama/Llama-3.1-8B')"</code></pre>
+    <div class="note">Muninn ingests from the Hub using its native transfer protocol — parallel range requests — and serves your LAN plain HTTP. A normal reverse proxy cannot do this: its upstream leg inherits the client's protocol, and forcing the cacheable path collapses the download to a single slow stream.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Built for the boring parts</h2>
+    <div class="grid">
+      <div class="card">
+        <h4>Integrity, not optimism</h4>
+        <p>Container blobs are digest-verified before they are kept. Corrupt bytes are discarded rather than cached and served forever.</p>
+      </div>
+      <div class="card">
+        <h4>Eviction that knows better</h4>
+        <p>Least-recently-used, except for repositories deleted upstream — evicting a live one costs a re-download, evicting a vanished one destroys the last copy.</p>
+      </div>
+      <div class="card">
+        <h4>Per-key authorisation</h4>
+        <p>Credentials are keys with rules. A key can be allowed to pull one registry and nothing else, and revoking it takes effect on the next request.</p>
+      </div>
+      <div class="card">
+        <h4>Runs where your data is</h4>
+        <p>A single container with a volume. No control plane, no external dependencies, no phone-home.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="account">
+  <div class="wrap">
+    <h2>Your credentials</h2>
+    <!-- hidden until /_auth/me confirms a login exists AND you are not in
+         it. Visible by default would promise a sign-in button to deployments
+         that have no identity provider configured. -->
+    <div id="signed-out" hidden>
+      <p class="muted">Sign in to create and revoke your own cache credentials. Nobody needs shell access on the cache to rotate a key.</p>
+    </div>
+
+    <div id="console" hidden>
+      <p class="muted">A credential is a key id and a secret, used as the username and password of a <code>docker login</code>. What a key may do is set by an administrator — so a key you have just created may need an allowlist before it can pull.</p>
+
+      <div id="allowlist-mine"></div>
+
+      <div class="row">
+        <input class="txt" id="new-label" placeholder="label, e.g. ci-runner" maxlength="80">
+        <button class="btn small" id="new-key">Create a key</button>
+      </div>
+
+      <div class="reveal" id="reveal" hidden></div>
+      <div id="keys"></div>
+
+      <div id="admin" hidden>
+        <h2 style="margin-top:2.6rem">Users</h2>
+        <p class="muted">An allowlist is a list of patterns, each granting pull, push, or both. <code>*</code> matches anything including slashes, so a single <code>*</code> with both boxes ticked is unrestricted. Patterns match <code>upstream/repository</code> — never the tag — so <code>docker.io/library/*</code> covers every tag of every official image.</p>
+        <div id="users"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap narrow">
+    <h2>What it is not</h2>
+    <p class="muted">A cache is shared storage, not a security boundary. Everyone whose key permits a path is served whatever is cached there — Muninn does not re-check entitlement with the upstream registry on a hit, because on a hit it never contacts the upstream at all. If two tenants must not read each other's private images, give them separate caches.</p>
+    <p class="muted">It is also not a mirror. Nothing is pre-populated and nothing is guaranteed to still be here; it holds what has been asked for, and evicts under pressure.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="kicker">Muninn</p>
+    <p>Odin's raven of memory — which is what a cache is. Open source under the MIT licence.<br>
+    <a href="https://github.com/skibare87/muninn">github.com/skibare87/muninn</a></p>
+  </div>
 </footer>
+
 <script>
 // Self-contained on purpose: no framework, no CDN, nothing this page does not
 // serve itself. A cache that exists to stop machines reaching the internet
@@ -239,10 +362,9 @@ python -c "from huggingface_hub import snapshot_download;
     if (!me || !me.login_enabled) return;            // no provider -> no button
     who.hidden = false;
     if (!me.authenticated) {
-      var a = el('a', 'Sign in', 'btn');
+      var a = el('a', 'Sign in', 'btn small');
       a.href = '/_auth/login';
       who.appendChild(a);
-      who.appendChild(el('span', 'Sign in to manage your cache credentials.'));
       return;
     }
     who.appendChild(el('span', me.email || 'signed in'));
@@ -275,7 +397,7 @@ python -c "from huggingface_hub import snapshot_download;
       p.appendChild(el('span', 'Ask an administrator to set one.'));
       al.appendChild(p);
     } else {
-      var box = el('p', null, 'note');
+      var box = el('div', null, 'note');
       box.appendChild(el('strong', 'Your allowlist'));
       var ul = el('ul', null, 'rules');
       data.allowlist.forEach(function (r) { ul.appendChild(el('li', ruleText(r))); });
@@ -396,13 +518,11 @@ python -c "from huggingface_hub import snapshot_download;
         r.textContent = '';
         r.appendChild(el('p', k.warning, 'warn'));
         var pre = el('pre');
-        var code = el('code', 'key id:  ' + k.key_id + '\nsecret:  ' + k.secret);
-        pre.appendChild(code);
+        pre.appendChild(el('code', 'key id:  ' + k.key_id + '\nsecret:  ' + k.secret));
         r.appendChild(pre);
         r.appendChild(el('p', 'To use it — this prompts for the secret, so it does not land in your shell history:', 'muted'));
         var pre2 = el('pre');
-        pre2.appendChild(el('code',
-          'docker login ' + location.host + ' -u ' + k.key_id));
+        pre2.appendChild(el('code', 'docker login ' + location.host + ' -u ' + k.key_id));
         r.appendChild(pre2);
         return loadKeys();
       })
@@ -415,6 +535,8 @@ python -c "from huggingface_hub import snapshot_download;
       renderWho();
       $('console').hidden = !me.authenticated;
       $('admin').hidden = !me.is_admin;
+      var out = $('signed-out');
+      if (out) out.hidden = !(me.login_enabled && !me.authenticated);
       if (me.authenticated) loadKeys();
       if (me.is_admin) loadUsers();
     }).catch(function () {
