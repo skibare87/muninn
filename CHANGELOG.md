@@ -9,6 +9,29 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.12 — 2026-09-12
+
+v0.9.12 -- a key scope of "*" is refused
+
+"*" is the correct unrestricted value in an ALLOWLIST. In a key SCOPE, which is
+a narrowing, it means "narrow to everything" -- a no-op that reads as a
+restriction and leaves the row looking configured.
+
+So the value a reader reaches for is the one that silently removes the
+protection. That happened: two consumer keys scoped to named registries were
+reset to unrestricted through the console, and it was found by a consumer
+measuring their own access and reporting that they could reach a private
+registry their scope excluded.
+
+Refused now at the API and in the page, including when mixed with real patterns.
+An empty list is still accepted -- the guard is against a wildcard PRETENDING to
+be a narrowing, not against widening on purpose, which now asks for confirmation
+and names what it is removing.
+
+Anyone exposing the console to people who also administer allowlists should
+upgrade. The failure is silent and in the permissive direction.
+
+
 ## v0.9.11 — 2026-09-12
 
 v0.9.11 -- key rules narrow instead of widening
