@@ -9,6 +9,75 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.8 — 2026-09-12
+
+v0.9.8 -- per-key authorization gains a browser front end, and three holes behind it
+
+Muninn can now be run as a SHARED cache: a credential is a key with rules
+rather than a line in a flat htpasswd, users manage their own keys through a
+login on the cache's own homepage, and an administrator decides what each
+user's keys may do.
+
+All of it is opt-in and unset by default. A deployment that upgrades to this
+release and changes no environment variables behaves exactly as before: no
+login routes are mounted, no management surface exists, and client auth is the
+same htpasswd gate.
+
+  XHC_AUTHZ_DB       per-key push/pull authorisation (SQLite: principals, keys, rules)
+  XHC_OIDC_ISSUER    browser login; requires client id, secret, redirect URI,
+                     session secret and XHC_AUTHZ_DB, and REFUSES TO START without them
+  XHC_METRICS_AUTH   `token` gates /metrics behind XHC_MANAGE_TOKEN
+  XHC_WEB_ROOT       serve a homepage from the same hostname as the cache
+
+Rules are patterns over <upstream>/<repository>, allow-only, no precedence, and
+an empty list grants nothing. `*` spans `/`, so a single `*` with both verbs is
+unrestricted. Patterns never match the tag.
+
+THE PART WORTH READING: three defects this release fixes, none of which
+produced an error, a log line or a failing test before it was looked for.
+
+1. A DISABLED CREDENTIAL COULD STILL LOG IN. Authorisation refused a disabled
+   key for every operation naming a repository, so pulls and pushes were never
+   at risk -- but /v2/ names no repository, never reaches that check, and is
+   the endpoint `docker login` calls. A revoked user got "Login Succeeded" and
+   learned about the revocation on their next pull. Authentication now refuses
+   a disabled key or a disabled principal.
+
+2. AN UPLOAD SESSION WAS NOT BOUND TO THE KEY THAT OPENED IT. A push is four
+   requests and only the first is authorised against a repository; the PATCH
+   and PUT that follow carry a session uuid and write to the repository the
+   SESSION names. Any authenticated caller who learned a uuid could finish
+   someone else's upload into a repository they had been refused. Sessions now
+   record their opener, and a mismatch is reported identically to a uuid that
+   does not exist.
+
+3. A REVOCATION COULD SUCCEED WITHOUT REVOKING ANYTHING. Disabling a principal
+   ran a bare UPDATE, so a mistyped subject returned success having changed no
+   rows -- the operator's evidence that a revocation happened was a 200 from a
+   statement that touched nothing.
+
+Each was found by a test asserting the effect ON THE WIRE rather than the
+management API's own response. Asserting the response would have been green for
+all three, and would have been testing that a write happened rather than that
+the thing it claims stopped working actually stopped.
+
+Documentation changed WITH the code, which is the point: the README previously
+argued per-client authorization was impossible here, with a correct argument
+about an implementation that no longer holds. The replacement leads with the
+LIMITS, because the feature overstates itself without them -- it covers /v2
+only and not the Hugging Face path, and allowing a path grants whatever is
+already cached under it, because the cache holds no per-tenant copies and never
+contacts the upstream on a hit. One Muninn does not separate tenants who must
+not read each other's private images.
+
+The example homepage ships a login button and a key-management console, with no
+framework and no CDN: a cache that exists so machines need not reach the
+internet should not need the internet to draw its own homepage, and on a public
+hostname every external subresource is a third party collecting visitor IPs.
+Eight guards over that page were each made to go red deliberately before being
+kept.
+
+
 ## v0.9.7 — 2026-09-12
 
 XHC_WEB_ROOT -- one hostname can be a homepage AND a cache.
