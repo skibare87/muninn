@@ -331,6 +331,40 @@ is a derived number and inherits their units: an earlier version of this line
 said 8.8×, which divided MiB/s by MB/s.
 Verify it on your own hardware before assuming it holds on yours.
 
+### One hostname as a homepage and a cache
+
+`XHC_WEB_ROOT=/srv/www` serves static files at `/`. Unset by default, so nothing
+changes for an existing deployment.
+
+**Why this is in Muninn rather than in a reverse proxy.** The OCI surface is
+bounded under `/v2` by spec, so a proxy *can* split docker traffic from a
+homepage. It cannot split the Hugging Face surface: HF clients construct
+arbitrary top-level paths like `/owner/repo/resolve/main/config.json`, so there is
+no prefix to match on. Muninn already knows which paths are HF paths, so the
+discriminator is a **precedence rule** rather than a pattern:
+
+> **If a file exists under the web root, serve it. Otherwise fall through to
+> Hugging Face.**
+
+**That makes the web root's contents a claim on those paths.** A directory named
+`models/` or `datasets/` in there would silently shadow real HF traffic, and the
+symptom would be *"the cache stopped working"* rather than *"a file was served"*.
+Keep it to a homepage and its assets.
+
+It cannot shadow `/v2`, `/healthz`, `/metrics` or `/_cache` — those routers are
+mounted before the HF catch-all, so they win by ordering. That ordering is now
+load-bearing for a security property and is pinned by a test.
+
+**Containment is enforced by resolving the path, not by comparing strings.** A
+prefix check on the raw request path is the classic bypass: `..` and symlinks both
+defeat it. The candidate is fully resolved and then tested for containment, so a
+symlink pointing out of the root fails the same check as `../../etc/passwd`. A
+configured-but-missing root logs a warning and serves nothing rather than raising
+— a typo in one setting should not take down a cache whose main job is unrelated.
+
+**It is unauthenticated by design.** The client-auth gate is on `/v2` only. A
+homepage is public; do not put anything there that is not.
+
 ## Two request headers: prewarm, and local-only
 
 Both are opt-in headers on the ordinary resolve path. **No management token, no
@@ -1173,6 +1207,7 @@ experiments age out.
 | `XHC_MISS_POLICY` | `stream` | `stream` \| `redirect` \| `wait` |
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
 | `XHC_HF_VERIFY` | `1` | hash each ingested HF file against its ETag and refuse a mismatch |
+| `XHC_WEB_ROOT` | *(unset)* | serve static files at `/` so one hostname is a homepage **and** a cache |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |

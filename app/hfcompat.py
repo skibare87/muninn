@@ -18,7 +18,13 @@ from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
@@ -401,11 +407,76 @@ def _cache_headers(commit: str, etag: str | None, extra: dict | None = None) -> 
     return hdrs
 
 
+
+def _web_root_file(full_path: str) -> Path | None:
+    """Resolve a request path inside XHC_WEB_ROOT, or None.
+
+    Returns None when no web root is configured, when nothing exists at that
+    path, or when the path escapes the root. The caller falls through to Hugging
+    Face on None, which is what lets one hostname serve a homepage AND a cache.
+
+    CONTAINMENT IS ENFORCED BY RESOLUTION, NOT BY STRING COMPARISON. `..` and
+    symlinks both escape a prefix check on the raw path -- that is the classic
+    bypass -- so the candidate is fully resolved and then tested for containment
+    against the resolved root. A symlink out of the root fails the same test as
+    `../../etc/passwd`, without needing to be special-cased.
+
+    An empty path is index.html, and so is a directory, because that is what a
+    browser asking for "/" means.
+    """
+    root_cfg = settings.web_root
+    if not root_cfg:
+        return None
+    try:
+        root = Path(root_cfg).resolve(strict=True)
+    except OSError:
+        # A configured-but-missing web root is a misconfiguration, not a reason
+        # to start serving HF for the homepage. Say so once per request rather
+        # than failing the request: the cache still works.
+        log.warning("XHC_WEB_ROOT=%s does not exist; serving nothing from it", root_cfg)
+        return None
+
+    rel = full_path.strip("/")
+    candidate = root / rel if rel else root
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+
+    if resolved != root and root not in resolved.parents:
+        log.warning("web root traversal refused: %r resolved outside %s", full_path, root)
+        return None
+
+    if resolved.is_dir():
+        index = resolved / "index.html"
+        if not index.is_file():
+            return None
+        try:
+            index = index.resolve(strict=True)
+        except OSError:
+            return None
+        if root not in index.parents:
+            return None
+        return index
+    return resolved if resolved.is_file() else None
+
+
 @router.api_route(
     "/{full_path:path}",
     methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
 )
 async def catch_all(full_path: str, request: Request) -> Response:
+    # 0. A static web root, if one is configured, so this hostname can be a
+    #    homepage as well as a cache. Checked FIRST among the catch-all's
+    #    branches because it is the only one keyed on a file existing rather
+    #    than on a path shape -- and it falls through when the file is absent,
+    #    so HF traffic is untouched. /v2, /healthz, /metrics and /_cache never
+    #    reach here: their routers are mounted before this one.
+    if settings.web_root and request.method in ("GET", "HEAD"):
+        served = _web_root_file(full_path)
+        if served is not None:
+            return FileResponse(served)
+
     # 1. Stop clients from negotiating Xet through us. If they got a real
     #    casUrl they would pull bytes straight from HF and the cache would
     #    never see them -- a silent, and very expensive, bypass.

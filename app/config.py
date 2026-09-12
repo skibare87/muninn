@@ -120,6 +120,22 @@ class Settings:
     # casUrl and pull bytes straight from HF, bypassing this cache.
     block_client_xet: bool = True
     ingest_concurrency: int = 4
+    # Serve a static web root at / so one hostname can be a homepage AND a
+    # cache. Unset means the behaviour is exactly as before.
+    #
+    # PRECEDENCE, AND IT IS A LOADED GUN: anything in this directory CLAIMS that
+    # path from Hugging Face. A directory called `models` or `datasets` here
+    # would silently shadow real HF traffic, and the symptom is "the cache
+    # stopped working", not "a file was served". Keep it to a homepage and its
+    # assets.
+    #
+    # It does NOT shadow /v2, /healthz, /metrics or /_cache -- those routers are
+    # mounted before the HF catch-all, so they win by ordering. That ordering is
+    # load-bearing for a security property and is pinned by a test.
+    #
+    # Unauthenticated by design: the client-auth gate is on /v2 only. A homepage
+    # is public; do not put anything here that is not.
+    web_root: str | None = None
     # Hash an ingested HF file against its upstream ETag and REFUSE to keep it
     # on a mismatch, matching what the OCI path already does for blobs.
     #
@@ -303,6 +319,7 @@ class Settings:
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
             hf_verify_ingest=_env_bool("XHC_HF_VERIFY", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
+            web_root=os.environ.get("XHC_WEB_ROOT") or None,
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
             orphan_policy=orphan_policy,
             orphan_check_interval_s=_env_float(
