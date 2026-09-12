@@ -192,3 +192,65 @@ def test_admin_is_stored_not_derived():
     p = Principal(subject="sub-1", email="a@example.com", is_admin=True)
     assert p.is_admin
     assert not Principal(subject="sub-2").is_admin
+
+
+# ---------------------------------------------------------------------------
+# Key scope NARROWS. It used to widen, and that was a design error with a
+# visible symptom: a narrower credential was inexpressible, so every distinct
+# scope needed its own principal, and machine consumers turned up in the user
+# list as if they were people.
+# ---------------------------------------------------------------------------
+
+
+def test_a_scope_narrows_its_holders_grant():
+    k = Key("k", "h", "p",
+            rules=[Rule("*", pull=True, push=True)],
+            scope=[Rule("docker.io/*", pull=True)])
+    assert decide(k, "pull", "docker.io/library/alpine")[0]
+    assert not decide(k, "pull", "ghcr.io/org/app")[0], "the scope must bound it"
+    assert not decide(k, "push", "docker.io/library/alpine")[0], "scope is pull-only"
+
+
+def test_a_scope_CANNOT_widen_its_holders_grant():
+    """The property that makes narrowing safe, and the whole reason to prefer it:
+    a key can never carry authority its holder was not given. Under the old
+    union a scope could only ever add."""
+    k = Key("k", "h", "p",
+            rules=[Rule("docker.io/*", pull=True)],
+            scope=[Rule("*", pull=True, push=True)])
+    assert decide(k, "pull", "docker.io/library/alpine")[0]
+    assert not decide(k, "pull", "ghcr.io/org/app")[0]
+    assert not decide(k, "push", "docker.io/library/alpine")[0]
+
+
+def test_an_empty_scope_does_not_narrow():
+    """EMPTY MEANS DIFFERENT THINGS IN THE TWO LISTS, deliberately. An empty
+    GRANT grants nothing; an empty CONSTRAINT constrains nothing. Reading an
+    absent constraint as deny-all would have stopped every key in existence the
+    moment the field was added."""
+    k = Key("k", "h", "p", rules=[Rule("*", pull=True, push=True)], scope=[])
+    assert decide(k, "pull", "anything/at/all")[0]
+    assert decide(k, "push", "anything/at/all")[0]
+
+
+def test_an_empty_grant_still_grants_nothing_however_wide_the_scope():
+    k = Key("k", "h", "p", rules=[], scope=[Rule("*", pull=True, push=True)])
+    assert not decide(k, "pull", "docker.io/x")[0]
+
+
+def test_the_refusal_says_WHICH_list_refused():
+    """An operator chasing a 403 needs to know whether the holder was never
+    granted it or this key was scoped away from it. Same status, different fix."""
+    scoped = Key("k", "h", "p",
+                 rules=[Rule("*", pull=True)], scope=[Rule("docker.io/*", pull=True)])
+    ok, reason = decide(scoped, "pull", "ghcr.io/org/app")
+    assert not ok and "scoped away" in reason
+
+    ungranted = Key("k", "h", "p", rules=[Rule("docker.io/*", pull=True)])
+    ok, reason = decide(ungranted, "pull", "ghcr.io/org/app")
+    assert not ok and "scoped away" not in reason
+
+
+def test_a_disabled_key_is_refused_regardless_of_either_list():
+    k = Key("k", "h", "p", rules=[Rule("*", pull=True)], scope=[], disabled=True)
+    assert not decide(k, "pull", "docker.io/x")[0]

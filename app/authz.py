@@ -75,14 +75,40 @@ class Key:
     key_id: str
     secret_hash: str
     principal: str
+    # WHAT THE HOLDER MAY DO. The principal's allowlist, set by an administrator.
+    # This is the grant, and an empty one grants nothing.
     rules: list[Rule] = field(default_factory=list)
+    # WHAT THIS PARTICULAR KEY MAY DO OF THAT. A narrowing, and only a narrowing.
+    #
+    # EMPTY MEANS NO NARROWING, which is the opposite of what empty means for
+    # `rules` above, and the difference is deliberate. A grant list that is empty
+    # grants nothing; a CONSTRAINT list that is empty constrains nothing. Reading
+    # an absent constraint as deny-all would stop every existing key the moment
+    # this field was introduced.
+    scope: list[Rule] = field(default_factory=list)
     label: str = ""
     disabled: bool = False
 
     def allows(self, operation: Operation, reference: str) -> bool:
+        """Both lists must permit it. NARROWING, not widening.
+
+        The earlier model unioned the two, so a key could only ever be granted
+        MORE than its holder. That made a narrower credential impossible to
+        express, which in turn forced a separate principal per scope -- machine
+        consumers appearing in the user list as if they were people, because
+        that was the only place a scope could be hung.
+
+        Conjunction of DECISIONS rather than intersection of patterns: working
+        out the overlap of two globs is a hard problem and an unnecessary one,
+        since the question is only ever asked about a concrete reference.
+        """
         if self.disabled:
             return False
-        return any(r.grants(operation, reference) for r in self.rules)
+        if not any(r.grants(operation, reference) for r in self.rules):
+            return False
+        if not self.scope:
+            return True
+        return any(r.grants(operation, reference) for r in self.scope)
 
 
 @dataclass
@@ -142,4 +168,9 @@ def decide(key: Key | None, operation: Operation, reference: str) -> tuple[bool,
         return False, f"key {key.key_id} has no rules"
     if key.allows(operation, reference):
         return True, f"key {key.key_id} allows {operation} on {reference}"
+    # Two ways to be refused, and an operator chasing a 403 needs to know which:
+    # the holder was never granted it, or this key was scoped away from it.
+    if key.scope and any(r.grants(operation, reference) for r in key.rules):
+        return False, (f"key {key.key_id} is scoped away from {operation} on "
+                       f"{reference}, which its holder is otherwise allowed")
     return False, f"key {key.key_id} has no rule granting {operation} on {reference}"

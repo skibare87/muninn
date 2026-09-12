@@ -293,3 +293,53 @@ def test_an_admin_can_delete_another_user_and_their_keys_stop_working(console):
     r = as_user("sub-admin").delete("/_console/users/sub-user")
     assert r.status_code == 200, r.text
     assert client.get("/v2/", auth=(key_id, secret)).status_code == 401
+
+
+def test_a_holder_may_narrow_their_own_key(console):
+    """Safe only because a scope subtracts. Under the old union this endpoint
+    would have let a user grant themselves authority."""
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("*", pull=True, push=True)])
+    c = as_user("sub-user")
+    created = c.post("/_console/keys", json={"label": "ci"}).json()
+    kid, secret = created["key_id"], created["secret"]
+
+    assert client.get("/v2/", auth=(kid, secret)).status_code == 200, "positive control"
+
+    r = c.put(f"/_console/keys/{kid}/scope",
+              json={"rules": [{"pattern": "docker.io/*", "pull": True, "push": False}]})
+    assert r.status_code == 200, r.text
+
+    from app import authz
+    key = store.resolve(kid, secret)
+    assert authz.decide(key, "pull", "docker.io/library/alpine")[0]
+    assert not authz.decide(key, "pull", "ghcr.io/org/app")[0], "the scope must bound it"
+    assert not authz.decide(key, "push", "docker.io/library/alpine")[0]
+
+
+def test_a_scope_cannot_be_used_to_widen(console):
+    """The property that makes the endpoint safe to expose to a non-admin."""
+    from app import authz
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("docker.io/*", pull=True)])
+    c = as_user("sub-user")
+    created = c.post("/_console/keys", json={}).json()
+    kid, secret = created["key_id"], created["secret"]
+
+    c.put(f"/_console/keys/{kid}/scope",
+          json={"rules": [{"pattern": "*", "pull": True, "push": True}]})
+    key = store.resolve(kid, secret)
+    assert not authz.decide(key, "pull", "ghcr.io/org/app")[0]
+    assert not authz.decide(key, "push", "docker.io/library/alpine")[0]
+
+
+def test_a_user_cannot_scope_another_users_key(console):
+    client, _, as_user = console
+    victim = as_user("sub-admin").post("/_console/keys", json={}).json()
+    r = as_user("sub-user").put(f"/_console/keys/{victim['key_id']}/scope",
+                                json={"rules": []})
+    assert r.status_code == 404, "404 not 403: a 403 confirms the key id is real"

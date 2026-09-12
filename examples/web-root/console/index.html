@@ -126,6 +126,7 @@
   <div id="console" hidden>
 
     <h2>Your keys</h2>
+    <p class="muted">A key does whatever your allowlist permits, unless you give it a <strong>scope</strong> — a narrowing, for a key meant for one job. A scope can only ever subtract, so narrowing your own key is always safe.</p>
     <div id="allowlist-mine"></div>
     <div id="keys"></div>
     <div class="row">
@@ -238,12 +239,42 @@
     }
     var t = el('table');
     var head = el('tr');
-    ['Key id', 'Label', 'State', ''].forEach(function (h) { head.appendChild(el('th', h)); });
+    ['Key id', 'Label', 'Scope', 'State', ''].forEach(function (h) { head.appendChild(el('th', h)); });
     t.appendChild(head);
     data.keys.forEach(function (k) {
       var tr = el('tr');
       tr.appendChild(el('td', k.key_id, 'mono'));
       tr.appendChild(el('td', k.label || '—'));
+      // A scope NARROWS this key to part of your allowlist. Blank means the key
+      // does whatever you may do -- an empty CONSTRAINT constrains nothing.
+      var sc = el('td');
+      var si = document.createElement('input');
+      si.className = 'txt'; si.style.width = '14rem'; si.style.fontSize = '.8rem';
+      si.placeholder = 'no limit';
+      si.value = (k.scope || []).map(ruleLine).join(', ');
+      si.title = 'Narrow this key, e.g. docker.io/* pull. Blank = everything you may do.';
+      sc.appendChild(si);
+      sc.appendChild(el('span', ' '));
+      sc.appendChild(btn('Set', 'ghost', function () {
+        var rules = [], bad = null;
+        si.value.split(',').forEach(function (item) {
+          item = item.trim();
+          if (!item) return;
+          var parts = item.split(/\s+/);
+          var verbs = (parts[1] || '').toLowerCase();
+          if (parts.length > 2 || (verbs && !/^(pull|push|pull\+push|push\+pull)$/.test(verbs))) {
+            bad = item; return;
+          }
+          rules.push({ pattern: parts[0],
+                       pull: verbs === '' || verbs.indexOf('pull') >= 0,
+                       push: verbs.indexOf('push') >= 0 });
+        });
+        if (bad !== null) { showError('Could not parse: ' + bad); return; }
+        api('PUT', '/_console/keys/' + encodeURIComponent(k.key_id) + '/scope',
+            { rules: rules }).then(function () { clearError(); return loadKeys(); })
+          .catch(showError);
+      }));
+      tr.appendChild(sc);
       tr.appendChild(el('td', k.disabled ? 'disabled' : 'active'));
       var actions = el('td');
       actions.appendChild(btn(k.disabled ? 'Enable' : 'Disable', 'ghost', function () {

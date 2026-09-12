@@ -88,7 +88,8 @@ def test_an_admin_can_be_demoted_once_another_exists(store):
 def test_the_right_secret_resolves_and_a_wrong_one_does_not(store):
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("docker.io/*", pull=True)])
+    store.set_principal_rules("sub-1", [Rule("docker.io/*", pull=True)])
+    store.add_key(kid, sec, "sub-1", [])
     assert store.resolve(kid, sec) is not None
     assert store.resolve(kid, sec + "x") is None
     assert store.resolve("unknown-id", sec) is None
@@ -106,7 +107,8 @@ def test_the_raw_secret_is_never_stored(store):
     """
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("*", pull=True)])
+    store.set_principal_rules("sub-1", [Rule("*", pull=True)])
+    store.add_key(kid, sec, "sub-1", [])
 
     # Everything SQLite may have written: main file plus WAL and shm sidecars.
     base = Path(store.path)
@@ -132,7 +134,8 @@ def test_disabling_a_key_takes_effect_immediately(store):
     revocation that silently does nothing."""
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("*", pull=True, push=True)])
+    store.set_principal_rules("sub-1", [Rule("*", pull=True, push=True)])
+    store.add_key(kid, sec, "sub-1", [])
     assert decide(store.resolve(kid, sec), "push", "docker.io/x")[0]
 
     store.set_key_disabled(kid, True)
@@ -147,7 +150,8 @@ def test_disabling_a_PRINCIPAL_disables_all_their_keys(store):
     keys = []
     for _ in range(3):
         kid, sec = new_secret()
-        store.add_key(kid, sec, "sub-2", [Rule("*", pull=True, push=True)])
+        store.set_principal_rules("sub-2", [Rule("*", pull=True, push=True)])
+        store.add_key(kid, sec, "sub-2", [])
         keys.append((kid, sec))
 
     for kid, sec in keys:
@@ -164,7 +168,8 @@ def test_deleting_a_key_removes_its_rules(store):
     made; the foreign key cascade is asserted rather than assumed."""
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("*", pull=True, push=True)])
+    store.set_principal_rules("sub-1", [Rule("*", pull=True, push=True)])
+    store.add_key(kid, sec, "sub-1", [])
     store.delete_key(kid)
     assert store.resolve(kid, sec) is None
     assert store.list_keys() == []
@@ -175,8 +180,9 @@ def test_rewriting_rules_replaces_rather_than_appends(store):
     edit strictly more permissive -- a UI that can only widen access."""
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("*", pull=True, push=True)])
-    store.set_key_rules(kid, [Rule("docker.io/*", pull=True, push=False)])
+    store.set_principal_rules("sub-1", [Rule("*", pull=True, push=True)])
+    store.add_key(kid, sec, "sub-1", [])
+    store.set_key_scope(kid, [Rule("docker.io/*", pull=True, push=False)])
 
     k = store.resolve(kid, sec)
     assert decide(k, "pull", "docker.io/library/redis")[0]
@@ -187,7 +193,8 @@ def test_rewriting_rules_replaces_rather_than_appends(store):
 def test_the_store_survives_reopening(store, tmp_path):
     store.claim_or_get_principal("sub-1")
     kid, sec = new_secret()
-    store.add_key(kid, sec, "sub-1", [Rule("ghcr.io/me/*", pull=True, push=True)])
+    store.set_principal_rules("sub-1", [Rule("ghcr.io/me/*", pull=True, push=True)])
+    store.add_key(kid, sec, "sub-1", [])
 
     reopened = AuthzStore(store.path)
     k = reopened.resolve(kid, sec)

@@ -46,13 +46,18 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(dockerauth, "_store", None)  # reopen against tmp db
 
     store = AuthzStore(db)
+    # Rules live on the PRINCIPAL: that is the grant. Two principals rather than
+    # two key scopes, because these tests are about two different authorities,
+    # not about one authority narrowed two ways.
     store.claim_or_get_principal("sub-1", "a@example.com")
+    store.set_principal_rules("sub-1", [Rule("docker.io/*", pull=True, push=False)])
     puller, puller_secret = new_secret()
-    store.add_key(puller, puller_secret, "sub-1",
-                  [Rule("docker.io/*", pull=True, push=False)])
+    store.add_key(puller, puller_secret, "sub-1", [])
+
+    store.create_principal("sub-2", "b@example.com")
+    store.set_principal_rules("sub-2", [Rule("docker.io/*", pull=True, push=True)])
     pusher, pusher_secret = new_secret()
-    store.add_key(pusher, pusher_secret, "sub-1",
-                  [Rule("docker.io/*", pull=True, push=True)])
+    store.add_key(pusher, pusher_secret, "sub-2", [])
 
     app = FastAPI()
     app.include_router(ocicompat.router,

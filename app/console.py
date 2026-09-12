@@ -46,6 +46,10 @@ class AllowlistIn(BaseModel):
     rules: list[RuleIn]
 
 
+class ScopeIn(BaseModel):
+    rules: list[RuleIn]
+
+
 def _store():
     st = dockerauth.store()
     if st is None:
@@ -69,7 +73,11 @@ def _key_out(key: authz.Key) -> dict:
         "label": key.label,
         "principal": key.principal,
         "disabled": key.disabled,
+        # What the HOLDER may do, and what THIS KEY may do of that. Reported
+        # separately because a refusal is diagnosed differently depending on
+        # which one stopped it.
         "rules": [_rule_out(r) for r in key.rules],
+        "scope": [_rule_out(r) for r in key.scope],
     }
 
 
@@ -117,6 +125,9 @@ async def create_my_key(request: Request, label: str = Body("", embed=True)) -> 
     # No key-specific rules: a new key's authority is its owner's allowlist and
     # nothing more. Passed explicitly rather than defaulted, so that "a user
     # created a key" can never be the act that widens what they may do.
+    # No scope: the key does exactly what its holder may do until someone
+    # narrows it. Passed explicitly, because an empty list here means
+    # "unnarrowed" rather than "nothing".
     _store().add_key(key_id, secret, principal.subject, [], label=label[:200])
     log.info("key created: %s for %s", key_id, principal.subject[:12] + "...")
     return {
@@ -135,6 +146,25 @@ async def set_my_key_disabled(
     key = _owned_key(request, key_id)
     _store().set_key_disabled(key.key_id, disabled)
     return {"key_id": key.key_id, "disabled": disabled}
+
+
+@router.put("/keys/{key_id}/scope")
+async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
+    """Narrow one key to a subset of what its holder may do. Empty removes it.
+
+    ALLOWED TO THE KEY'S OWNER, not only to an admin, and that is safe in a way
+    the old model was not: a scope can only ever subtract. Under the previous
+    union semantics this endpoint could not have existed, because a holder
+    setting their own key's rules would have been granting themselves authority.
+
+    It is what lets a credential be minted for one job -- a CI runner, a single
+    registry -- without inventing a separate account to hang the scope on.
+    """
+    key = _owned_key(request, key_id)
+    parsed = [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
+    _store().set_key_scope(key.key_id, parsed)
+    log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))
+    return {"key_id": key.key_id, "scope": [_rule_out(r) for r in parsed]}
 
 
 @router.delete("/keys/{key_id}")

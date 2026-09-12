@@ -9,6 +9,35 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.11 — 2026-09-12
+
+v0.9.11 -- key rules narrow instead of widening
+
+A key's effective rules were the UNION of its principal's allowlist and its own.
+Union only widens, so a key could be granted more than its holder and never
+less. A narrower credential was inexpressible -- which meant every distinct
+scope needed its own principal, and machine consumers ended up in the user list
+as if they were people, because a principal was the only thing a scope could
+hang on.
+
+Principal rules are now the GRANT; key rules are a NARROWING; a request needs
+both to permit it.
+
+  empty GRANT       grants nothing      (unchanged)
+  empty CONSTRAINT  constrains nothing  (new, and the opposite on purpose)
+
+Strictly more restrictive, so nothing is widened by upgrading, and existing keys
+carry no scope and behave exactly as before.
+
+What it buys: a holder can narrow their own key (PUT /_console/keys/{id}/scope),
+which is safe only because a scope subtracts -- under the union that endpoint
+would have been a way to grant yourself authority. A credential for one job no
+longer needs an account invented to hold its scope.
+
+Refusals now name which list refused: "scoped away from" versus "no rule
+granting". Same status, different fix.
+
+
 ## v0.9.10 — 2026-09-12
 
 v0.9.10 -- revocation now works when the write came from another process

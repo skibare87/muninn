@@ -92,18 +92,24 @@ CREATE INDEX IF NOT EXISTS principal_rules_by_subject ON principal_rules(subject
 
 # TWO PLACES A RULE CAN LIVE, AND THE DISTINCTION IS THE WHOLE AUTHORISATION MODEL.
 #
-#   principal_rules  the USER's allowlist. What this person may pull and push,
-#                    anywhere, through any key they hold. Admin-set.
-#   rules            extra grants for ONE key. Also admin-set.
+#   principal_rules  WHAT THE HOLDER MAY DO. The grant. Admin-set. Empty grants
+#                    nothing.
+#   rules            WHAT ONE KEY MAY DO OF THAT. A narrowing, never a widening.
+#                    Empty means unnarrowed -- a constraint list that is empty
+#                    constrains nothing, which is the opposite of what empty
+#                    means above and is deliberate.
 #
-# A key's effective rules are the UNION of the two. Union, not intersection,
-# because these are grants and a grant list has no precedence: see authz.py.
+# A request is allowed only if BOTH permit it.
 #
-# Union means key rules can only WIDEN, never narrow. That is safe here for one
-# reason and only one: NOTHING LETS A NON-ADMIN SET EITHER LIST. A user creates
-# and deletes their own keys; what those keys may do is not theirs to say. If a
-# future change lets users edit key rules, this union becomes privilege
-# escalation -- so that change must make it an intersection first.
+# It was a UNION until v0.9.11, and that was a design error with a visible
+# symptom: a key could only ever be granted MORE than its holder, so a narrower
+# credential was inexpressible, so every distinct scope needed its own
+# principal -- and machine consumers ended up in the user list as if they were
+# people, because a principal was the only thing a scope could hang on.
+#
+# Narrowing also removes the escalation hazard the union carried: a key can no
+# longer inherit authority its own scope withheld, so letting a holder narrow
+# their OWN key is safe in a way widening never was.
 
 
 def hash_secret(secret: str) -> str:
@@ -308,7 +314,7 @@ class AuthzStore:
     # ---------------- keys ----------------
 
     def add_key(self, key_id: str, secret: str, principal: str,
-                rules: list[Rule], label: str = "") -> None:
+                scope: list[Rule], label: str = "") -> None:
         with self._connect() as c:
             c.execute(
                 "INSERT INTO keys(key_id,secret_hash,principal,label,disabled,created_at)"
@@ -317,11 +323,15 @@ class AuthzStore:
             )
             c.executemany(
                 "INSERT INTO rules(key_id,pattern,pull,push) VALUES (?,?,?,?)",
-                [(key_id, r.pattern, int(r.pull), int(r.push)) for r in rules],
+                [(key_id, r.pattern, int(r.pull), int(r.push)) for r in scope],
             )
         self._invalidate()
 
-    def set_key_rules(self, key_id: str, rules: list[Rule]) -> None:
+    def set_key_scope(self, key_id: str, rules: list[Rule]) -> None:
+        """Replace one key's NARROWING. Empty removes the narrowing entirely."""
+        return self._set_key_rules(key_id, rules)
+
+    def _set_key_rules(self, key_id: str, rules: list[Rule]) -> None:
         with self._connect() as c:
             c.execute("DELETE FROM rules WHERE key_id=?", (key_id,))
             c.executemany(
@@ -415,10 +425,8 @@ class AuthzStore:
                 r["key_id"]: Key(
                     key_id=r["key_id"], secret_hash=r["secret_hash"],
                     principal=r["principal"],
-                    rules=(
-                        by_principal.get(r["principal"], [])
-                        + rules.get(r["key_id"], [])
-                    ),
+                    rules=by_principal.get(r["principal"], []),
+                    scope=rules.get(r["key_id"], []),
                     label=r["label"],
                     disabled=bool(r["disabled"]) or bool(r["p_disabled"]),
                 )
