@@ -9,6 +9,57 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.7 — 2026-09-12
+
+XHC_WEB_ROOT -- one hostname can be a homepage AND a cache.
+
+Point it at a directory and static files are served at /. Unset by default, so
+nothing changes for an existing deployment.
+
+WHY IN MUNINN RATHER THAN IN A REVERSE PROXY
+
+The OCI surface is bounded under /v2 by spec, so a proxy can split docker traffic
+from a homepage. It cannot split the Hugging Face surface: HF clients construct
+arbitrary top-level paths like /owner/repo/resolve/main/config.json, so there is
+no prefix to match on.
+
+Muninn can, because it already knows which paths are HF paths. The discriminator
+is a PRECEDENCE RULE rather than a pattern:
+
+  if a file exists under the web root, serve it; otherwise fall through to HF.
+
+That makes "falls through" the property the cache depends on, and it has its own
+test.
+
+THE WEB ROOT'S CONTENTS ARE A CLAIM ON THOSE PATHS
+
+A directory named models/ or datasets/ in there would silently shadow real HF
+traffic, and the symptom would be "the cache stopped working" rather than "a file
+was served". Keep it to a homepage and its assets.
+
+CONTAINMENT IS ENFORCED BY RESOLUTION, NOT BY STRING COMPARISON
+
+A prefix check on the raw request path is the classic bypass: `..` and symlinks
+both defeat it. The candidate is fully resolved and then tested for containment,
+so a symlink pointing out of the root fails the same check as ../../etc/passwd
+without being special-cased. Verified by weakening the guard to a prefix check,
+which turns four tests red -- one of them showing a file outside the root being
+served.
+
+A configured-but-missing root warns and serves nothing rather than raising. A typo
+in one setting must not take down a cache whose main job is unrelated.
+
+ORDERING IS NOW A SECURITY PROPERTY AND IS PINNED
+
+/v2, /healthz, /metrics and /_cache are mounted before the catch-all and cannot be
+shadowed by a web root. That was previously an implementation detail; a test now
+asserts it, because reordering the mounts would let a web root answer the registry
+surface or the unauthenticated health endpoint with nothing else noticing.
+
+Unauthenticated by design: the client-auth gate is on /v2 only. A homepage is
+public. Do not put anything there that is not.
+
+
 ## v0.9.6 — 2026-09-12
 
 A SECURITY WARNING'S REMEDIATION CLAUSE NAMED A SETTING THAT DOES NOTHING ALONE.
