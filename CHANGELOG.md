@@ -9,6 +9,18 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.13 — 2026-09-12
+
+v0.9.13 -- a wildcard key scope means no limit
+
+v0.9.12 refused it. That was an error dressed as a control: a key is bounded
+by its holder allowlist regardless of scope, so the widest a scope can reach is
+what that holder already has. Nothing could escalate through it, and refusing
+it only stopped legitimate edits while surprising everyone who tried.
+
+Stored as no limit, which is what it means.
+
+
 ## v0.9.12 — 2026-09-12
 
 v0.9.12 -- a key scope of "*" is refused
