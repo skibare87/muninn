@@ -9,6 +9,45 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.9 — 2026-09-12
+
+v0.9.9 -- the Hugging Face surface can require a credential, and never forwards yours
+
+Until now only /v2 was authenticated. The Hugging Face catch-all -- every model
+and dataset byte, and the larger surface by far -- had no gate at all, and
+neither did FastAPI's /docs, /redoc and /openapi.json. On a private cache that
+is fine. On a public one it is the whole service.
+
+  XHC_HF_AUTH=key   require a key from XHC_AUTHZ_DB on the HF surface
+  XHC_DOCS=0        switch off the interactive API docs
+
+Both opt-in; a deployment that changes no variables behaves exactly as before.
+
+The key is presentable as `Bearer <key_id>:<secret>`, so a user sets HF_TOKEN to
+that and Hugging Face's own tooling works unchanged -- it has no concept of a
+username. Basic works too. The web root stays public, because a homepage nobody
+can load is not a homepage.
+
+THE FIX THAT MATTERS MOST IS NOT THE GATE. Upstream requests applied the cache's
+own Hub token only when the client had not sent one. So a client authenticating
+to the cache -- which the tooling can only do by sending a token -- would have
+had THEIR CREDENTIAL FORWARDED TO HUGGING FACE, and the request would then fail
+there, because a cache key is not a Hub token.
+
+The same line had a quieter failure that predates this release: a user with
+their own HF_TOKEN caused ingest to be authorised as them rather than as the
+cache. Which credential a shared cache presented upstream depended on whoever
+asked first.
+
+The cache now authenticates to the Hub as itself, always -- matching what the
+/v2 surface already did with registry credentials.
+
+Consequence, stated so nobody discovers it: you cannot reach a gated repository
+through this cache by supplying your own entitlement. The cache fetches what the
+cache can fetch. For shared storage that is the correct answer, because anything
+fetched is then served to everyone whose rules cover the path.
+
+
 ## v0.9.8 — 2026-09-12
 
 v0.9.8 -- per-key authorization gains a browser front end, and three holes behind it
