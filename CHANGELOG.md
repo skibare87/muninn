@@ -9,6 +9,63 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.6 — 2026-09-12
+
+A SECURITY WARNING'S REMEDIATION CLAUSE NAMED A SETTING THAT DOES NOTHING ALONE.
+
+The push-through warning, logged at boot whenever push is enabled, told the
+operator to "set XHC_DOCKER_HTPASSWD to require a credential". The README said
+the same. The file alone is ignored: client auth defaults to none and the loader
+returns before ever opening it, so XHC_DOCKER_AUTH=basic is also required and
+neither sentence mentioned it.
+
+Measured by a peer rather than read. With a valid bcrypt htpasswd mounted and
+XHC_DOCKER_AUTH unset, GET /v2/ with no credentials returned 200 and the boot log
+said nothing about auth at all. So an operator does exactly what the security
+warning says, restarts, sees no error, and serves an unauthenticated
+push-through cache. The file is never opened, so a malformed one would not have
+complained either.
+
+THE ASYMMETRY WAS THE BUG, AND IT SAT THREE LINES ABOVE THE EARLY RETURN
+
+That loader's own docstring says resolving unknown to permissive is what disarmed
+pin protection, and that it must not be possible to lose a password file and
+silently return to an open cache. The code honoured that in ONE direction --
+auth=basic with no file refuses to start -- and was silent in the other.
+
+One case is "you asked to be closed and cannot be". The other is "you look like
+you asked to be closed and did not", and it is the one an operator reaches by
+following this project's own instructions. Only the first was guarded.
+
+WHAT CHANGED
+
+Both strings name both variables, and the README says the file alone is ignored
+and why. The loader now warns when a credential file is set while auth is none,
+stating that the file is IGNORED and that /v2/* is UNAUTHENTICATED.
+
+There was already a good positive control -- "client auth enabled for N user(s)
+on /v2/*" -- and no negative one. So silence meant both "correctly open" and
+"you tried to close it and failed", which are the two states an operator most
+needs told apart.
+
+Two tests, and the second matters as much as the first. One asserts the warning
+fires and names both the current state and the setting that changes it, verified
+able to fail by deleting the warning. The other asserts it does NOT fire when
+neither is set, because a warning on every default deployment is how a real
+signal gets trained out of a log.
+
+NOT TAKEN HERE, AND RECORDED AS A DECISION
+
+Whether that combination should REFUSE to start, symmetric with its sibling and
+with the docstring's own principle, is a real trade rather than an obvious
+improvement: refusing turns a stale environment variable into an outage on
+upgrade, for a live service other teams deploy. The warning closes the
+information gap without that risk.
+
+No behaviour change to the auth path itself. An operator who had working auth
+still has it; an operator who thought they did now finds out at boot.
+
+
 ## v0.9.5 — 2026-09-06
 
 SNAPSHOT INGEST IS VERIFIED TOO.
