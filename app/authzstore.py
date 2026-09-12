@@ -26,8 +26,20 @@ different attack from guessing the input.
 
 THE IN-MEMORY CACHE IS NOT AN OPTIMISATION, IT IS THE READ PATH. Every /v2 request
 authorises, and hitting SQLite synchronously from an async handler on every request
-would serialise the server on a file lock. Keys are loaded once and reloaded when a
-write bumps the version counter, so the hot path is a dict lookup and one hash.
+would serialise the server on a file lock. Keys are loaded once and reloaded when the
+data changes, so the hot path is a dict lookup and one hash.
+
+INVALIDATION MUST WORK ACROSS PROCESSES, and for a while it did not. Dropping the
+cache inside the writing object only helps callers that share that object. Anything
+administering the store out of band -- a migration script, an operator, a one-shot
+`docker exec` -- committed to SQLite and the RUNNING SERVER NEVER NOTICED. The
+consequence is the one that matters: a key disabled that way KEPT AUTHENTICATING
+until the process restarted, which is the exact inverse of the guarantee this store
+exists to provide.
+
+So freshness is checked against the DATABASE, not against our own writes.
+`PRAGMA data_version` changes whenever another connection commits, which is precisely
+this question, and it is answered from an already-open handle with no I/O.
 """
 
 from __future__ import annotations
@@ -112,6 +124,9 @@ class AuthzStore:
         self.path = str(path)
         self._lock = threading.Lock()
         self._cache: dict[str, Key] | None = None
+        # Long-lived handle used only for the freshness probe. See _data_version.
+        self._probe: sqlite3.Connection | None = None
+        self._cache_version: int | None = None
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as c:
             c.executescript(_SCHEMA)
@@ -125,6 +140,17 @@ class AuthzStore:
     def _invalidate(self) -> None:
         with self._lock:
             self._cache = None
+
+    def _data_version(self) -> int:
+        """SQLite's own answer to "has anyone else committed?".
+
+        Read from a connection held open for the purpose: the value only tracks
+        commits made by OTHER connections, so a fresh connection each time would
+        report a fresh baseline and never detect anything.
+        """
+        if self._probe is None:
+            self._probe = sqlite3.connect(self.path, timeout=10)
+        return self._probe.execute("PRAGMA data_version").fetchone()[0]
 
     # ---------------- principals ----------------
 
@@ -230,6 +256,40 @@ class AuthzStore:
                       (1 if is_admin else 0, subject))
         self._invalidate()
 
+    def delete_principal(self, subject: str) -> None:
+        """Remove a principal and everything it owns. Raises KeyError if absent.
+
+        Their keys and allowlist go with them, by ON DELETE CASCADE rather than
+        by a loop here: a loop can be interrupted halfway and leave a deleted
+        user's credentials still resolving, which is the failure this is meant
+        to prevent.
+
+        REFUSES TO REMOVE THE LAST ADMIN, for the same reason set_admin does --
+        an administrative surface with no administrator has no path back that
+        does not involve a shell on the host.
+
+        Deletion, not disabling, is right for a principal created in error. A
+        disabled row stays in the user list forever looking like a decision
+        somebody made.
+        """
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT is_admin FROM principals WHERE subject=?", (subject,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no such principal: {subject}")
+            if row["is_admin"]:
+                others = c.execute(
+                    "SELECT COUNT(*) AS n FROM principals WHERE is_admin=1 AND subject<>?",
+                    (subject,),
+                ).fetchone()["n"]
+                if others == 0:
+                    raise ValueError("refusing to delete the last administrator")
+            c.execute("DELETE FROM principals WHERE subject=?", (subject,))
+            c.commit()
+        self._invalidate()
+
     def set_principal_disabled(self, subject: str, disabled: bool) -> None:
         """Raises KeyError for an unknown subject.
 
@@ -324,7 +384,19 @@ class AuthzStore:
 
     def _all_keys(self) -> dict[str, Key]:
         with self._lock:
-            if self._cache is not None:
+            # Cheap enough to run on every authorisation: a pragma on an open
+            # handle, no file access. Expensive compared with skipping it, and
+            # the thing it buys is that revocation works at all when the write
+            # came from somewhere else.
+            try:
+                version = self._data_version()
+            except sqlite3.Error:
+                # Unreadable means UNKNOWN, never "unchanged". Drop the cache so
+                # the next read goes to the database and fails loudly there if
+                # it is going to fail, rather than serving stale authority.
+                self._cache = None
+                version = None
+            if self._cache is not None and version == self._cache_version:
                 return self._cache
         with self._connect() as c:
             rules: dict[str, list[Rule]] = {}
@@ -357,6 +429,13 @@ class AuthzStore:
             }
         with self._lock:
             self._cache = loaded
+            # Recorded AFTER the load, so a commit landing mid-load leaves the
+            # version behind and the next read reloads rather than trusting a
+            # half-current snapshot.
+            try:
+                self._cache_version = self._data_version()
+            except sqlite3.Error:
+                self._cache_version = None
         return loaded
 
     def resolve(self, key_id: str, secret: str) -> Key | None:

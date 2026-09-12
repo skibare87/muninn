@@ -38,6 +38,9 @@
       --code-bg:#161c24; --shadow:none;
     }
   }
+  /* [hidden] is only a UA-stylesheet rule, so ANY display declaration beats
+     it -- .who and .cta both set display, which would silently un-hide. */
+  [hidden]{display:none !important}
   *{box-sizing:border-box}
   html{scroll-behavior:smooth}
   body{
@@ -270,31 +273,12 @@ python -c "from huggingface_hub import snapshot_download;
 <section id="account">
   <div class="wrap">
     <h2>Your credentials</h2>
-    <!-- hidden until /_auth/me confirms a login exists AND you are not in
-         it. Visible by default would promise a sign-in button to deployments
-         that have no identity provider configured. -->
-    <div id="signed-out" hidden>
-      <p class="muted">Sign in to create and revoke your own cache credentials. Nobody needs shell access on the cache to rotate a key.</p>
-    </div>
-
-    <div id="console" hidden>
-      <p class="muted">A credential is a key id and a secret, used as the username and password of a <code>docker login</code>. What a key may do is set by an administrator — so a key you have just created may need an allowlist before it can pull.</p>
-
-      <div id="allowlist-mine"></div>
-
-      <div class="row">
-        <input class="txt" id="new-label" placeholder="label, e.g. ci-runner" maxlength="80">
-        <button class="btn small" id="new-key">Create a key</button>
-      </div>
-
-      <div class="reveal" id="reveal" hidden></div>
-      <div id="keys"></div>
-
-      <div id="admin" hidden>
-        <h2 style="margin-top:2.6rem">Users</h2>
-        <p class="muted">An allowlist is a list of patterns, each granting pull, push, or both. <code>*</code> matches anything including slashes, so a single <code>*</code> with both boxes ticked is unrestricted. Patterns match <code>upstream/repository</code> — never the tag — so <code>docker.io/library/*</code> covers every tag of every official image.</p>
-        <div id="users"></div>
-      </div>
+    <p>Sign in to create and revoke the keys you use against this cache. Nobody needs shell access on the cache to rotate one.</p>
+    <div class="cta">
+      <!-- Both hidden until /_auth/me says which applies. A deployment with no
+           identity provider shows neither, rather than a button leading to a 404. -->
+      <a class="btn" id="signin" href="/_auth/login" hidden>Sign in</a>
+      <a class="btn" id="goconsole" href="/console" hidden>Open the console</a>
     </div>
   </div>
 </section>
@@ -318,235 +302,39 @@ python -c "from huggingface_hub import snapshot_download;
 </footer>
 
 <script>
-// Self-contained on purpose: no framework, no CDN, nothing this page does not
-// serve itself. A cache that exists to stop machines reaching the internet
-// should not need the internet to render its own homepage.
-//
-// EVERY string that came from a user or the database is inserted with
-// textContent, never innerHTML. Labels, emails, subjects and rule patterns are
-// all user-controlled, and an admin viewing the user list is exactly the
-// high-privilege reader an injected script would want.
+// This page is a homepage. Key management lives at /console, on its own page,
+// because a management surface at the bottom of a marketing page is somewhere
+// nobody looks -- and scrolling past four sections to find it is the report
+// that moved it.
 (function () {
   var $ = function (id) { return document.getElementById(id); };
-
-  function el(tag, text, cls) {
-    var n = document.createElement(tag);
-    if (text !== undefined && text !== null) n.textContent = String(text);
-    if (cls) n.className = cls;
-    return n;
-  }
-  function btn(text, cls, onclick) {
-    var b = el('button', text, 'btn small' + (cls ? ' ' + cls : ''));
-    b.addEventListener('click', onclick);
-    return b;
-  }
-  function api(method, path, body) {
-    return fetch(path, {
-      method: method,
-      headers: body ? { 'content-type': 'application/json' } : {},
-      body: body ? JSON.stringify(body) : undefined,
-      credentials: 'same-origin'
-    }).then(function (r) {
-      if (!r.ok) return r.json().catch(function () { return {}; })
-        .then(function (j) { throw new Error(j.detail || ('HTTP ' + r.status)); });
-      return r.json();
-    });
-  }
-  function fail(e) { alert(e.message || String(e)); }
-
-  var me = null;
-
-  function renderWho() {
-    var who = $('who');
-    who.textContent = '';
-    if (!me || !me.login_enabled) return;            // no provider -> no button
-    who.hidden = false;
-    if (!me.authenticated) {
-      var a = el('a', 'Sign in', 'btn small');
-      a.href = '/_auth/login';
-      who.appendChild(a);
-      return;
-    }
-    who.appendChild(el('span', me.email || 'signed in'));
-    if (me.is_admin) who.appendChild(el('span', 'admin', 'tag'));
-    who.appendChild(btn('Sign out', 'ghost', function () {
-      // A form POST rather than fetch, so the browser follows the redirect and
-      // the page reloads with the cookie already gone.
-      var f = document.createElement('form');
-      f.method = 'POST'; f.action = '/_auth/logout';
-      document.body.appendChild(f); f.submit();
-    }));
-  }
-
-  function ruleText(r) {
-    var verbs = [];
-    if (r.pull) verbs.push('pull');
-    if (r.push) verbs.push('push');
-    return r.pattern + '  ' + (verbs.length ? verbs.join('+') : 'nothing');
-  }
-
-  function renderKeys(data) {
-    var mount = $('keys');
-    mount.textContent = '';
-
-    var al = $('allowlist-mine');
-    al.textContent = '';
-    if (!data.allowlist.length) {
-      var p = el('p', '', 'note');
-      p.appendChild(el('span', 'Your allowlist is empty, so your keys currently grant nothing. ', 'warn'));
-      p.appendChild(el('span', 'Ask an administrator to set one.'));
-      al.appendChild(p);
-    } else {
-      var box = el('div', null, 'note');
-      box.appendChild(el('strong', 'Your allowlist'));
-      var ul = el('ul', null, 'rules');
-      data.allowlist.forEach(function (r) { ul.appendChild(el('li', ruleText(r))); });
-      box.appendChild(ul);
-      al.appendChild(box);
-    }
-
-    if (!data.keys.length) {
-      mount.appendChild(el('p', 'You have no keys yet.', 'muted'));
-      return;
-    }
-    var t = el('table', null, 'keys');
-    var head = el('tr');
-    ['Key id', 'Label', 'State', ''].forEach(function (h) { head.appendChild(el('th', h)); });
-    t.appendChild(head);
-    data.keys.forEach(function (k) {
-      var tr = el('tr');
-      tr.appendChild(el('td', k.key_id, 'mono'));
-      tr.appendChild(el('td', k.label || '—'));
-      tr.appendChild(el('td', k.disabled ? 'disabled' : 'active'));
-      var actions = el('td');
-      actions.appendChild(btn(k.disabled ? 'Enable' : 'Disable', 'ghost', function () {
-        api('POST', '/_console/keys/' + encodeURIComponent(k.key_id) + '/disabled',
-            { disabled: !k.disabled }).then(loadKeys).catch(fail);
-      }));
-      actions.appendChild(el('span', ' '));
-      actions.appendChild(btn('Delete', 'ghost', function () {
-        if (!confirm('Delete key ' + k.key_id + '? Anything using it stops working immediately.')) return;
-        api('DELETE', '/_console/keys/' + encodeURIComponent(k.key_id))
-          .then(loadKeys).catch(fail);
-      }));
-      tr.appendChild(actions);
-      t.appendChild(tr);
-    });
-    mount.appendChild(t);
-  }
-
-  function loadKeys() { return api('GET', '/_console/keys').then(renderKeys).catch(fail); }
-
-  function ruleEditor(user) {
-    // A textarea of one rule per line, because that is what an allowlist IS and
-    // a row-per-rule widget makes the common case (paste the same three lines
-    // onto a new user) harder than the rare one.
-    var wrap = el('div');
-    var ta = document.createElement('textarea');
-    ta.className = 'txt';
-    ta.rows = Math.max(3, user.allowlist.length + 1);
-    ta.style.width = '100%';
-    ta.style.fontFamily = 'ui-monospace,SFMono-Regular,Menlo,monospace';
-    ta.value = user.allowlist.map(function (r) {
-      return r.pattern + ' ' + (r.pull ? 'pull' : '') + (r.push ? (r.pull ? '+push' : 'push') : '');
-    }).join('\n');
-    ta.placeholder = 'docker.io/library/* pull\nghcr.io/myorg/* pull+push\n* pull+push';
-    wrap.appendChild(ta);
-    wrap.appendChild(btn('Save allowlist', null, function () {
-      var rules = [];
-      var bad = null;
-      ta.value.split('\n').forEach(function (line) {
-        line = line.trim();
-        if (!line) return;
-        var parts = line.split(/\s+/);
-        var verbs = (parts[1] || '').toLowerCase();
-        // Refuse a line whose verbs we do not understand rather than silently
-        // storing pull-only. A typo that quietly narrows a grant is a support
-        // ticket; a typo that quietly WIDENS one is an incident.
-        if (parts.length > 2 || (verbs && !/^(pull|push|pull\+push|push\+pull)$/.test(verbs))) {
-          bad = line; return;
-        }
-        rules.push({
-          pattern: parts[0],
-          pull: verbs === '' || verbs.indexOf('pull') >= 0,
-          push: verbs.indexOf('push') >= 0
-        });
-      });
-      if (bad !== null) { alert('Could not parse: ' + bad + '\n\nUse: <pattern> pull|push|pull+push'); return; }
-      api('PUT', '/_console/users/' + encodeURIComponent(user.subject) + '/allowlist',
-          { rules: rules }).then(loadUsers).catch(fail);
-    }));
-    return wrap;
-  }
-
-  function renderUsers(data) {
-    var mount = $('users');
-    mount.textContent = '';
-    data.users.forEach(function (u) {
-      var card = el('div', null, 'card');
-      card.style.marginBottom = '1rem';
-      var h = el('h4');
-      h.appendChild(el('span', u.email || u.subject));
-      if (u.is_admin) h.appendChild(el('span', ' admin', 'tag'));
-      if (u.disabled) h.appendChild(el('span', ' disabled', 'tag'));
-      card.appendChild(h);
-      card.appendChild(el('p', u.key_count + ' key(s)'));
-      card.appendChild(ruleEditor(u));
-      var row = el('div', null, 'row');
-      row.appendChild(btn(u.is_admin ? 'Revoke admin' : 'Make admin', 'ghost', function () {
-        api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/admin',
-            { is_admin: !u.is_admin }).then(loadUsers).then(loadMe).catch(fail);
-      }));
-      row.appendChild(btn(u.disabled ? 'Enable user' : 'Disable user', 'ghost', function () {
-        if (!u.disabled && !confirm('Disable ' + (u.email || u.subject) + '? Every key they hold stops working immediately.')) return;
-        api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/disabled',
-            { disabled: !u.disabled }).then(loadUsers).catch(fail);
-      }));
-      card.appendChild(row);
-      mount.appendChild(card);
-    });
-  }
-
-  function loadUsers() { return api('GET', '/_console/users').then(renderUsers).catch(fail); }
-
-  $('new-key').addEventListener('click', function () {
-    api('POST', '/_console/keys', { label: $('new-label').value || '' })
-      .then(function (k) {
-        $('new-label').value = '';
-        var r = $('reveal');
-        r.hidden = false;
-        r.textContent = '';
-        r.appendChild(el('p', k.warning, 'warn'));
-        var pre = el('pre');
-        pre.appendChild(el('code', 'key id:  ' + k.key_id + '\nsecret:  ' + k.secret));
-        r.appendChild(pre);
-        r.appendChild(el('p', 'To use it — this prompts for the secret, so it does not land in your shell history:', 'muted'));
-        var pre2 = el('pre');
-        pre2.appendChild(el('code', 'docker login ' + location.host + ' -u ' + k.key_id));
-        r.appendChild(pre2);
-        return loadKeys();
-      })
-      .catch(fail);
-  });
-
-  function loadMe() {
-    return api('GET', '/_auth/me').then(function (data) {
-      me = data;
-      renderWho();
-      $('console').hidden = !me.authenticated;
-      $('admin').hidden = !me.is_admin;
-      var out = $('signed-out');
-      if (out) out.hidden = !(me.login_enabled && !me.authenticated);
-      if (me.authenticated) loadKeys();
-      if (me.is_admin) loadUsers();
-    }).catch(function () {
-      // No /_auth surface at all: login is not configured on this deployment.
-      // Not an error and not worth telling the reader about -- the page is a
-      // homepage first and a console second.
-    });
-  }
-
-  loadMe();
+  fetch('/_auth/me', { credentials: 'same-origin' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (me) {
+      if (!me || !me.login_enabled) return;   // no provider -> no buttons at all
+      var who = $('who');
+      if (me.authenticated) {
+        $('goconsole').hidden = false;
+        who.hidden = false;
+        var a = document.createElement('a');
+        a.className = 'btn small ghost';
+        a.href = '/console';
+        a.textContent = 'Console';
+        var name = document.createElement('span');
+        name.textContent = me.email || 'signed in';
+        who.appendChild(name);
+        who.appendChild(a);
+      } else {
+        $('signin').hidden = false;
+        who.hidden = false;
+        var b = document.createElement('a');
+        b.className = 'btn small';
+        b.href = '/_auth/login';
+        b.textContent = 'Sign in';
+        who.appendChild(b);
+      }
+    })
+    .catch(function () { /* login not configured; the page is a homepage regardless */ });
 })();
 </script>
 </body>

@@ -265,3 +265,114 @@ def test_an_unset_bootstrap_leaves_the_first_principal_rule_alone(tmp_path):
     st = AuthzStore(tmp_path / "a.db")
     assert st.claim_or_get_principal("sub-a").is_admin is True
     assert st.claim_or_get_principal("sub-b", "", None).is_admin is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-process invalidation.
+#
+# The read path is an in-memory cache. Dropping it inside the writing object
+# only helps callers that share that object -- anything administering the store
+# out of band (a migration script, an operator, a one-shot exec) committed to
+# SQLite while the running server carried on serving the old answer.
+#
+# Two AuthzStore instances on one file is a faithful model of that: separate
+# caches, same database, exactly as two processes have.
+# ---------------------------------------------------------------------------
+
+
+def test_a_key_disabled_BY_ANOTHER_PROCESS_stops_authenticating(tmp_path):
+    """THE ONE THAT MATTERS. Revocation is the guarantee this store exists to
+    provide, and it was silently not provided for out-of-band writes: a
+    disabled key kept resolving until the process restarted."""
+    db = tmp_path / "a.db"
+    server, admin = AuthzStore(db), AuthzStore(db)
+
+    server.claim_or_get_principal("sub-1")
+    key_id, secret = new_secret()
+    server.add_key(key_id, secret, "sub-1", [Rule("*", pull=True)])
+
+    assert server.resolve(key_id, secret) is not None, "positive control"
+
+    admin.set_key_disabled(key_id, True)          # a DIFFERENT instance writes
+    resolved = server.resolve(key_id, secret)
+    assert resolved is None or resolved.disabled, "the server must see the revocation"
+
+
+def test_a_key_added_by_another_process_is_visible(tmp_path):
+    """The same defect in the other direction: a key minted out of band did not
+    work until restart, which is how it presents to whoever was handed it."""
+    db = tmp_path / "a.db"
+    server, admin = AuthzStore(db), AuthzStore(db)
+    admin.claim_or_get_principal("sub-1")
+    server.list_keys()                            # warm the server's cache first
+
+    key_id, secret = new_secret()
+    admin.add_key(key_id, secret, "sub-1", [Rule("*", pull=True)])
+    assert server.resolve(key_id, secret) is not None
+
+
+def test_rules_changed_by_another_process_take_effect(tmp_path):
+    db = tmp_path / "a.db"
+    server, admin = AuthzStore(db), AuthzStore(db)
+    admin.claim_or_get_principal("sub-1")
+    key_id, secret = new_secret()
+    admin.add_key(key_id, secret, "sub-1", [])
+    admin.set_principal_rules("sub-1", [Rule("docker.io/*", pull=True)])
+    server.resolve(key_id, secret)                # warm
+
+    admin.set_principal_rules("sub-1", [Rule("ghcr.io/*", pull=True)])
+    key = server.resolve(key_id, secret)
+    assert [r.pattern for r in key.rules] == ["ghcr.io/*"]
+
+
+def test_the_cache_is_still_a_cache(tmp_path):
+    """The freshness probe must not turn every authorisation into a reload --
+    it is one pragma on an open handle, and the dict is meant to survive."""
+    db = tmp_path / "a.db"
+    st = AuthzStore(db)
+    st.claim_or_get_principal("sub-1")
+    key_id, secret = new_secret()
+    st.add_key(key_id, secret, "sub-1", [Rule("*", pull=True)])
+    st.resolve(key_id, secret)
+    first = st._all_keys()
+    for _ in range(50):
+        st.resolve(key_id, secret)
+    assert st._all_keys() is first, "unchanged data must not be reloaded"
+
+
+def test_deleting_a_principal_takes_their_keys_and_rules(tmp_path):
+    """CASCADE, not a loop. A loop can be interrupted halfway and leave a
+    deleted user's credentials still resolving."""
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("admin-1")           # first principal = admin
+    st.create_principal("doomed", "d@example.com")
+    st.set_principal_rules("doomed", [Rule("*", pull=True)])
+    key_id, secret = new_secret()
+    st.add_key(key_id, secret, "doomed", [])
+    assert st.resolve(key_id, secret) is not None, "positive control"
+
+    st.delete_principal("doomed")
+    assert st.resolve(key_id, secret) is None, "their key must stop resolving"
+    assert st.get_principal_rules("doomed") == []
+    assert "doomed" not in [p.subject for p in st.list_principals()]
+
+
+def test_the_last_admin_cannot_be_deleted(tmp_path):
+    """An administrative surface with no administrator has no path back that
+    does not involve a shell on the host."""
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("only-admin")
+    st.create_principal("ordinary")
+    with pytest.raises(ValueError, match="last administrator"):
+        st.delete_principal("only-admin")
+    # and it IS possible once another admin exists -- the positive control,
+    # without which the guard could simply be "never delete an admin"
+    st.set_admin("ordinary", True)
+    st.delete_principal("only-admin")
+    assert [p.subject for p in st.list_principals()] == ["ordinary"]
+
+
+def test_deleting_an_absent_principal_is_reported(tmp_path):
+    st = AuthzStore(tmp_path / "a.db")
+    with pytest.raises(KeyError):
+        st.delete_principal("never-existed")

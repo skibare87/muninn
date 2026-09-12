@@ -261,3 +261,35 @@ def test_the_key_hash_never_leaves_the_console(console):
     c.post("/_console/keys", json={"label": "x"})
     body = c.get("/_console/keys").text
     assert "secret_hash" not in body
+
+
+def test_a_non_admin_cannot_delete_a_user(console):
+    client, store, as_user = console
+    r = as_user("sub-user").delete("/_console/users/sub-admin")
+    assert r.status_code == 403
+    assert "sub-admin" in [p.subject for p in store.list_principals()]
+
+
+def test_an_admin_cannot_delete_themselves(console):
+    """They lose the session's backing row mid-request, and on a single-admin
+    deployment nothing restores it without a shell on the host."""
+    client, store, as_user = console
+    r = as_user("sub-admin").delete("/_console/users/sub-admin")
+    assert r.status_code == 400
+    assert "sub-admin" in [p.subject for p in store.list_principals()]
+
+
+def test_an_admin_can_delete_another_user_and_their_keys_stop_working(console):
+    """The positive control, asserted ON THE WIRE: the API returning 200 is a
+    statement about the write, not about whether the credential still works."""
+    from app.authz import Rule, new_secret
+
+    client, store, as_user = console
+    key_id, secret = new_secret()
+    store.add_key(key_id, secret, "sub-user", [Rule("docker.io/*", pull=True)])
+    store.set_principal_rules("sub-user", [Rule("docker.io/*", pull=True)])
+    assert client.get("/v2/", auth=(key_id, secret)).status_code == 200, "positive control"
+
+    r = as_user("sub-admin").delete("/_console/users/sub-user")
+    assert r.status_code == 200, r.text
+    assert client.get("/v2/", auth=(key_id, secret)).status_code == 401

@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Console — Muninn</title>
+<meta name="robots" content="noindex">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64">
+<link rel="icon" type="image/png" sizes="64x64" href="/_brand/muninn-icon-64.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#1C222B">
+<style>
+  :root{
+    --ink:#1C222B; --gold:#C7A764; --paper:#E1DED1;
+    --bg:var(--paper); --fg:var(--ink);
+    --muted:#5a6472; --rule:#cbc7b8; --card:#f3f1e9; --code-bg:#e6e2d6;
+    --shadow:0 1px 2px rgba(28,34,43,.07); --danger:#9a3b2f;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#12171e; --fg:var(--paper); --muted:#9aa5b4; --rule:#2a323d;
+      --card:#1a2029; --code-bg:#161c24; --shadow:none; --danger:#d98070;
+    }
+  }
+  /* [hidden] is only a UA-stylesheet rule, so ANY display declaration beats it.
+     Stating it here with !important means a class that sets display can never
+     silently un-hide an element the script meant to keep hidden. */
+  [hidden]{display:none !important}
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:60rem;margin:0 auto;padding:0 1.5rem}
+  nav{border-bottom:1px solid var(--rule);background:var(--card)}
+  nav .wrap{display:flex;align-items:center;gap:1rem;padding:.8rem 1.5rem}
+  .brandmark{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:inherit}
+  .chip{width:30px;height:30px;border-radius:8px;background:var(--paper);display:grid;place-items:center;flex:none}
+  .chip img{width:23px;height:23px;display:block}
+  .wordmark{font-weight:800;letter-spacing:.16em;text-transform:uppercase;font-size:.85rem}
+  .spacer{margin-left:auto}
+  .who{font-size:.85rem;color:var(--muted);display:flex;gap:.7rem;align-items:center;flex-wrap:wrap}
+
+  h1{font-size:1.7rem;margin:2.2rem 0 .4rem;font-weight:800;letter-spacing:-.01em}
+  .sub{color:var(--muted);margin:0 0 2rem}
+  h2{
+    font:800 .72rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--gold);margin:2.6rem 0 1rem
+  }
+  p{margin:0 0 1rem;max-width:46rem}
+  .muted{color:var(--muted)}
+  a{color:var(--gold);text-underline-offset:3px}
+  code{background:var(--code-bg);padding:.13em .4em;border-radius:4px;font-size:.9em;
+       font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  pre{background:var(--card);border:1px solid var(--rule);border-radius:9px;padding:.9rem 1.05rem;
+      overflow-x:auto;font-size:.84rem;line-height:1.7;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  pre code{background:none;padding:0}
+
+  .btn{
+    font:600 .85rem/1 ui-sans-serif,system-ui,sans-serif;cursor:pointer;
+    background:var(--gold);color:var(--ink);border:1px solid var(--gold);
+    border-radius:7px;padding:.6rem 1rem;text-decoration:none;display:inline-block
+  }
+  .btn:hover{filter:brightness(1.07);color:var(--ink)}
+  .btn.ghost{background:none;color:var(--fg);border-color:var(--rule)}
+  .btn.ghost:hover{border-color:var(--gold);color:var(--gold);filter:none}
+  .btn.small{font-size:.78rem;padding:.38rem .7rem}
+  .btn.danger{color:var(--danger);border-color:var(--rule);background:none}
+  .btn.danger:hover{border-color:var(--danger);color:var(--danger);filter:none}
+
+  .tag{font:700 .62rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.1em;text-transform:uppercase;
+       border:1px solid var(--gold);color:var(--gold);border-radius:99px;padding:.24rem .5rem;white-space:nowrap}
+  table{width:100%;border-collapse:collapse;font-size:.88rem;margin:.8rem 0}
+  th{text-align:left;font:700 .66rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.12em;
+     text-transform:uppercase;color:var(--muted);padding:.5rem .6rem;border-bottom:1px solid var(--rule)}
+  td{padding:.6rem;border-bottom:1px solid var(--rule);vertical-align:middle}
+  td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:10px;padding:1.2rem;margin-bottom:1rem;box-shadow:var(--shadow)}
+  .card h3{margin:0 0 .2rem;font-size:1.02rem;font-weight:700;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+  .reveal{background:var(--card);border:2px solid var(--gold);border-radius:10px;padding:1.2rem;margin:1.2rem 0}
+  .note{border-left:3px solid var(--gold);padding:.1rem 0 .1rem 1.1rem;margin:1.2rem 0;color:var(--muted)}
+  .warn{color:var(--gold);font-weight:700}
+  .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:1rem 0}
+  input.txt,textarea.txt{
+    font:.88rem ui-sans-serif,system-ui,sans-serif;padding:.55rem .7rem;
+    border:1px solid var(--rule);border-radius:7px;background:var(--bg);color:var(--fg)
+  }
+  textarea.txt{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;width:100%;font-size:.84rem}
+  .err{background:var(--card);border:2px solid var(--danger);color:var(--danger);
+       border-radius:9px;padding:.9rem 1.1rem;margin:1rem 0;font-size:.9rem}
+  footer{border-top:1px solid var(--rule);margin-top:4rem;padding:1.6rem 0 3rem;color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brandmark" href="/">
+      <span class="chip"><img src="/_brand/muninn-icon-64.png" alt=""></span>
+      <span class="wordmark">Muninn</span>
+    </a>
+    <span class="spacer"></span>
+    <div class="who" id="who"></div>
+  </div>
+</nav>
+
+<main class="wrap">
+  <h1>Console</h1>
+  <p class="sub">Create and revoke the credentials you use against this cache.</p>
+
+  <!-- Any failure the page cannot recover from lands here, visibly. The first
+       version swallowed every error into a silent catch, so a broken console
+       and a logged-out one looked identical. -->
+  <div class="err" id="error" hidden></div>
+
+  <div id="signed-out" hidden>
+    <p>You are not signed in.</p>
+    <p class="row"><a class="btn" href="/_auth/login">Sign in</a></p>
+  </div>
+
+  <div id="no-login" hidden>
+    <p class="muted">This cache has no identity provider configured, so there is no console. Credentials are managed by whoever operates it.</p>
+  </div>
+
+  <div id="console" hidden>
+
+    <h2>Your keys</h2>
+    <div id="allowlist-mine"></div>
+    <div id="keys"></div>
+    <div class="row">
+      <input class="txt" id="new-label" placeholder="label, e.g. ci-runner" maxlength="80">
+      <button class="btn" id="new-key">Create a key</button>
+    </div>
+    <div class="reveal" id="reveal" hidden></div>
+
+    <div id="admin" hidden>
+      <h2>Users</h2>
+      <p class="muted">An allowlist is one rule per line: a pattern, then <code>pull</code>, <code>push</code> or <code>pull+push</code>. <code>*</code> matches anything including slashes, so <code>* pull+push</code> is unrestricted. Patterns match <code>upstream/repository</code> and never the tag.</p>
+      <div id="users"></div>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <div class="wrap"><a href="/">&larr; Back to muninn</a></div>
+</footer>
+
+<script>
+// Self-contained: no framework, no CDN. Every user-written string is inserted
+// with textContent, never innerHTML -- labels, emails, subjects and rule
+// patterns are all user-controlled, and an admin reading the user list is
+// exactly the high-privilege reader an injected script would want.
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  function el(tag, text, cls) {
+    var n = document.createElement(tag);
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    if (cls) n.className = cls;
+    return n;
+  }
+  function btn(text, cls, onclick) {
+    var b = el('button', text, 'btn small' + (cls ? ' ' + cls : ''));
+    b.addEventListener('click', onclick);
+    return b;
+  }
+  function showError(msg) {
+    var e = $('error');
+    e.textContent = String(msg);
+    e.hidden = false;
+  }
+  function clearError() { $('error').hidden = true; }
+
+  function api(method, path, body) {
+    return fetch(path, {
+      method: method,
+      headers: body ? { 'content-type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'same-origin'
+    }).then(function (r) {
+      if (!r.ok) return r.json().catch(function () { return {}; })
+        .then(function (j) {
+          var e = new Error(j.detail || ('HTTP ' + r.status));
+          e.status = r.status;
+          throw e;
+        });
+      return r.json();
+    });
+  }
+
+  var me = null;
+
+  function renderWho() {
+    var who = $('who');
+    who.textContent = '';
+    if (!me || !me.authenticated) return;
+    who.appendChild(el('span', me.email || 'signed in'));
+    if (me.is_admin) who.appendChild(el('span', 'admin', 'tag'));
+    who.appendChild(btn('Sign out', 'ghost', function () {
+      var f = document.createElement('form');
+      f.method = 'POST'; f.action = '/_auth/logout';
+      document.body.appendChild(f); f.submit();
+    }));
+  }
+
+  function ruleLine(r) {
+    var verbs = (r.pull ? 'pull' : '') + (r.push ? (r.pull ? '+push' : 'push') : '');
+    return r.pattern + ' ' + (verbs || 'nothing');
+  }
+
+  function renderKeys(data) {
+    clearError();
+    var al = $('allowlist-mine');
+    al.textContent = '';
+    if (!data.allowlist.length) {
+      var p = el('p', null, 'note');
+      p.appendChild(el('strong', 'Your allowlist is empty, so your keys grant nothing yet. ', 'warn'));
+      p.appendChild(el('span', me && me.is_admin
+        ? 'You are an admin — set your own allowlist under Users below.'
+        : 'Ask an administrator to set one.'));
+      al.appendChild(p);
+    } else {
+      var box = el('div', null, 'note');
+      box.appendChild(el('strong', 'Your allowlist'));
+      var pre = el('pre');
+      pre.appendChild(el('code', data.allowlist.map(ruleLine).join('\n')));
+      box.appendChild(pre);
+      al.appendChild(box);
+    }
+
+    var mount = $('keys');
+    mount.textContent = '';
+    if (!data.keys.length) {
+      mount.appendChild(el('p', 'You have no keys yet.', 'muted'));
+      return;
+    }
+    var t = el('table');
+    var head = el('tr');
+    ['Key id', 'Label', 'State', ''].forEach(function (h) { head.appendChild(el('th', h)); });
+    t.appendChild(head);
+    data.keys.forEach(function (k) {
+      var tr = el('tr');
+      tr.appendChild(el('td', k.key_id, 'mono'));
+      tr.appendChild(el('td', k.label || '—'));
+      tr.appendChild(el('td', k.disabled ? 'disabled' : 'active'));
+      var actions = el('td');
+      actions.appendChild(btn(k.disabled ? 'Enable' : 'Disable', 'ghost', function () {
+        api('POST', '/_console/keys/' + encodeURIComponent(k.key_id) + '/disabled',
+            { disabled: !k.disabled }).then(loadKeys).catch(showError);
+      }));
+      actions.appendChild(el('span', ' '));
+      actions.appendChild(btn('Delete', 'danger', function () {
+        if (!confirm('Delete key ' + k.key_id + '?\n\nAnything using it stops working immediately.')) return;
+        api('DELETE', '/_console/keys/' + encodeURIComponent(k.key_id))
+          .then(loadKeys).catch(showError);
+      }));
+      tr.appendChild(actions);
+      t.appendChild(tr);
+    });
+    mount.appendChild(t);
+  }
+
+  function loadKeys() { return api('GET', '/_console/keys').then(renderKeys).catch(showError); }
+
+  function ruleEditor(user) {
+    // One rule per line, because that is what an allowlist IS -- and it makes
+    // the common case (paste the same three lines onto a new user) easier than
+    // the rare one, which a row-per-rule widget inverts.
+    var wrap = el('div');
+    var ta = document.createElement('textarea');
+    ta.className = 'txt';
+    ta.rows = Math.max(3, user.allowlist.length + 1);
+    ta.value = user.allowlist.map(ruleLine).join('\n');
+    ta.placeholder = 'docker.io/library/* pull\nghcr.io/myorg/* pull+push\n* pull+push';
+    wrap.appendChild(ta);
+    var row = el('div', null, 'row');
+    row.appendChild(btn('Save allowlist', null, function () {
+      var rules = [], bad = null;
+      ta.value.split('\n').forEach(function (line) {
+        line = line.trim();
+        if (!line) return;
+        var parts = line.split(/\s+/);
+        var verbs = (parts[1] || '').toLowerCase();
+        // Refuse a line whose verbs are not understood rather than defaulting.
+        // A typo that quietly narrows a grant is a support ticket; one that
+        // quietly WIDENS it is an incident.
+        if (parts.length > 2 || (verbs && !/^(pull|push|pull\+push|push\+pull)$/.test(verbs))) {
+          bad = line; return;
+        }
+        rules.push({
+          pattern: parts[0],
+          pull: verbs === '' || verbs.indexOf('pull') >= 0,
+          push: verbs.indexOf('push') >= 0
+        });
+      });
+      if (bad !== null) { showError('Could not parse: ' + bad + '   — use: <pattern> pull|push|pull+push'); return; }
+      api('PUT', '/_console/users/' + encodeURIComponent(user.subject) + '/allowlist',
+          { rules: rules }).then(function () { clearError(); return loadUsers(); })
+        .then(loadKeys).catch(showError);
+    }));
+    wrap.appendChild(row);
+    return wrap;
+  }
+
+  function renderUsers(data) {
+    var mount = $('users');
+    mount.textContent = '';
+    data.users.forEach(function (u) {
+      var card = el('div', null, 'card');
+      var h = el('h3');
+      h.appendChild(el('span', u.email || u.subject));
+      if (u.is_admin) h.appendChild(el('span', 'admin', 'tag'));
+      if (u.disabled) h.appendChild(el('span', 'disabled', 'tag'));
+      card.appendChild(h);
+      card.appendChild(el('p', u.key_count + ' key(s) · ' + u.subject, 'muted'));
+      card.appendChild(ruleEditor(u));
+      var row = el('div', null, 'row');
+      row.appendChild(btn(u.is_admin ? 'Revoke admin' : 'Make admin', 'ghost', function () {
+        api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/admin',
+            { is_admin: !u.is_admin }).then(loadUsers).then(loadMe).catch(showError);
+      }));
+      row.appendChild(btn('Delete user', 'danger', function () {
+        if (!confirm('Delete ' + (u.email || u.subject) +
+            '?\n\nTheir keys and allowlist go with them. This cannot be undone.')) return;
+        api('DELETE', '/_console/users/' + encodeURIComponent(u.subject))
+          .then(loadUsers).catch(showError);
+      }));
+            row.appendChild(btn(u.disabled ? 'Enable user' : 'Disable user', 'ghost', function () {
+        if (!u.disabled && !confirm('Disable ' + (u.email || u.subject) +
+            '?\n\nEvery key they hold stops working immediately, including docker login.')) return;
+        api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/disabled',
+            { disabled: !u.disabled }).then(loadUsers).catch(showError);
+      }));
+      card.appendChild(row);
+      mount.appendChild(card);
+    });
+  }
+
+  function loadUsers() { return api('GET', '/_console/users').then(renderUsers).catch(showError); }
+
+  $('new-key').addEventListener('click', function () {
+    api('POST', '/_console/keys', { label: $('new-label').value || '' })
+      .then(function (k) {
+        clearError();
+        $('new-label').value = '';
+        var r = $('reveal');
+        r.hidden = false;
+        r.textContent = '';
+        r.appendChild(el('p', k.warning, 'warn'));
+        var pre = el('pre');
+        pre.appendChild(el('code', 'key id:  ' + k.key_id + '\nsecret:  ' + k.secret));
+        r.appendChild(pre);
+        r.appendChild(el('p', 'Containers — this prompts for the secret, so it stays out of your shell history:', 'muted'));
+        var p1 = el('pre');
+        p1.appendChild(el('code', 'docker login ' + location.host + ' -u ' + k.key_id));
+        r.appendChild(p1);
+        r.appendChild(el('p', 'Models and datasets:', 'muted'));
+        var p2 = el('pre');
+        p2.appendChild(el('code',
+          'export HF_ENDPOINT=https://' + location.host + '\n' +
+          'export HF_TOKEN=' + k.key_id + ':' + k.secret));
+        r.appendChild(p2);
+        return loadKeys();
+      })
+      .catch(showError);
+  });
+
+  function loadMe() {
+    return api('GET', '/_auth/me').then(function (data) {
+      me = data;
+      renderWho();
+      // Three distinct states, rendered as three. Collapsing "not signed in"
+      // and "no login configured" into one blank page is what made the first
+      // version look broken.
+      $('no-login').hidden = !!me.login_enabled;
+      $('signed-out').hidden = !(me.login_enabled && !me.authenticated);
+      $('console').hidden = !me.authenticated;
+      $('admin').hidden = !me.is_admin;
+      if (me.authenticated) loadKeys();
+      if (me.is_admin) loadUsers();
+    }).catch(function (e) {
+      // NOT swallowed. A console that fails to load must say so; silence here
+      // is indistinguishable from being logged out, which is exactly the state
+      // a user is trying to leave.
+      showError('Could not reach the cache: ' + (e.message || e));
+    });
+  }
+
+  loadMe();
+})();
+</script>
+</body>
+</html>

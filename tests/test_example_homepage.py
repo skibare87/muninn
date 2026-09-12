@@ -17,12 +17,29 @@ from pathlib import Path
 
 import pytest
 
-PAGE = Path(__file__).resolve().parent.parent / "examples" / "web-root" / "index.html"
+WEB = Path(__file__).resolve().parent.parent / "examples" / "web-root"
+PAGE = WEB / "index.html"
+# The key-management surface is its OWN PAGE. It used to be a section at the
+# bottom of the homepage, which is somewhere nobody looks -- the report that
+# moved it was "I have to scroll down a mile to find it".
+CONSOLE = WEB / "console" / "index.html"
 
 
 @pytest.fixture(scope="module")
 def html() -> str:
     return PAGE.read_text()
+
+
+@pytest.fixture(scope="module")
+def console_html() -> str:
+    return CONSOLE.read_text()
+
+
+@pytest.fixture(scope="module")
+def console_script(console_html: str) -> str:
+    scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", console_html, re.S)
+    assert len(scripts) == 1
+    return _strip_comments(scripts[0])
 
 
 @pytest.fixture(scope="module")
@@ -119,6 +136,21 @@ def test_no_script_reaches_a_remote_origin(script: str):
     assert "WebSocket" not in script
 
 
+def test_console_user_strings_are_never_written_as_html(console_script: str):
+    """Same rule, and the console is where it matters most: an admin reading the
+    user list is the high-privilege reader an injected script wants."""
+    for banned in ("innerHTML", "outerHTML", "document.write", "insertAdjacentHTML"):
+        assert banned not in console_script, banned
+    assert not re.search(r"\beval\s*\(", console_script)
+
+
+def test_console_reaches_no_remote_origin(console_script: str, console_html: str):
+    for url in re.findall(r"""fetch\(\s*['"]([^'"]+)""", console_script):
+        assert url.startswith("/"), url
+    for attr, value in re.findall(r'\b(src|href)\s*=\s*"([^"]*)"', console_html):
+        assert not value.startswith(("http://", "https://", "//")), f"{attr}={value}"
+
+
 def test_user_controlled_strings_are_never_written_as_html(script: str):
     """THE XSS BOUNDARY, and it is enforced structurally rather than by review.
 
@@ -159,18 +191,54 @@ def test_the_login_button_points_at_the_apex_and_takes_no_destination(script: st
     assert "?" not in hrefs[0]
 
 
-def test_logout_is_a_post(script: str):
+def test_the_console_is_a_separate_page_not_a_homepage_section(html: str, console_html: str):
+    """A management surface at the bottom of a marketing page is somewhere
+    nobody looks. The homepage links to it; it does not contain it."""
+    assert CONSOLE.is_file()
+    assert 'href="/console"' in html
+    for owned_by_console in ('id="keys"', 'id="users"', 'id="new-key"', "_console/"):
+        assert owned_by_console not in html, f"homepage still carries {owned_by_console}"
+        assert owned_by_console in console_html, f"console page lacks {owned_by_console}"
+
+
+def test_hidden_beats_display_on_both_pages(html: str, console_html: str):
+    """`[hidden]` is only a UA-stylesheet rule, so ANY `display` declaration
+    overrides it. Both pages set display on classes that are also hidden
+    (.who, .cta, .row), so without an explicit rule an element the script means
+    to keep hidden is silently visible."""
+    for name, doc in (("homepage", html), ("console", console_html)):
+        assert re.search(r"\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important", doc), name
+
+
+def test_the_console_distinguishes_its_three_states(console_script: str):
+    """Signed in, signed out, and no-login-configured are three different
+    things. Collapsing them renders a blank page, which is what made the first
+    version look broken rather than logged out."""
+    for element_id in ("no-login", "signed-out", "console"):
+        assert f"$('{element_id}')" in console_script, element_id
+
+
+def test_the_console_surfaces_failures_instead_of_swallowing_them(console_script: str):
+    """The first version ended loadMe() with an empty catch, so a console that
+    failed to load was indistinguishable from one that was merely logged out --
+    and being logged out is the state the user is trying to leave."""
+    assert "showError" in console_script
+    tail = console_script[console_script.index("function loadMe"):]
+    assert "showError" in tail, "loadMe must report its own failure"
+
+
+def test_logout_is_a_post(console_script: str):
     """A GET logout fires from any page that embeds an image pointing at it."""
-    assert "/_auth/logout" in script
-    assert re.search(r"f\.method\s*=\s*'POST'", script)
+    assert "/_auth/logout" in console_script
+    assert re.search(r"f\.method\s*=\s*'POST'", console_script)
 
 
 def test_the_console_is_hidden_until_the_server_says_there_is_a_login(html: str):
     """A deployment with no identity provider shows no sign-in button, rather
     than one that leads to a 404. The server decides, via /_auth/me; the page
     starts hidden so the default is the quiet one."""
-    for element_id in ("who", "console", "admin", "reveal"):
-        assert re.search(rf'id="{element_id}"[^>]*\shidden', html), element_id
+    for element_id in ("who", "signin", "goconsole"):
+        assert re.search(rf'id="{element_id}"[^>]*\shidden', html), f"homepage: {element_id}"
 
 
 def test_the_page_is_still_a_homepage(html: str):
@@ -187,13 +255,13 @@ def test_the_comment_stripper_does_not_eat_code(script_source: str, script: str)
     """
     assert len(script) > 0.4 * len(script_source), "stripper removed too much"
     for must_survive in (
-        "textContent",
+        "/_auth/me",
         "/_auth/login",
-        "/_console/keys",
+        "/console",
         "credentials: 'same-origin'",
     ):
         assert must_survive in script, must_survive
-    assert "// Self-contained on purpose" not in script, "stripper removed nothing"
+    assert "// This page is a homepage." not in script, "stripper removed nothing"
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +277,18 @@ def test_the_comment_stripper_does_not_eat_code(script_source: str, script: str)
 # ---------------------------------------------------------------------------
 
 WEB_ROOT = PAGE.parent
+
+
+def _resolves(ref: str) -> bool:
+    """Does this reference resolve the way the SERVER resolves it?
+
+    Mirrors _web_root_file: a file serves directly, and a DIRECTORY serves its
+    index.html. Testing `is_file()` alone would have called /console broken
+    while the server serves it correctly -- a check that disagrees with the
+    thing it checks.
+    """
+    target = WEB_ROOT / ref.lstrip("/")
+    return target.is_file() or (target / "index.html").is_file()
 
 
 def test_a_favicon_is_shipped_at_the_root():
@@ -228,8 +308,15 @@ def test_every_local_asset_the_page_references_actually_exists(html: str):
     # Application routes are served by the app, not from the web root.
     refs = {r for r in refs if not r.startswith(("/_auth", "/_console", "/v2", "/_cache"))}
     assert refs, "expected the page to reference local assets"
-    missing = sorted(r for r in refs if r != "/" and not (WEB_ROOT / r.lstrip("/")).is_file())
-    assert not missing, f"referenced but absent from the web root: {missing}"
+    assert not (missing := sorted(r for r in refs if r != "/" and not _resolves(r))), \
+        f"referenced but absent from the web root: {missing}"
+
+
+def test_every_local_asset_the_console_references_exists(console_html: str):
+    refs = set(re.findall(r'\b(?:src|href)\s*=\s*"(/[^"]*)"', console_html))
+    refs = {r for r in refs if not r.startswith(("/_auth", "/_console", "/v2", "/_cache"))}
+    missing = sorted(r for r in refs if r != "/" and not (WEB / r.lstrip("/")).is_file())
+    assert not missing, f"referenced but absent: {missing}"
 
 
 def test_the_mark_sits_on_a_paper_surface(html: str):

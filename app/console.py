@@ -224,6 +224,28 @@ async def set_user_disabled(
     return {"subject": subject, "disabled": disabled}
 
 
+@router.delete("/users/{subject}")
+async def delete_user(request: Request, subject: str) -> dict:
+    """Remove a user, their keys and their allowlist.
+
+    Refusing to delete YOURSELF is not paternalism: an admin who deletes their
+    own principal loses the session's backing row mid-request, and on a
+    single-admin deployment nothing can restore it without a shell on the box.
+    Sign out and have another admin do it.
+    """
+    admin = webauth.require_admin(request)
+    if subject == admin.subject:
+        raise HTTPException(status_code=400, detail="you cannot delete yourself")
+    try:
+        _store().delete_principal(subject)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="no such user") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log.info("user deleted: %s", subject[:12] + "...")
+    return {"subject": subject, "deleted": True}
+
+
 @router.get("/users/{subject}/keys")
 async def list_user_keys(request: Request, subject: str) -> dict:
     webauth.require_admin(request)
