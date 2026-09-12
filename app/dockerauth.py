@@ -85,6 +85,26 @@ def load() -> None:
     global _users  # noqa: PLW0603 - module-level cache, loaded once
     _users = None
     if settings.docker_auth == "none":
+        # THE NEGATIVE CONTROL. A credential file set while auth is off is not a
+        # neutral state: it is what an operator is left with after following this
+        # project's own push-through security warning, which named only the file.
+        # Silence here made "correctly open" and "you tried to close it and
+        # failed" identical -- and the file is never opened, so a malformed one
+        # would not have complained either.
+        #
+        # The sibling case (auth=basic with no file) REFUSES TO START, on the
+        # reasoning in this function's docstring: unknown must not resolve to
+        # permissive. This direction only WARNS, because refusing would turn a
+        # stale environment variable into an outage on upgrade for a live service
+        # other teams deploy. Whether it should refuse is a decision recorded on
+        # the ticket rather than taken here.
+        if settings.docker_htpasswd:
+            log.warning(
+                "XHC_DOCKER_HTPASSWD is set (%s) but XHC_DOCKER_AUTH is 'none', "
+                "so the file is IGNORED and /v2/* is UNAUTHENTICATED. Set "
+                "XHC_DOCKER_AUTH=basic to enforce it.",
+                settings.docker_htpasswd,
+            )
         return
     path = settings.docker_htpasswd
     if not path:

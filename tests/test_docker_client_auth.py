@@ -212,3 +212,61 @@ def test_v2_is_open_when_auth_is_off(client):
     settings.docker_auth = "none"
     dockerauth.load()
     assert client.get("/v2/").status_code == 200
+
+
+def test_htpasswd_without_basic_is_announced_not_silent(monkeypatch, tmp_path, caplog):
+    """A config that LOOKS closed and is open must not pass silently.
+
+    THE NEGATIVE CONTROL THIS FILE WAS MISSING. The sibling case is covered --
+    auth=basic with no file refuses to start -- and nothing covered the direction
+    an operator actually reaches by following our own security warning, which
+    named only XHC_DOCKER_HTPASSWD. With auth defaulting to `none` the loader
+    returns before opening the file, so:
+
+      - /v2/* is unauthenticated
+      - nothing is logged
+      - a MALFORMED file would not have complained either, since it is never read
+
+    Silence therefore meant both "correctly open" and "you tried to close it and
+    failed". This asserts the warning exists and names both variables, because a
+    warning that does not name the second one leaves the reader where they were.
+    """
+    import logging
+
+    from app import dockerauth
+    from app.config import settings
+
+    htpasswd = tmp_path / "htpasswd"
+    htpasswd.write_text("someone:$2b$12$" + "x" * 53 + "\n")
+    monkeypatch.setattr(settings, "docker_auth", "none")
+    monkeypatch.setattr(settings, "docker_htpasswd", str(htpasswd))
+
+    with caplog.at_level(logging.WARNING, logger="xhc.dockerauth"):
+        dockerauth.load()
+
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "IGNORED" in msg, "an ignored credential file must say so"
+    assert "XHC_DOCKER_AUTH" in msg, "the warning must name the setting that enables it"
+    assert "UNAUTHENTICATED" in msg, "it must say what the current state actually is"
+
+
+def test_no_warning_when_neither_is_set(monkeypatch, caplog):
+    """NEGATIVE CONTROL FOR THE NEGATIVE CONTROL.
+
+    A deliberately open cache with no credential file is the DEFAULT and is not a
+    misconfiguration. If this warned there too, the warning would fire on every
+    normal deployment and stop meaning anything -- which is how a real signal gets
+    trained out of a log.
+    """
+    import logging
+
+    from app import dockerauth
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "docker_auth", "none")
+    monkeypatch.setattr(settings, "docker_htpasswd", None)
+
+    with caplog.at_level(logging.WARNING, logger="xhc.dockerauth"):
+        dockerauth.load()
+
+    assert not [r for r in caplog.records if "IGNORED" in r.getMessage()]

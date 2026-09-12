@@ -891,8 +891,13 @@ content evictable when it may be the only copy anywhere. Nothing does it automat
 > **anyone who can reach this cache can push to any registry it holds credentials for**,
 > under the cache's identity, with no attribution — a `docker push` cannot identify
 > itself. That is the same trust model as the pull surface rather than an exception to it.
-> Restrict who can reach the port, or set `XHC_DOCKER_HTPASSWD`. Muninn warns at boot; it
-> does not refuse.
+> Restrict who can reach the port, or set **both** `XHC_DOCKER_AUTH=basic` **and**
+> `XHC_DOCKER_HTPASSWD` — **the file alone is ignored**, because auth defaults to `none`
+> and the loader returns before ever opening it. Muninn warns at boot; it does not refuse.
+>
+> This sentence named only the file until 0.9.6, so an operator could follow it exactly,
+> restart, see no error, and still be serving an unauthenticated push-through cache. The
+> file being set while auth is `none` now logs a warning naming both variables.
 
 **Not implemented:** delete and cross-repo mount. Removing upstream content is a retention
 decision for that registry's owner, not for a cache sitting in front of it.

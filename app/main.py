@@ -114,7 +114,8 @@ async def lifespan(app: FastAPI):
                 "this cache may push to any registry it holds credentials for, "
                 "under this cache's identity and with no attribution -- a "
                 "docker push cannot identify itself. Restrict who can reach the "
-                "port, or set XHC_DOCKER_HTPASSWD to require a credential.",
+                "port, or set BOTH XHC_DOCKER_AUTH=basic AND "
+                "XHC_DOCKER_HTPASSWD -- the file alone is ignored.",
                 settings.docker_push_mode,
             )
             if settings.docker_push_mode == "store-forward":
