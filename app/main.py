@@ -175,6 +175,15 @@ app = FastAPI(
     ),
     version="0.5.0",
     lifespan=lifespan,
+    # FastAPI mounts /docs, /redoc and /openapi.json with no authentication of
+    # any kind. On a private cache that is a convenience; on a public one it is
+    # a published description of the management API for anyone who asks. None
+    # of the three is needed to operate the cache, so they can be switched off
+    # entirely rather than gated -- an endpoint that does not exist cannot be
+    # misconfigured later.
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url="/redoc" if settings.docs_enabled else None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
 )
 
 

@@ -1339,6 +1339,8 @@ experiments age out.
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |
+| `XHC_HF_AUTH` | `none` | `key` requires a credential from `XHC_AUTHZ_DB` on the **Hugging Face surface** — the catch-all serving everything not claimed by another router. Accepts Basic **or** `Bearer <key_id>:<secret>`, so a user can set `HF_TOKEN` to that and Hugging Face's own tooling works unchanged. The web root stays public, so a homepage still renders logged out |
+| `XHC_DOCS` | `1` | FastAPI's `/docs`, `/redoc` and `/openapi.json`. They describe the management API and are unauthenticated by construction; set `0` on a public deployment |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |

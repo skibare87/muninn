@@ -32,6 +32,7 @@ from pathlib import Path
 
 import bcrypt
 from fastapi import Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from . import authz, authzstore
 from .config import settings
@@ -262,6 +263,74 @@ def authenticate(request: Request, authorization: str | None) -> bool:
         return False
     request.state.authz_key = key
     return True
+
+
+def parse_hf_credential(header: str | None) -> tuple[str, str] | None:
+    """Parse a credential off the Hugging Face surface. Basic OR Bearer.
+
+    BOTH, because the two clients that arrive here send different things and
+    neither is wrong. `huggingface_hub` sends `Authorization: Bearer <HF_TOKEN>`
+    and has no concept of a username, so a user sets HF_TOKEN to
+    `<key_id>:<secret>` and it arrives as one opaque string. curl, requests and
+    a browser send Basic, exactly as the /v2 surface already expects.
+
+    Returning None for anything unparseable, rather than raising: the caller
+    turns that into a 401 with a challenge, and a malformed header is not a
+    different outcome from an absent one.
+    """
+    if not header:
+        return None
+    scheme, _, value = header.partition(" ")
+    scheme = scheme.strip().lower()
+    value = value.strip()
+    if scheme == "basic":
+        return parse_basic(header)
+    if scheme == "bearer" and ":" in value:
+        key_id, _, secret = value.partition(":")
+        if key_id and secret:
+            return key_id, secret
+    return None
+
+
+def authenticate_hf(request: Request, authorization: str | None) -> bool:
+    """Resolve an HF-surface credential onto request.state.authz_key.
+
+    Returns True when XHC_HF_AUTH is off -- this function has no opinion then,
+    and the surface is open by configuration rather than by accident.
+    """
+    if settings.hf_auth != "key":
+        return True
+    st = store()
+    if st is None:
+        # XHC_HF_AUTH=key without a store is refused at startup, so reaching
+        # here means the store failed to open at runtime. FAIL CLOSED: an
+        # unreadable credential store means "unknown", never "allow".
+        log.error("XHC_HF_AUTH=key but no authorisation store; refusing")
+        return False
+    request.state.authz_key = None
+    creds = parse_hf_credential(authorization)
+    if creds is None:
+        return False
+    key = st.resolve(*creds)
+    if key is None or key.disabled:
+        return False
+    request.state.authz_key = key
+    return True
+
+
+def hf_unauthorized() -> Response:
+    """401 for the HF surface.
+
+    Carries a Basic challenge so a browser and curl prompt, and names the Bearer
+    form in the body because `huggingface_hub` shows the body on failure and its
+    users have an HF_TOKEN rather than a username and password.
+    """
+    return JSONResponse(
+        {"error": "this cache requires a credential",
+         "hint": "set HF_TOKEN to '<key_id>:<key_secret>', or use HTTP Basic"},
+        status_code=401,
+        headers={"www-authenticate": 'Basic realm="muninn"'},
+    )
 
 
 def authorize(request: Request, operation: str, reference: str) -> Response | None:

@@ -28,7 +28,7 @@ from fastapi.responses import (
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, metrics, policy, refs, serving, viewer
+from . import cachefs, dockerauth, metrics, policy, refs, serving, viewer
 from .config import settings
 from .jobs import manager
 
@@ -477,6 +477,23 @@ async def catch_all(full_path: str, request: Request) -> Response:
         if served is not None:
             return FileResponse(served)
 
+    # 0a. THE CREDENTIAL GATE FOR THIS ENTIRE SURFACE, and its position is the
+    #     design. It sits AFTER the web root so a homepage and its assets stay
+    #     public -- the login button has to render before anyone has a
+    #     credential -- and BEFORE every other branch, so there is no path
+    #     shape that reaches the Hub without passing it.
+    #
+    #     Placed here rather than as a router dependency for one reason: the web
+    #     root is served from inside this function, so a dependency would have
+    #     to gate the homepage too, and a cache whose front page 401s is not a
+    #     front page.
+    #
+    #     Off by default. When on, it covers api paths, resolve paths, the
+    #     datasets-server proxy and everything unrecognised, because it runs
+    #     before any of them are parsed.
+    if not dockerauth.authenticate_hf(request, request.headers.get("authorization")):
+        return dockerauth.hf_unauthorized()
+
     # 1. Stop clients from negotiating Xet through us. If they got a real
     #    casUrl they would pull bytes straight from HF and the cache would
     #    never see them -- a silent, and very expensive, bypass.
@@ -555,6 +572,42 @@ def _passthrough(upstream: httpx.Response) -> Response:
     )
 
 
+def _apply_upstream_auth(headers: dict) -> dict:
+    """Replace whatever the CLIENT sent with the cache's own Hub credential.
+
+    THE CACHE AUTHENTICATES TO THE HUB AS ITSELF. A client reaches us with a
+    ravencache key, sent through Hugging Face's own tooling -- `HF_TOKEN` becomes
+    `Authorization: Bearer <our key>` -- so that header is a credential for THIS
+    service and is meaningless upstream. It is stripped unconditionally.
+
+    This replaced an `if "authorization" not in headers` guard that applied the
+    cache's token only when the client had sent none. Two things were wrong with
+    it, and the first is the one that bites immediately:
+
+      * A client authenticating to us would have OUR OWN KEY FORWARDED TO
+        HUGGING FACE -- a third party -- and the pull would then fail there,
+        because a ravencache key is not a Hub token.
+      * Which credential the cache used upstream depended on what the client
+        happened to send. A user with their own HF_TOKEN set silently caused
+        ingest to be authorised as them rather than as the cache, so what landed
+        in a SHARED cache was decided by whoever asked first.
+
+    The /v2 surface already worked this way -- the cache presents its own
+    registry credentials and never forwards a client's. This makes the two
+    surfaces agree.
+
+    A consequence worth stating rather than discovering: a user cannot reach a
+    gated repo through this cache by supplying their own entitlement. The cache
+    can fetch what the cache can fetch. That is the correct behaviour for shared
+    storage, because anything fetched is then served to everyone whose rules
+    cover the path, regardless of their own Hub access.
+    """
+    headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+    if settings.hf_token:
+        headers["authorization"] = f"Bearer {settings.hf_token}"
+    return headers
+
+
 async def _proxy_get(full_path: str, request: Request) -> httpx.Response:
     """GET upstream, non-streamed.
 
@@ -566,8 +619,7 @@ async def _proxy_get(full_path: str, request: Request) -> httpx.Response:
     if request.url.query:
         url = f"{url}?{request.url.query}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
-    if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
-        headers["authorization"] = f"Bearer {settings.hf_token}"
+    headers = _apply_upstream_auth(headers)
     headers.setdefault("accept-encoding", "identity")
     try:
         resp = await get_client().get(url, headers=headers)
@@ -686,8 +738,7 @@ async def serve_datasets_server(endpoint: str, upstream_path: str, request: Requ
         entry = None
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
-    if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
-        headers["authorization"] = f"Bearer {settings.hf_token}"
+    headers = _apply_upstream_auth(headers)
     headers.setdefault("accept-encoding", "identity")
     try:
         upstream = await get_client().get(url, headers=headers)
@@ -1034,8 +1085,7 @@ async def proxy_upstream(full_path: str, request: Request) -> Response:
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
     # Use the cache's identity unless the client brought its own. This is how
     # you keep Hub tokens off the edge nodes entirely.
-    if "authorization" not in {k.lower() for k in headers} and settings.hf_token:
-        headers["authorization"] = f"Bearer {settings.hf_token}"
+    headers = _apply_upstream_auth(headers)
     # httpx injects its own accept-encoding, which would make us request a
     # gzipped body the client never asked for and then forward it verbatim.
     # Pin it to whatever the client actually sent.

@@ -144,6 +144,26 @@ class Settings:
     # When set, a Basic credential is USERNAME=key_id, PASSWORD=key_secret, and
     # pull and push become separately authorised for the first time.
     authz_db: str | None = None
+    # Require a credential on the HUGGING FACE surface -- the catch-all that
+    # serves everything not claimed by another router.
+    #
+    #   none  unauthenticated (default; unchanged for every existing deployment)
+    #   key   a valid key from XHC_AUTHZ_DB, as Basic or Bearer
+    #
+    # WHY THIS EXISTS AS A SEPARATE KNOB FROM XHC_DOCKER_AUTH: the two surfaces
+    # are served by different routers, and only /v2 was ever gated. On a private
+    # LAN cache that is fine. On a PUBLIC one it means the largest surface --
+    # every model and dataset byte -- is open to anyone who knows the hostname,
+    # and it is the surface an HF_TOKEN would be exposed through, since the cache
+    # authenticates to the Hub as itself and serves the result to whoever asked.
+    #
+    # THE WEB ROOT STAYS PUBLIC. A homepage nobody can load is not a homepage,
+    # and the login button has to render before anyone has a credential.
+    hf_auth: str = "none"
+    # FastAPI's interactive docs. They describe the management API and exist to
+    # be read by a developer, not by the internet. Default unchanged; turn off
+    # on a public deployment.
+    docs_enabled: bool = True
     # --- interactive login (OIDC) --------------------------------------------
     #
     # Entirely optional and unset by default: a Muninn with no issuer configured
@@ -439,6 +459,17 @@ class Settings:
                 "credential for it to check."
             )
 
+        hf_auth = (os.environ.get("XHC_HF_AUTH") or cls.hf_auth).strip().lower()
+        if hf_auth not in ("none", "key"):
+            raise ValueError(f"XHC_HF_AUTH must be none|key, got {hf_auth!r}")
+        # Fails on the ARGUMENTS: asking for key auth with no key store would
+        # start a server whose HF surface refuses everyone, which is a worse
+        # outcome than the one being guarded against.
+        if hf_auth == "key" and not (os.environ.get("XHC_AUTHZ_DB") or "").strip():
+            raise ValueError(
+                "XHC_HF_AUTH=key needs XHC_AUTHZ_DB: there are no keys to check without it."
+            )
+
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
         return cls(
@@ -455,6 +486,8 @@ class Settings:
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
             web_root=os.environ.get("XHC_WEB_ROOT") or None,
             authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
+            hf_auth=hf_auth,
+            docs_enabled=_env_bool("XHC_DOCS", cls.docs_enabled),
             oidc_issuer=oidc_issuer,
             oidc_client_id=os.environ.get("XHC_OIDC_CLIENT_ID") or None,
             oidc_client_secret=os.environ.get("XHC_OIDC_CLIENT_SECRET") or None,

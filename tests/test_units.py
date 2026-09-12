@@ -635,6 +635,10 @@ ENV_TO_SETTING = [
     # `token` needs XHC_MANAGE_TOKEN, so only `none` is valid on its own here;
     # the gated case is exercised in test_metrics_auth.py.
     ("XHC_METRICS_AUTH", "none", "metrics_auth", "none"),
+    # `key` needs XHC_AUTHZ_DB, so only `none` is valid alone here;
+    # the gated case is exercised in test_hf_auth.py.
+    ("XHC_HF_AUTH", "none", "hf_auth", "none"),
+    ("XHC_DOCS", "0", "docs_enabled", False),
     # --- docker / OCI (0.5.0) ---
     ("XHC_DOCKER_ENABLED", "0", "docker_enabled", False),
     ("XHC_DOCKER_DIR", "/mnt/oci", "docker_dir", "/mnt/oci"),
