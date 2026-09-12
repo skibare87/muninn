@@ -665,6 +665,10 @@ ENV_TO_SETTING = [
     ("XHC_OIDC_CLIENT_SECRET", "shh", "oidc_client_secret", "shh"),
     ("XHC_OIDC_REDIRECT_URI", "https://c/cb", "oidc_redirect_uri", "https://c/cb"),
     ("XHC_OIDC_SCOPES", "openid", "oidc_scopes", "openid"),
+    ("XHC_OIDC_DISCOVERY_URL", "https://p/x/.well-known/openid-configuration",
+     "oidc_discovery_url", "https://p/x/.well-known/openid-configuration"),
+    ("XHC_OIDC_PKCE", "0", "oidc_pkce", False),
+    ("XHC_BOOTSTRAP_ADMIN", "a@example.com", "bootstrap_admin", "a@example.com"),
     ("XHC_SESSION_SECRET", "sig", "session_secret", "sig"),
     ("XHC_SESSION_TTL", "600", "session_ttl_s", 600.0),
 ]

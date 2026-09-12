@@ -42,6 +42,8 @@ def client() -> oidc.OIDCClient:
             client_secret=settings.oidc_client_secret or "",
             redirect_uri=settings.oidc_redirect_uri or "",
             scopes=settings.oidc_scopes,
+            discovery_url=settings.oidc_discovery_url,
+            pkce=settings.oidc_pkce,
         )
     return _client
 
@@ -149,7 +151,9 @@ async def callback(request: Request) -> Response:
     if st is None:
         raise HTTPException(status_code=503, detail="authorisation store unavailable")
 
-    principal = st.claim_or_get_principal(identity.subject, identity.email)
+    principal = st.claim_or_get_principal(
+        identity.subject, identity.email, settings.bootstrap_admin
+    )
     if principal.disabled:
         # Authenticated, and still not allowed in. Refusing here rather than
         # issuing a cookie means a disabled account cannot get a session at all.

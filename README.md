@@ -1333,6 +1333,9 @@ experiments age out.
 | `XHC_OIDC_CLIENT_SECRET` | *(unset)* | OAuth client secret |
 | `XHC_OIDC_REDIRECT_URI` | *(unset)* | exact callback URL, e.g. `https://cache.example.com/_auth/callback`. Pinned, never taken from a query parameter |
 | `XHC_OIDC_SCOPES` | `openid email profile` | scopes requested at the provider |
+| `XHC_OIDC_DISCOVERY_URL` | *(derived)* | where the discovery document lives, when it is not `<issuer>/.well-known/openid-configuration`. Changes only where it is **fetched**; the issuer stays the trust anchor and a document declaring a different one is refused |
+| `XHC_OIDC_PKCE` | `1` | set `0` only if a provider **rejects** the parameter. Not advertising support is not the same as refusing it |
+| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself |
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |

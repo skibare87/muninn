@@ -128,7 +128,9 @@ class AuthzStore:
 
     # ---------------- principals ----------------
 
-    def claim_or_get_principal(self, subject: str, email: str = "") -> Principal:
+    def claim_or_get_principal(
+        self, subject: str, email: str = "", bootstrap_admin: str | None = None
+    ) -> Principal:
         """Get a principal, creating it on first sight.
 
         THE FIRST PRINCIPAL BECOMES ADMIN, AND THE CLAIM CANNOT RACE. Two
@@ -150,12 +152,23 @@ class AuthzStore:
                 return Principal(row["subject"], row["email"],
                                  bool(row["is_admin"]), bool(row["disabled"]))
             first = c.execute("SELECT COUNT(*) AS n FROM principals").fetchone()["n"] == 0
+            # The bootstrap grant is evaluated HERE -- inside the branch that
+            # creates the row -- and nowhere else. Consequences of that placement,
+            # all of them deliberate:
+            #   * idempotent: once the principal exists this is never consulted
+            #     again, so the setting is harmless to leave in the environment
+            #   * cannot re-promote someone deliberately demoted later
+            #   * cannot mint an admin on its own: no completed login, no row,
+            #     no grant. The environment names who MAY become admin; it does
+            #     not make anyone one.
+            bootstrap = bool(bootstrap_admin) and bootstrap_admin in (subject, email)
+            is_admin = first or bootstrap
             c.execute(
                 "INSERT INTO principals(subject,email,is_admin,disabled,created_at)"
                 " VALUES (?,?,?,0,?)",
-                (subject, email, 1 if first else 0, _now()),
+                (subject, email, 1 if is_admin else 0, _now()),
             )
-            return Principal(subject, email, is_admin=first, disabled=False)
+            return Principal(subject, email, is_admin=is_admin, disabled=False)
 
     def list_principals(self) -> list[Principal]:
         with self._connect() as c:

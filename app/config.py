@@ -166,6 +166,43 @@ class Settings:
     # target, which is the whole credential.
     oidc_redirect_uri: str | None = None
     oidc_scopes: str = "openid email profile"
+    # Where the discovery document lives, when it is NOT
+    # `<issuer>/.well-known/openid-configuration`. Some providers publish a
+    # per-application document at an unrelated path.
+    #
+    # This changes only where the document is FETCHED. The issuer above stays
+    # the trust anchor and is what the `iss` claim is checked against; a
+    # document declaring a different issuer is refused.
+    oidc_discovery_url: str | None = None
+    # PKCE, on by default. Set 0 only if a provider REJECTS the parameter --
+    # a provider merely not advertising support is not evidence it will refuse,
+    # since sparse discovery documents omit plenty they implement.
+    #
+    # This is a confidential client (there is a client secret), so PKCE is
+    # defence in depth against an intercepted authorization code rather than the
+    # only protection on the exchange. For a public client it would not be
+    # optional.
+    oidc_pkce: bool = True
+    # Grants admin to this subject (or email) WHEN THEIR PRINCIPAL IS FIRST
+    # CREATED, regardless of how many principals already exist.
+    #
+    # Needed because "first principal becomes admin" means COUNT(*) == 0, which
+    # is right for a fresh deployment and wrong for the case that actually
+    # happens: a cache with live consumers, whose credentials must be migrated
+    # into the store BEFORE authz is switched on or they are all refused at the
+    # next restart. That leaves the table non-empty, so the intended admin's
+    # first login silently does not make them one.
+    #
+    # Consulted ONLY at creation, never on a later login. So it is idempotent,
+    # harmless to leave set, and cannot re-promote someone who was deliberately
+    # demoted. It also never creates a principal by itself -- admin is granted
+    # by a COMPLETED login and by nothing else, or the environment would be a
+    # way to mint an administrator.
+    #
+    # Matching on email is weaker than on subject, because email is changeable
+    # at most providers. It is accepted only because nobody knows their own
+    # subject before their first login.
+    bootstrap_admin: str | None = None
     # Signs the session cookie. MUST be set when OIDC is on; there is no
     # generated default, because a per-process random key silently logs
     # everyone out on restart and silently fails to log anyone out across
@@ -423,6 +460,9 @@ class Settings:
             oidc_client_secret=os.environ.get("XHC_OIDC_CLIENT_SECRET") or None,
             oidc_redirect_uri=os.environ.get("XHC_OIDC_REDIRECT_URI") or None,
             oidc_scopes=os.environ.get("XHC_OIDC_SCOPES", cls.oidc_scopes),
+            oidc_discovery_url=os.environ.get("XHC_OIDC_DISCOVERY_URL") or None,
+            oidc_pkce=_env_bool("XHC_OIDC_PKCE", cls.oidc_pkce),
+            bootstrap_admin=os.environ.get("XHC_BOOTSTRAP_ADMIN") or None,
             session_secret=os.environ.get("XHC_SESSION_SECRET") or None,
             session_ttl_s=_env_float("XHC_SESSION_TTL", cls.session_ttl_s),
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),

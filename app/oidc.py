@@ -89,9 +89,34 @@ class OIDCClient:
         redirect_uri: str,
         scopes: str = "openid email profile",
         *,
+        discovery_url: str | None = None,
+        pkce: bool = True,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self.issuer = issuer.rstrip("/")
+        # WHERE the discovery document lives, which is not always
+        # `issuer + /.well-known/openid-configuration`. Some providers publish a
+        # per-application document at an unrelated path.
+        #
+        # This changes only where the document is FETCHED FROM. It does not
+        # change the trust anchor: `issuer` still comes from configuration and
+        # is still what the `iss` claim is checked against. See metadata().
+        self.discovery_url = discovery_url or f"{self.issuer}/.well-known/openid-configuration"
+        # PKCE, on by default. The escape hatch exists because a provider that
+        # REJECTS an unrecognised parameter breaks every login, and that is not a
+        # thing to discover during a cutover.
+        #
+        # Turning it off is a real but small loss here: this is a CONFIDENTIAL
+        # client, so the token exchange is already authenticated by the client
+        # secret and PKCE is defence in depth against an intercepted code rather
+        # than the only thing standing between an attacker and a token. For a
+        # public client it would not be optional.
+        #
+        # NOTE that a provider ADVERTISING no support is not evidence it will
+        # reject: sparse discovery documents omit plenty they implement. Absence
+        # in the document means unknown, so the default stays on and this flag is
+        # for what a real login actually shows.
+        self.pkce = pkce
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
@@ -120,9 +145,51 @@ class OIDCClient:
         """
         if self._meta is None:
             c = await self._client()
-            r = await c.get(f"{self.issuer}/.well-known/openid-configuration")
+            r = await c.get(self.discovery_url)
             r.raise_for_status()
-            self._meta = r.json()
+            meta = r.json()
+            # THE DOCUMENT DOES NOT GET TO NAME ITS OWN ISSUER.
+            #
+            # `iss` is verified against the CONFIGURED issuer, so if the `iss`
+            # check also took its expected value from this document, it would be
+            # checking the document against itself -- a fetched-over-the-network
+            # value validating a fetched-over-the-network value. Anyone who could
+            # serve a discovery document could then name any issuer they liked and
+            # the check would pass.
+            #
+            # OIDC Discovery requires these to match, so enforcing it is the spec
+            # rather than an extra restriction; the reason it is written out is
+            # that the failure is silent if you skip it. It matters MORE when
+            # discovery sits at a non-standard path, because then the URL itself
+            # no longer ties the document to the issuer.
+            declared = (meta.get("issuer") or "").rstrip("/")
+            if declared != self.issuer:
+                raise OIDCError(
+                    f"discovery document at {self.discovery_url} declares issuer "
+                    f"{declared!r}, configured issuer is {self.issuer!r}"
+                )
+            # The endpoints this flow cannot run without. Checked HERE, where the
+            # message can name the document, rather than discovered as a KeyError
+            # in the middle of a user's first login.
+            #
+            # This is not defensive padding. A provider can serve a document that
+            # is well-formed, 200, self-consistent about its own issuer, and still
+            # the WRONG DOCUMENT -- Cloudflare Access publishes one at the team
+            # domain for verifying gateway assertions, with no token or
+            # authorization endpoint, alongside the per-application one that has
+            # them. Point at the first and every check above passes.
+            missing = [
+                k for k in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+                if not meta.get(k)
+            ]
+            if missing:
+                raise OIDCError(
+                    f"discovery document at {self.discovery_url} has no "
+                    + ", ".join(missing)
+                    + " -- this is not an authorization-code provider. Check the "
+                    "issuer names the APPLICATION, not the account or team root."
+                )
+            self._meta = meta
         return self._meta
 
     async def _jwk_client(self) -> PyJWKClient:
@@ -146,8 +213,7 @@ class OIDCClient:
         meta = await self.metadata()
         state = secrets.token_urlsafe(32)
         nonce = secrets.token_urlsafe(32)
-        verifier = secrets.token_urlsafe(64)
-        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        verifier = secrets.token_urlsafe(64) if self.pkce else ""
         self._pending[state] = (nonce, verifier, time.time())
 
         from urllib.parse import urlencode
@@ -159,9 +225,10 @@ class OIDCClient:
             "scope": self.scopes,
             "state": state,
             "nonce": nonce,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
         }
+        if self.pkce:
+            params["code_challenge"] = _b64url(hashlib.sha256(verifier.encode()).digest())
+            params["code_challenge_method"] = "S256"
         return f"{meta['authorization_endpoint']}?{urlencode(params)}"
 
     async def complete(self, code: str, state: str) -> Identity:
@@ -187,12 +254,22 @@ class OIDCClient:
                 "redirect_uri": self.redirect_uri,
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
-                "code_verifier": verifier,
+                # Sent only if a challenge was sent. A verifier with no challenge
+                # is at best ignored and at worst rejected as an unknown
+                # parameter, which would turn the escape hatch into a second bug.
+                **({"code_verifier": verifier} if self.pkce else {}),
             },
             headers={"Accept": "application/json"},
         )
         if r.status_code != 200:
-            raise OIDCError(f"token endpoint returned {r.status_code}")
+            # The body carries the provider's own error code, and for a login
+            # that fails at the exchange it is usually the only thing that says
+            # WHY -- `invalid_grant` on a reused code reads very differently from
+            # an unsupported parameter. Logged by the caller, never returned to
+            # the browser.
+            raise OIDCError(
+                f"token endpoint returned {r.status_code}: {r.text[:300]}"
+            )
         token = r.json().get("id_token")
         if not token:
             raise OIDCError("no id_token in the token response")
@@ -206,7 +283,9 @@ class OIDCClient:
                 # is what "alg: none" and algorithm-confusion attacks rely on.
                 algorithms=["RS256", "RS512", "ES256", "ES384"],
                 audience=self.client_id,   # the aud check -- not optional
-                issuer=meta.get("issuer", self.issuer),
+                # the CONFIGURED issuer, never the document's -- metadata()
+                # has already refused a document that disagrees with it
+                issuer=self.issuer,
                 options={"require": ["exp", "iat", "aud", "iss", "sub"]},
             )
         except jwt.PyJWTError as exc:

@@ -194,3 +194,74 @@ def test_the_store_survives_reopening(store, tmp_path):
     assert k is not None
     assert decide(k, "push", "ghcr.io/me/app")[0]
     assert sum(p.is_admin for p in reopened.list_principals()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap admin.
+#
+# "First principal becomes admin" is COUNT(*) == 0, which is right for a fresh
+# deployment and wrong for the case that actually happens: a cache with live
+# consumers whose credentials must be migrated in BEFORE authz is switched on,
+# or they are all refused at the next restart. That leaves the table non-empty
+# and the intended admin silently does not become one.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_grants_admin_even_when_the_table_is_not_empty(tmp_path):
+    """The case it exists for: machine credentials migrated in first."""
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("svc-consumer")           # migrated first
+    assert st.claim_or_get_principal("svc-consumer").is_admin is True, (
+        "sanity: the consumer took the first-principal grant, which is the problem"
+    )
+    human = st.claim_or_get_principal("sub-matt", "m@example.com", "sub-matt")
+    assert human.is_admin is True
+
+
+def test_bootstrap_matches_on_email_too(tmp_path):
+    """Nobody knows their own subject before their first login, which is the
+    only reason email is accepted here at all."""
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("svc-consumer")
+    p = st.claim_or_get_principal("sub-xyz", "m@example.com", "m@example.com")
+    assert p.is_admin is True
+
+
+def test_bootstrap_does_not_grant_to_anyone_else(tmp_path):
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("svc-consumer")
+    other = st.claim_or_get_principal("sub-stranger", "s@example.com", "sub-matt")
+    assert other.is_admin is False
+
+
+def test_bootstrap_cannot_re_promote_a_DEMOTED_admin(tmp_path):
+    """THE REASON IT IS EVALUATED AT CREATION ONLY. Left set in the environment
+    -- which it will be -- a grant applied on every login would silently undo a
+    deliberate demotion the next time that person signed in."""
+    st = AuthzStore(tmp_path / "a.db")
+    st.claim_or_get_principal("sub-matt", "m@example.com", "sub-matt")
+    st.claim_or_get_principal("sub-two", "t@example.com")
+    st.set_admin("sub-two", True)
+    st.set_admin("sub-matt", False)
+
+    again = st.claim_or_get_principal("sub-matt", "m@example.com", "sub-matt")
+    assert again.is_admin is False, "a later login must not re-grant admin"
+
+
+def test_bootstrap_does_not_create_a_principal_by_itself(tmp_path):
+    """Admin is granted by a COMPLETED login and by nothing else. If the setting
+    could create a row, the environment would be a way to mint an administrator
+    without anyone authenticating."""
+    st = AuthzStore(tmp_path / "a.db")
+    assert st.list_principals() == []
+    # naming someone who never logs in changes nothing
+    st.claim_or_get_principal("sub-someone-else", "", "sub-matt")
+    assert [p.subject for p in st.list_principals()] == ["sub-someone-else"]
+    assert not any(p.is_admin and p.subject == "sub-matt" for p in st.list_principals())
+
+
+def test_an_unset_bootstrap_leaves_the_first_principal_rule_alone(tmp_path):
+    """The default path must be unchanged: this is opt-in."""
+    st = AuthzStore(tmp_path / "a.db")
+    assert st.claim_or_get_principal("sub-a").is_admin is True
+    assert st.claim_or_get_principal("sub-b", "", None).is_admin is False
