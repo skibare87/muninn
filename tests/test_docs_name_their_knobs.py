@@ -163,3 +163,83 @@ def test_the_exclusion_list_does_not_silently_cover_everything():
     assert len(routes) >= 10, f"the route sweep found almost nothing: {sorted(routes)}"
     for expected in ("/healthz", "/metrics", "/_cache/docker/pending"):
         assert expected in routes, f"{expected} vanished from the swept set"
+
+
+# ---------------------------------------------------------------------------
+# The same rule, applied to the other kind of name.
+#
+# The env-var check above was written after a colleague could not enable a
+# feature because the variable was never named. It then went green for three
+# releases while two management ENDPOINTS stayed undocumented, and green again
+# while the key-management console shipped at a URL the README never mentions.
+#
+# That is the guard generalising to the instances its author had seen. The rule
+# is broader: ANYTHING A READER MUST TYPE IN ORDER TO USE THIS MUST BE NAMED.
+# A path is as much a knob as a variable.
+# ---------------------------------------------------------------------------
+
+
+def _route_prefixes() -> set[str]:
+    """The paths a user or operator has to know, reduced to their prefix.
+
+    Reduced rather than enumerated because documenting `/_cache/jobs/{job_id}`
+    verbatim is not the point -- naming `/_cache` is. The catch-all is excluded:
+    it is every path that is not one of these, which is prose, not a name.
+    """
+    # The ROUTERS, not the assembled app. Several are mounted conditionally --
+    # the login and console surfaces only exist when an identity provider is
+    # configured -- so reading app.routes under a test configuration is blind to
+    # exactly the features most likely to be new and undocumented. That blind
+    # spot is the same shape as the bug this file exists to catch, and it was
+    # found by mutating the README and watching the check NOT go red.
+    import app.main as main
+    from app import console, hfcompat, manage, ocicompat, ocimanage, webauth
+
+    routers = [manage.router, ocimanage.router, ocicompat.router,
+               webauth.router, console.router, hfcompat.router]
+
+    out = set()
+    # route.path already carries the router's prefix; prepending it again
+    # produced "/_auth/_auth" and is the kind of thing a check catches on
+    # itself only because its own output is readable.
+    collected = [getattr(route, "path", "") for r in routers for route in r.routes]
+    collected += [getattr(route, "path", "") for route in main.app.routes]
+    for path in collected:
+        if not path or "{full_path" in path or "{rest" in path:
+            continue
+        parts = [p for p in path.split("/") if p and not p.startswith("{")]
+        if not parts:
+            continue
+        # The FIRST segment only. The requirement is that a reader can find the
+        # SURFACE -- /_console, /_cache, /v2 -- not that every sub-route is
+        # transcribed. Demanding the latter produced a check that failed on
+        # /_console/keys, which nobody types: the console is a browser page.
+        # A guard set at the wrong granularity gets suppressed rather than
+        # satisfied, and then it is not a guard.
+        out.add("/" + parts[0])
+    return out
+
+
+def test_every_endpoint_is_named_in_the_readme():
+    readme = (ROOT / "README.md").read_text()
+    missing = sorted(p for p in _route_prefixes() if p not in readme)
+    assert not missing, (
+        "endpoints the app serves but the README never names: "
+        f"{missing}. A reader cannot use a path they have to guess."
+    )
+
+
+def test_every_shipped_page_is_named_in_the_readme():
+    """The example web root ships pages at URLs. A console nobody can find is
+    the same failure as a variable nobody can name -- and it is how the key
+    management UI shipped at /console with no mention of it anywhere."""
+    readme = (ROOT / "README.md").read_text()
+    web = ROOT / "examples" / "web-root"
+    if not web.is_dir():
+        return
+    urls = set()
+    for index in web.rglob("index.html"):
+        rel = index.parent.relative_to(web).as_posix()
+        urls.add("/" if rel == "." else f"/{rel}")
+    missing = sorted(u for u in urls if u != "/" and u not in readme)
+    assert not missing, f"pages shipped but never named in the README: {missing}"

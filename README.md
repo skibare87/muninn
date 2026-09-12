@@ -1086,6 +1086,33 @@ user could edit their own, "create a key" and "grant myself push to everything" 
 same operation. A newly created key therefore grants nothing until an administrator sets an
 allowlist, which the UI says rather than leaving the user to discover.
 
+#### The console at `/console`
+
+`examples/web-root/` ships two pages: the homepage at `/`, and the key-management
+console at **`/console`**. Point `XHC_WEB_ROOT` at that directory and both are served.
+
+The console is a separate page on purpose. It began as a section at the bottom of the
+homepage, and the report that moved it was *"I have to scroll down a mile to find it"* —
+a management surface under four sections of marketing copy is somewhere nobody looks.
+
+| | |
+| --- | --- |
+| any signed-in user | create, disable and delete **their own** keys; see their allowlist |
+| admin | all users, each with an editable allowlist, admin toggle, disable, and delete |
+
+Creating a key shows the `docker login` line and the `HF_ENDPOINT`/`HF_TOKEN` pair with
+the values filled in. Deleting a user takes their keys and allowlist with them, and is
+refused for the last administrator and for yourself.
+
+The page is a client of **`/_console`**, which is the JSON API behind it —
+`/_console/keys` for a user's own credentials and `/_console/users` for administration,
+both authorised by the session cookie rather than by a cache key. It is named here
+because it exists, not because you are expected to call it directly; the console page is
+the supported way in, and `/_auth` is the login surface it depends on.
+
+Both pages are self-contained — no framework, no CDN, no external request of any kind —
+and every user-written string is inserted with `textContent`, never `innerHTML`.
+
 A key secret is shown **once**, at creation. The store keeps only a SHA-256 hash, which is
 what makes a copy of the database less than a full compromise.
 
