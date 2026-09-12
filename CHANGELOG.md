@@ -9,6 +9,33 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.10 — 2026-09-12
+
+v0.9.10 -- revocation now works when the write came from another process
+
+A key disabled by anything other than the running server KEPT AUTHENTICATING
+until that server restarted. A key minted the same way did not work at all.
+
+The read path is an in-memory cache and invalidation only dropped it inside the
+writing object, so a migration script, an operator, or a one-shot exec committed
+to SQLite and the server never noticed. Observed against a live service: two
+freshly minted keys returned 401 while a key disabled seconds earlier returned
+200. A restart inverted both.
+
+Freshness is now checked against the database. `PRAGMA data_version` changes
+when another connection commits, answered from an open handle with no I/O. The
+cache is still a cache -- unchanged data is not reloaded.
+
+Anyone administering an authorisation store out of band should upgrade. The
+failure is silent in the direction that matters: the revocation appears to
+succeed and the credential keeps working.
+
+ALSO: users can be deleted. The console could grant admin and disable an
+account, but a principal created in error stayed in the list forever. Deletion
+cascades to keys and allowlist, and refuses on the last administrator or on
+yourself.
+
+
 ## v0.9.9 — 2026-09-12
 
 v0.9.9 -- the Hugging Face surface can require a credential, and never forwards yours
