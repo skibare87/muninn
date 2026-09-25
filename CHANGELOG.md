@@ -9,6 +9,41 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.26 — 2026-09-25
+
+v0.9.26 -- an acknowledged push survives losing the blob disk; HTTP clients follow their event loop
+
+STORE-FORWARD DURABILITY. A store-forward push answered 201 is now durable.
+
+  - With XHC_STATE_DIR set, a pending push -- its record and the bytes it
+    will forward -- lives under $XHC_STATE_DIR/oci/pending/ until the upstream
+    confirms it. Replacing or losing the docker dir no longer loses a push the
+    client was told succeeded. On the same filesystem the held copy is a hard
+    link and costs nothing. Across filesystems it is copied, hashed against
+    its digest while it is written, fsynced, and renamed into place.
+    XHC_DOCKER_PUSH_PENDING_MAX_SIZE optionally caps it, and a copy that would
+    leave less than 64 MiB free on the state volume is refused. A refusal is a
+    507 naming the setting, never an accept-then-drop.
+  - In every mode, a push whose forward record cannot be written is refused
+    (507 if the volume is full, 503 otherwise) instead of acknowledged.
+    BEHAVIOUR CHANGE: previously the failure was logged and 201 returned
+    anyway.
+  - A resumed manifest whose body has gone missing is kept and reported as
+    failed until an operator abandons it. Previously it was deleted, with
+    only a log line.
+  - Existing <docker dir>/_pending records move to the state dir on first
+    boot with it set. If their bytes cannot be held, startup refuses.
+
+HTTP CLIENTS. Long-lived HTTP clients are now built on the event loop that
+uses them, and all of them are closed at shutdown. The OIDC login client was
+never closed before. A second start of the object-store tier in the same
+process used to reuse a closed client and let its upload workers die
+silently. Under uvicorn's single loop none of this affected normal serving.
+
+Tests: a test that runs longer than 120 s dumps every thread's stack, and CI
+jobs time out at 15 minutes.
+
+
 ## v0.9.25 — 2026-09-25
 
 v0.9.25 -- the management API is off unless XHC_MANAGE_TOKEN is set
