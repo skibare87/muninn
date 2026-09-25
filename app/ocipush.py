@@ -277,7 +277,9 @@ def _held_total() -> int:
 def _reserve(n: int) -> None:
     """Claim `n` bytes of the pending area, or refuse the push. Synchronous on
     purpose: see _held."""
-    cap = getattr(settings, "docker_push_pending_max_bytes", None)
+    # The cap is a bound on the STATE volume; without one there is nothing
+    # separate to protect, and the docker dir's own capacity applies.
+    cap = getattr(settings, "docker_push_pending_max_bytes", None) if _durable() else None
     total = _held_total()
     if cap is not None and total + n > cap:
         raise PushError(
@@ -296,19 +298,29 @@ def _release(n: int) -> None:
 
 
 def _refusal(exc: OSError, what: str) -> PushError:
+    where = _obligations_dir_name()
     if exc.errno in (errno.ENOSPC, errno.EDQUOT):
         return PushError(
             507, "UNAVAILABLE",
-            f"cannot hold {what} on the state volume ({exc}); the push was NOT "
-            "accepted. Free space there, or set XHC_DOCKER_PUSH_PENDING_MAX_SIZE "
-            "so this is refused before the volume fills.")
+            f"cannot write {what} to {where} ({exc}); the push was NOT accepted. "
+            "Free space there"
+            + (", or set XHC_DOCKER_PUSH_PENDING_MAX_SIZE so this is refused "
+               "before the volume fills." if _durable() else "."))
     return PushError(503, "UNAVAILABLE",
-                     f"cannot hold {what} on the state volume ({exc}); the push "
-                     "was NOT accepted")
+                     f"cannot write {what} to {where} ({exc}); the push was NOT "
+                     "accepted")
+
+
+def _obligations_dir_name() -> str:
+    """For messages only: never creates anything, so it cannot fail."""
+    if _durable():
+        return f"{settings.state_dir}/oci/pending (the state volume)"
+    return str(_legacy_obligations_dir())
 
 
 def _record_obligation(key: str, record: dict) -> None:
-    """Write down that we owe an upstream something, BEFORE we owe it.
+    """Write down that we owe an upstream something, BEFORE we owe it -- or
+    refuse the push. Raises PushError; the caller answers.
 
     The queue used to live only in memory. A restart emptied it while the bytes
     stayed on disk, so the client had been told 201, the upstream did not have
@@ -325,27 +337,18 @@ def _record_obligation(key: str, record: dict) -> None:
     This is a minimal durable queue, not a general one: one small file per
     outstanding forward, removed on success.
 
-    This lenient form is the XHC_STATE_DIR-unset path, where a failed write has
-    always been logged and the push still accepted. With the state dir set,
-    _record_obligation_strict is used instead: the operator asked for pending
-    pushes to survive the disk, and one whose record was not written would not.
+    STRICT IN BOTH MODES. A failed write used to be logged and the push answered
+    201 anyway -- a push the client was told succeeded that would not survive
+    the next restart, which is the same silent loss the record exists to
+    prevent, one step earlier. Now it is refused: 507 if the volume is full,
+    503 otherwise. The client can retry a refusal; it cannot retry a 201.
     """
-    try:
-        _write_durable(_obligation_path(key), json.dumps(record).encode())
-    except OSError:
-        # Never fail a push because the marker could not be written -- but say
-        # so, because it means this forward will not survive a restart.
-        log.exception("could not record the forward obligation for %s; it will "
-                      "be LOST if this process restarts before it completes", key)
-
-
-def _record_obligation_strict(key: str, record: dict) -> None:
-    """Write the obligation or raise PushError. Counts against the bound."""
     data = json.dumps(record).encode()
-    path = _obligation_path(key)
-    grow = max(0, len(data) - (path.stat().st_size if path.exists() else 0))
-    _reserve(grow)
+    grow = 0
     try:
+        path = _obligation_path(key)
+        grow = max(0, len(data) - (path.stat().st_size if path.exists() else 0))
+        _reserve(grow)
         _write_durable(path, data)
     except OSError as exc:
         _release(grow)
@@ -803,14 +806,18 @@ async def finalise_blob(up: Upload, claimed: str) -> None:
         # recorded or landed.
         try:
             await _hold(up, claimed, key)
-            _record_obligation_strict(key, record)
+            _record_obligation(key, record)
         except PushError:
             discard(up)
             raise
-        _land(up, claimed, pin=True, force_keep=True)
     else:
-        _land(up, claimed, pin=True, force_keep=True)
-        _record_obligation(key, record)
+        # Recorded before the 201 in this mode too, or refused.
+        try:
+            _record_obligation(key, record)
+        except PushError:
+            discard(up)
+            raise
+    _land(up, claimed, pin=True, force_keep=True)
     _pending[key] = asyncio.create_task(_forward_later(up.ref, claimed, key))
 
 
@@ -1094,12 +1101,8 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
               "repo": ref.repo, "digest": digest, "reference": reference,
               "media_type": media_type,
               "body_b64": base64.b64encode(body).decode()}
-    if _durable():
-        _record_obligation_strict(key, record)     # refused before any 201
-        _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
-    else:
-        _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
-        _record_obligation(key, record)
+    _record_obligation(key, record)     # refused before any 201, in both modes
+    _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
     _pinned.add(key)
     _pending[key] = asyncio.create_task(
         _forward_manifest_later(ref, body, media_type, reference, digest, key))

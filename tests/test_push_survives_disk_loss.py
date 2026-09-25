@@ -513,3 +513,38 @@ def test_a_manifest_whose_body_is_gone_stays_visible_as_failed(tmp_path, monkeyp
     row = [p for p in pend if p["digest"] == mdigest]
     assert row and row[0]["state"] == "failed" and row[0]["pinned"], pend
     assert list((disk / "_pending").glob("*.json"))
+
+
+@pytest.mark.parametrize("err,status", [(errno.ENOSPC, 507), (errno.EIO, 503)])
+def test_without_a_state_dir_an_unrecorded_push_is_REFUSED_not_acknowledged(
+        tmp_path, monkeypatch, err, status):
+    """With XHC_STATE_DIR unset a failed record write used to be logged and the
+    push answered 201 anyway: a push the client was told succeeded that would
+    not survive the next restart. Refused now, in this mode too, and nothing is
+    left pinned, landed or scheduled."""
+    Upstream(monkeypatch)
+    real = ocipush._write_durable
+
+    def refuse_json(path, data):
+        if path.name.endswith(".json"):
+            raise OSError(err, os.strerror(err))
+        return real(path, data)
+
+    monkeypatch.setattr(ocipush, "_write_durable", refuse_json)
+
+    async def go():
+        up = ocipush.begin(_ref())
+        await ocipush.append(up, LAYER)
+        with pytest.raises(ocipush.PushError) as blob_exc:
+            await ocipush.finalise_blob(up, up.computed)
+        with pytest.raises(ocipush.PushError) as man_exc:
+            await ocipush.push_manifest(_ref(), _manifest(), MEDIA, "v1")
+        return up.computed, blob_exc.value, man_exc.value
+
+    digest, blob_err, man_err = asyncio.run(go())
+    assert blob_err.status == status and man_err.status == status
+    assert "NOT accepted" in blob_err.message
+    assert not ocipush._pinned and not ocipush._pending
+    assert not ocistore.blob_path(UPSTREAM, digest).exists()
+    assert not ocistore.load_manifest(UPSTREAM, ocistore.compute_digest(_manifest()))
+    assert not list((Path(settings.docker_dir) / "_pending").glob("*"))

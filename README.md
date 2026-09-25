@@ -1007,10 +1007,15 @@ was never answered `201`, and is not kept: the client retries it.
 | record | `<XHC_DOCKER_DIR>/_pending/<key>.json` | `$XHC_STATE_DIR/oci/pending/<key>.json` |
 | manifest body | inside the record, and in the cache | inside the record, and in the cache |
 | blob bytes | in the cache only | `$XHC_STATE_DIR/oci/pending/<key>.blob`, and in the cache |
+| record cannot be written | push **refused** (`507` if full, `503` otherwise) | push **refused** (`507` if full, `503` otherwise) |
 | process restart | survives | survives |
 | docker dir lost or replaced | **lost** | **survives** |
 | state dir lost | n/a | **lost** |
 
+- **No `201` without a record, in either mode.** The record is written, and synced,
+  before the client is answered. If it cannot be written the push is refused, not
+  acknowledged and then forgotten at the next restart. Before this, a failed write was
+  only logged and the client still got `201`.
 - **Without `XHC_STATE_DIR`, the docker dir is the durable storage.** A pending push
   survives a restart but not the disk. Do not put the docker dir on disposable storage with
   `store-forward` unless you also set `XHC_STATE_DIR`.
@@ -1025,8 +1030,7 @@ was never answered `201`, and is not kept: the client retries it.
   the push, if copying it would leave less than 64 MiB free there, or would take the
   pending area over `XHC_DOCKER_PUSH_PENDING_MAX_SIZE`. The client gets
   `507 Insufficient Storage` and nothing is recorded, pinned or kept, so it can retry
-  once the queue drains. Muninn never accepts a push and drops it later. A record that
-  cannot be written is refused the same way: `507` if the volume is full, `503` otherwise.
+  once the queue drains. Muninn never accepts a push and drops it later.
 - **Upgrading.** The first boot with `XHC_STATE_DIR` set moves each existing
   `<XHC_DOCKER_DIR>/_pending/*.json` to the state dir and holds its bytes there first. If
   the bytes cannot be held, the boot stops and the old record stays where it was. Records
