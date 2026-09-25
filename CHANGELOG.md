@@ -9,6 +9,33 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.14 — 2026-09-25
+
+v0.9.14 -- XHC_STATE_DIR keeps durable state off the blob disk
+
+Blobs can live on disposable local disk while the files whose loss changes
+behaviour -- pins, orphan marks and the runtime policy -- live on a small
+persistent volume. Losing blobs costs a re-fetch; losing pins or orphan marks
+can let eviction delete the only remaining copy of something.
+
+Set XHC_STATE_DIR to an absolute path. Layout: $XHC_STATE_DIR/hf/ and
+$XHC_STATE_DIR/oci/, so the two protocols' pin files can never be the same
+file. Unset, nothing moves and nothing changes.
+
+Existing in-tree state is copied across per file, byte for byte, at startup and
+again the first time any path resolves that file, so nothing can read an empty
+state dir as "nothing pinned" while the old file still holds pins. A corrupt
+old file arrives corrupt and still fails closed. If the state dir cannot be
+created or written, the service refuses to start rather than falling back to
+the disk it was told is disposable.
+
+Put XHC_AUTHZ_DB on the same volume.
+
+The README no longer names a concrete release in its install examples. It shows
+the tag's form and says to pin by the digest read from your own pull; a docs
+test fails if a concrete version number comes back.
+
+
 ## v0.9.13 — 2026-09-12
 
 v0.9.13 -- a wildcard key scope means no limit
