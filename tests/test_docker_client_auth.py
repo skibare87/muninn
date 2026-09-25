@@ -202,9 +202,13 @@ def test_the_pull_credential_does_not_open_the_management_api(tmp_path, client, 
     """
     _enable(tmp_path)
     monkeypatch.setattr(settings, "manage_token", "management-secret")
-    r = client.get("/_cache/images",
+    # /_cache/docker/images, not /_cache/images: the latter is not a route, and
+    # this test used to pass on the 401 the UPSTREAM returned for it once the
+    # catch-all proxied it. Muninn's own refusal is asserted by its body.
+    r = client.get("/_cache/docker/images",
                    headers={"authorization": _basic("hiro", "s3cret")})
     assert r.status_code == 401
+    assert "management token" in r.text
 
 
 def test_v2_is_open_when_auth_is_off(client):
