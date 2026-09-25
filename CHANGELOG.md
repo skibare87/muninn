@@ -9,6 +9,54 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.20 — 2026-09-25
+
+v0.9.20 -- workload identity (JWT), and Kubernetes examples
+
+Workload identity. Pods, CI jobs and client-credentials services can
+authenticate with a short-lived token from their platform's OIDC issuer
+instead of a static key. Configure trusted issuers in XHC_JWT_ISSUERS (JSON).
+For each one, the audience and a subject template are required. A token
+authenticates as the mapped principal in XHC_AUTHZ_DB, and that principal's
+rules apply exactly as they do for a key, on /v2 and the Hugging Face surface.
+
+  - The configured issuer is the trust anchor. The audience and exp are
+    required. Keys are selected by kid. Algorithms are asymmetric only: `none`
+    and every HS* are refused, which closes the HS256-with-the-public-key
+    confusion.
+  - A key set can come from discovery (https only) or from jwks_uri, including
+    file:///path for issuers the pod cannot reach. Refetches are rate-limited
+    per issuer. A warm key set keeps verifying through an issuer outage; with a
+    cold one, the issuer's tokens are refused.
+  - Each verification is cached per token until min(exp, XHC_JWT_CACHE_TTL), so
+    a pod pulling hundreds of files does not verify hundreds of signatures.
+    Disabling a principal takes effect on the next request.
+  - An unknown principal gets 401. auto_create per issuer creates it with no
+    rules, so it can pull nothing until an admin grants some.
+  - /v2 accepts the token as the Basic password (convention: -u jwt) or as a
+    Bearer token. /_cache stays on XHC_MANAGE_TOKEN only.
+  - huggingface_hub 0.34.4 re-reads HF_TOKEN_PATH on every request, so a rotated
+    projected token is picked up without a restart. That only holds if HF_TOKEN
+    is not also set.
+
+Kubernetes examples in examples/k8s:
+  - A StatefulSet with a restricted security context: non-root, read-only root
+    filesystem, all capabilities dropped.
+  - A ClusterIP Service, and a NetworkPolicy marked decorative unless your CNI
+    enforces it.
+  - An init container that provisions a principal, rules and a key into a
+    Kubernetes Secret idempotently, without printing it.
+  - A prewarm Job that fails on error or interrupted.
+  - A model-pod example.
+  - Memory sized from the measurements in "Sizing memory for ingest".
+  - A test that fails if the examples name a setting the code does not read.
+
+Docs: on hf-xet 1.6.0, HF_XET_NUM_CONCURRENT_RANGE_GETS and
+HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY appear not to be read. Sequential writes
+were re-verified with and without the flag, so the stream miss policy is safe
+on that version.
+
+
 ## v0.9.19 — 2026-09-25
 
 v0.9.19 -- files in flight per snapshot are bounded, and the memory limit is checked at startup
