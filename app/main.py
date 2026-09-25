@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from . import (
+    authzmanage,
     cachefs,
     config,
     console,
@@ -267,6 +268,17 @@ async def prometheus_metrics(
 
 
 app.include_router(manage.router)
+# Headless provisioning. MOUNTED ALWAYS, and refuses with 404 unless there is a
+# store to provision AND a manage token to guard it -- unlike the rest of
+# /_cache, an unset token does not mean open here, because this surface mints
+# credentials.
+#
+# Always mounted, which is the opposite of how the console is treated, because
+# in THIS app an unmounted path is not a 404: it falls to the Hugging Face
+# catch-all below and is proxied to the Hub, request body and all. A POST of a
+# principal to a deployment that had not enabled this would have been sent to
+# a third party. A route that exists and refuses answers locally.
+app.include_router(authzmanage.router)
 # Before hfcompat: /v2/* is the Docker surface and the HF catch-all would
 # otherwise swallow it.
 if settings.docker_enabled:
