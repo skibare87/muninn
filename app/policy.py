@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import statedir
 from .config import settings
 
 log = logging.getLogger("xhc.policy")
@@ -32,9 +33,7 @@ class Decision:
 
 
 def _state_path() -> Path:
-    d = Path(settings.cache_dir) / ".xhc"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / _POLICY_FILE
+    return statedir.hf_file(_POLICY_FILE)
 
 
 def _split(raw: str | None) -> list[str]:

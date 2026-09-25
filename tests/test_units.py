@@ -607,6 +607,7 @@ ENV_TO_SETTING = [
     ("XHC_HIGH_WATER", "0.8", "high_water", 0.8),
     ("XHC_LOW_WATER", "0.6", "low_water", 0.6),
     ("XHC_EVICT_INTERVAL", "123", "evict_interval_s", 123),
+    ("XHC_STATE_DIR", "/srv/state", "state_dir", "/srv/state"),
     ("XHC_BLOCK_CLIENT_XET", "0", "block_client_xet", False),
     ("XHC_HF_VERIFY", "0", "hf_verify_ingest", False),
     ("XHC_WEB_ROOT", "/srv/www", "web_root", "/srv/www"),

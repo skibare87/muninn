@@ -25,6 +25,7 @@ import logging
 import time
 from pathlib import Path
 
+from . import statedir
 from .config import settings
 
 log = logging.getLogger("xhc.viewer")
@@ -101,7 +102,7 @@ def ds_cache_key(upstream_path: str, query: str) -> str:
 
 def _hashed_name(namespace: str, key: str) -> Path:
     h = hashlib.sha256(f"{namespace}\0{key}".encode()).hexdigest()[:40]
-    d = Path(settings.cache_dir) / ".xhc" / _DIR
+    d = statedir.hf_tree_dir() / _DIR
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{namespace}-{h}.json"
 
@@ -136,7 +137,7 @@ def ds_store(key: str, body: bytes, content_type: str | None) -> None:
 
 def _path_for(repo_id: str, key_suffix: str) -> Path:
     safe = f"{repo_id}/{key_suffix}".replace("/", "__")
-    d = Path(settings.cache_dir) / ".xhc" / _DIR
+    d = statedir.hf_tree_dir() / _DIR
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{safe}.json"
 
@@ -175,7 +176,7 @@ def is_fresh(entry: dict) -> bool:
 
 
 def stats() -> dict:
-    d = Path(settings.cache_dir) / ".xhc" / _DIR
+    d = statedir.hf_tree_dir() / _DIR
     if not d.is_dir():
         return {"entries": 0, "bytes": 0}
     files = list(d.glob("*.json"))
@@ -183,7 +184,7 @@ def stats() -> dict:
 
 
 def clear() -> int:
-    d = Path(settings.cache_dir) / ".xhc" / _DIR
+    d = statedir.hf_tree_dir() / _DIR
     if not d.is_dir():
         return 0
     n = 0

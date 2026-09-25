@@ -101,6 +101,11 @@ class Settings:
     high_water: float = 0.90
     low_water: float = 0.75
     evict_interval_s: int = 900
+    # Where durable state (pins, orphan marks, runtime policy) lives. Unset:
+    # inside each cache tree, as `<cache>/.xhc/` and `<docker dir>/.xhc/`.
+    # Set: `$XHC_STATE_DIR/hf/` and `$XHC_STATE_DIR/oci/`, so blobs can sit on
+    # disposable disk while protection survives it. See app/statedir.py.
+    state_dir: str | None = None
 
     # --- behaviour -----------------------------------------------------------
     # What to do when a client asks for a file we do not have yet.
@@ -470,6 +475,13 @@ class Settings:
                 "XHC_HF_AUTH=key needs XHC_AUTHZ_DB: there are no keys to check without it."
             )
 
+        # Fails on the ARGUMENT: a relative path resolves against whatever the
+        # working directory happens to be, which is exactly the kind of
+        # accidental, disposable location this setting exists to get away from.
+        state_dir = (os.environ.get("XHC_STATE_DIR") or "").strip() or None
+        if state_dir and not os.path.isabs(state_dir):
+            raise ValueError(f"XHC_STATE_DIR must be an absolute path, got {state_dir!r}")
+
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
         return cls(
@@ -480,6 +492,7 @@ class Settings:
             high_water=high,
             low_water=low,
             evict_interval_s=_env_int("XHC_EVICT_INTERVAL", 900),
+            state_dir=state_dir,
             miss_policy=miss_policy,
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
             hf_verify_ingest=_env_bool("XHC_HF_VERIFY", True),

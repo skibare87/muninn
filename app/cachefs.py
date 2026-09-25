@@ -21,12 +21,13 @@ from pathlib import Path
 
 from huggingface_hub import scan_cache_dir
 
+from . import statedir
 from .config import settings
 
 log = logging.getLogger("xhc.cachefs")
 
 REPO_ID_SEPARATOR = "--"
-_STATE_DIR = ".xhc"
+_STATE_DIR = statedir.TREE_DIR_NAME
 _PINS_FILE = "pins.json"
 _ORPHANS_FILE = "orphans.json"
 
@@ -175,10 +176,10 @@ def blob_incomplete_path(repo_type: str, repo_id: str, etag: str) -> Path:
 # --------------------------------------------------------------------------
 
 
-def _state_dir() -> Path:
-    d = Path(settings.cache_dir) / _STATE_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _state_file(name: str) -> Path:
+    # Resolved through statedir so every reader and writer agrees on the
+    # location, including when XHC_STATE_DIR moves it off the cache tree.
+    return statedir.hf_file(name)
 
 
 class StateUnavailable(RuntimeError):
@@ -199,7 +200,7 @@ def load_pins(strict: bool = False) -> set[str]:
     when the file exists but cannot be parsed. Every destructive caller must
     pass it.
     """
-    p = _state_dir() / _PINS_FILE
+    p = _state_file(_PINS_FILE)
     if not p.is_file():
         return set()
     try:
@@ -212,7 +213,7 @@ def load_pins(strict: bool = False) -> set[str]:
 
 
 def save_pins(pins: set[str]) -> None:
-    p = _state_dir() / _PINS_FILE
+    p = _state_file(_PINS_FILE)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(sorted(pins), indent=2))
     tmp.replace(p)
@@ -231,7 +232,7 @@ def save_pins(pins: set[str]) -> None:
 
 def load_orphans(strict: bool = False) -> dict[str, dict]:
     """Repos marked as deleted upstream. See load_pins for `strict`."""
-    p = _state_dir() / _ORPHANS_FILE
+    p = _state_file(_ORPHANS_FILE)
     if not p.is_file():
         return {}
     try:
@@ -250,7 +251,7 @@ def load_orphans(strict: bool = False) -> dict[str, dict]:
 
 
 def save_orphans(orphans: dict[str, dict]) -> None:
-    p = _state_dir() / _ORPHANS_FILE
+    p = _state_file(_ORPHANS_FILE)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(orphans, indent=2, sort_keys=True))
     tmp.replace(p)

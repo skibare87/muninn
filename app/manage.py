@@ -250,7 +250,7 @@ async def get_policy() -> dict:
 
 @router.put("/policy", dependencies=[Depends(require_manage_token)])
 async def put_policy(req: PolicyRequest) -> dict:
-    """Persist policy to .xhc/policy.json. Env seeds it; the file then wins."""
+    """Persist policy to policy.json in the HF state dir (.xhc/ or $XHC_STATE_DIR/hf/). Env seeds it; the file then wins."""
     try:
         return policy.save(req.model_dump())
     except ValueError as exc:

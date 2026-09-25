@@ -26,6 +26,7 @@ from . import (
     orphans,
     pushlimits,
     refs,
+    statedir,
     webauth,
 )
 from . import registry as ociregistry
@@ -44,6 +45,9 @@ async def lifespan(app: FastAPI):
     Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
     if settings.docker_enabled:
         Path(settings.docker_dir).mkdir(parents=True, exist_ok=True)
+    # Before anything reads pins: validates XHC_STATE_DIR (raising, never
+    # falling back) and copies in-tree state across on first use.
+    statedir.prepare()
 
     if os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() in ("1", "true", "yes"):
         # This is the exact misconfiguration the whole design exists to avoid.

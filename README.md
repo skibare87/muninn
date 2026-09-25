@@ -1352,6 +1352,7 @@ experiments age out.
 |---|---|---|
 | `HF_TOKEN` | — | org token. Edge nodes then need no Hub credentials, and gated licences are accepted once, centrally. |
 | `HF_HUB_CACHE` | `/cache` | the array. Standard `huggingface_hub` layout. |
+| `XHC_STATE_DIR` | *(unset)* | absolute path for durable state (pins, orphan marks, runtime policy). Unset keeps it inside each cache tree. Set, it moves to `$XHC_STATE_DIR/hf/` and `$XHC_STATE_DIR/oci/`. See [Separating state from blobs](#separating-state-from-blobs) |
 | `XHC_CACHE_MAX_SIZE` | filesystem size | eviction target, e.g. `70T`. Binary units. |
 | `XHC_HIGH_WATER` / `XHC_LOW_WATER` | `0.90` / `0.75` | evict when above high, down to low |
 | `XHC_EVICT_INTERVAL` | `900` | background sweep, seconds |
@@ -1412,7 +1413,46 @@ The cache is a stock `huggingface_hub` directory
 revisions come for free, and the array stays readable by any standard HF client.
 If this service ever gets in your way you can mount the volume read-only
 elsewhere and point `HF_HUB_CACHE` straight at it. Our own state lives in
-`.xhc/` (currently just `pins.json`).
+`.xhc/`: `pins.json`, `orphans.json` and `policy.json`, plus a regenerable
+viewer response cache under `.xhc/viewer/`. The docker store keeps its own
+`pins.json` and `orphans.json` in `<XHC_DOCKER_DIR>/.xhc/`.
+
+### Separating state from blobs
+
+Blobs can always be fetched again. Pins and orphan marks cannot: they are what
+stops eviction deleting something, and under `XHC_ORPHAN_POLICY=retain` an
+orphaned repo is the only copy left. If the blobs sit on disposable local disk,
+put the state somewhere that survives it:
+
+```yaml
+environment:
+  XHC_STATE_DIR: /state          # a small persistent volume
+volumes:
+  - /srv/muninn-state:/state
+```
+
+| unset (default) | `XHC_STATE_DIR` set |
+|---|---|
+| `<HF_HUB_CACHE>/.xhc/{pins,orphans,policy}.json` | `$XHC_STATE_DIR/hf/` |
+| `<XHC_DOCKER_DIR>/.xhc/{pins,orphans}.json` | `$XHC_STATE_DIR/oci/` |
+
+The two protocols get separate subdirectories, so their pin files never
+collide. The viewer response cache stays with the blobs, because it is
+regenerable and can be large.
+
+- **Migration.** At startup, and again the first time any path reads one of
+  these files, a file absent from the state dir but present in the old `.xhc/`
+  is copied across and the copy is logged. The old file is left in place and is
+  no longer read. The copy is byte for byte, so an unreadable pins file arrives
+  unreadable and still makes eviction refuse rather than treating the cache as
+  unpinned. A file already in the state dir is never overwritten.
+- **Refuses to start** if the directory cannot be created or written, or is not
+  an absolute path. It does not fall back to the cache tree, because a fallback
+  would put protection back on the disk you just declared disposable.
+- **Put `XHC_AUTHZ_DB` on the same volume.** The key store holds principals,
+  keys and grants, and losing it locks every user out until they are
+  re-issued. It has exactly the same lifetime as the pins, and none of the
+  blobs', so it belongs beside them rather than on the disk you expect to lose.
 
 That file-level dedup is also the dedup that actually pays here. Fine-tunes
 rewrite essentially every weight tensor, so Xet's chunk-level dedup across them

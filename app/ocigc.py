@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ocipush, ocistore
+from . import ocipush, ocistore, statedir
 from .cachefs import StateUnavailable
 from .config import settings
 
@@ -41,14 +41,14 @@ _ORPHANS_FILE = "orphans.json"
 _MAX_INDEX_DEPTH = 8
 
 
-def _state_dir() -> Path:
-    d = ocistore.root() / ".xhc"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _state_file(name: str) -> Path:
+    # Resolved through statedir: the in-tree .xhc by default, or
+    # $XHC_STATE_DIR/oci -- never the HF side's file of the same name.
+    return statedir.oci_file(name)
 
 
 def _read_json(name: str, default, strict: bool):
-    p = _state_dir() / name
+    p = _state_file(name)
     if not p.is_file():
         return default
     try:
@@ -61,7 +61,7 @@ def _read_json(name: str, default, strict: bool):
 
 
 def _write_json(name: str, data) -> None:
-    p = _state_dir() / name
+    p = _state_file(name)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     os.replace(tmp, p)
@@ -131,7 +131,7 @@ def list_tags() -> list[TagRef]:
     r = ocistore.root()
     if not r.is_dir():
         return out
-    for up in sorted(p for p in r.iterdir() if p.is_dir() and p.name != ".xhc"):
+    for up in sorted(p for p in r.iterdir() if p.is_dir() and not statedir.is_oci_state_entry(p)):
         tags_root = up / "tags"
         if not tags_root.is_dir():
             continue
@@ -256,7 +256,7 @@ def _enumerate(kind: str) -> list[OnDisk]:
     r = ocistore.root()
     if not r.is_dir():
         return out
-    for up in sorted(p for p in r.iterdir() if p.is_dir() and p.name != ".xhc"):
+    for up in sorted(p for p in r.iterdir() if p.is_dir() and not statedir.is_oci_state_entry(p)):
         base = up / kind / "sha256"
         if not base.is_dir():
             continue
