@@ -22,6 +22,29 @@ jobs:
       - run: ruff check app scripts tests examples
       - run: pytest -q
 
+  # The object-store tier against a REAL S3-compatible server. The fake in the
+  # unit tests shares its author's reading of the protocol; MinIO does not.
+  # It verifies nothing about R2, GCS, B2 or AWS themselves.
+  #
+  # Not a `services:` container: GitHub cannot pass the `server /data`
+  # argument the official MinIO image needs. The suite starts its own
+  # throwaway MinIO with generated credentials and removes it afterwards, and
+  # MUNINN_TEST_MINIO_REQUIRED turns "could not start one" into a failure
+  # rather than a skip that reads as a pass.
+  tier-minio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: docker pull minio/minio:latest
+      - run: pytest -m minio -rs
+        env:
+          MUNINN_TEST_MINIO_REQUIRED: "1"
+
   # The unit tests are offline by design. This proves the image still builds on
   # both target architectures, which is the other half of "it works".
   build:

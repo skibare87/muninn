@@ -34,4 +34,9 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# The MinIO suite needs a real S3-compatible server; CI runs it as its own job
+# with `pytest -m minio` (a later -m on the command line wins).
+addopts = "-q -m 'not minio'"
+markers = [
+    "minio: needs a real S3-compatible server (MinIO); run with `pytest -m minio`",
+]

@@ -2607,6 +2607,7 @@ Three real bugs were caught only by end-to-end testing, not by unit checks:
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 pytest -q          # offline unit tests
+pytest -m minio    # the object-store tier against a throwaway MinIO (needs docker)
 ruff check app scripts tests
 uvicorn app.main:app --reload --port 8080
 ```
