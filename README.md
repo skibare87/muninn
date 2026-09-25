@@ -524,9 +524,12 @@ Xet-backed file (`Qwen/Qwen2.5-7B-Instruct` shard 1):
 | `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` unset | **PASS** — 17/17 samples valid prefixes, file grew from 0 monotonically, no preallocation |
 | `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY=1` | **PASS** — 9/9 samples, no measurable throughput penalty |
 
-So on this version writes are already sequential. That is *not* a documented
-guarantee, so the image sets the flag anyway and you should re-verify after any
-`hf_xet` upgrade:
+Re-verified on **hf-xet 1.6.0** (the version in the image), same file, both
+ways: **PASS** with the flag unset (15/15 samples) and set (11/11). The flag's
+name does not appear anywhere in the 1.6.0 library, so on that version it is
+most likely not read at all, and writes are sequential without it. That is
+*not* a documented guarantee, so the image still sets the flag, and you should
+re-verify after any `hf_xet` upgrade:
 
 ```bash
 docker compose exec muninn python scripts/verify_sequential_writes.py \
@@ -2096,10 +2099,10 @@ choosing it.
 | `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*`. With `XHC_AUTHZ_DB` set it also enables `/_cache/authz`, which **mints keys** — handle it as a Secret |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |
-| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |
+| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | range-GET parallelism in older `hf_xet`. **On hf-xet 1.6.0 it appears to have no effect:** the name is absent from the library, and 1, 4 and 32 gave the same time and memory on one ~110 MB/s link. Kept in the image for versions that read it |
 | `HF_XET_HIGH_PERFORMANCE` | unset | bigger buffers/concurrency; wants ≥64 GB RAM |
 | `HF_XET_CHUNK_CACHE_SIZE_BYTES` | `100G` (compose) | `hf_xet` scratch; the one place chunk-level dedup can pay off |
-| `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` | `1` (image) | required by the default `stream` policy |
+| `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` | `1` (image) | asks for front-to-back writes, which the default `stream` policy needs. hf-xet 1.6.0 writes sequentially with or without it (measured; see *stream* above) |
 
 Invalid config fails at import rather than at first request — a bad
 `XHC_MISS_POLICY` will refuse to start the container.
