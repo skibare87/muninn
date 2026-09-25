@@ -204,16 +204,26 @@ class ListedObject:
     size: int
 
 
-_S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+# Match child elements by LOCAL name, whatever namespace they carry. S3 and
+# MinIO use {http://s3.amazonaws.com/doc/2006-03-01/}; GCS's XML API uses
+# {http://doc.s3.amazonaws.com/2006-03-01} for the same documents. Matching one
+# namespace made every GCS listing parse as EMPTY -- well-formed, 200, and zero
+# objects -- with nothing to say the parser had looked in the wrong place.
 
 
-def _find(el: ET.Element, name: str) -> ET.Element | None:
-    found = el.find(_S3_NS + name)
-    return found if found is not None else el.find(name)
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def _findall(el: ET.Element, name: str) -> list[ET.Element]:
-    return el.findall(_S3_NS + name) or el.findall(name)
+    return [c for c in el if _local(c.tag) == name]
+
+
+def _find(el: ET.Element, name: str) -> ET.Element | None:
+    for c in el:
+        if _local(c.tag) == name:
+            return c
+    return None
 
 
 class S3Client:
@@ -357,7 +367,20 @@ class S3Client:
             if r.status_code != 200:
                 raise TierHTTPError(r.status_code, "ListObjectsV2", r.text)
             root = ET.fromstring(r.content)
-            for c in _findall(root, "Contents"):
+            contents = _findall(root, "Contents")
+            # A listing that says it holds keys and yields none is a parser
+            # that looked in the wrong place, not an empty bucket. Refuse it
+            # rather than let reconcile read "nothing uploaded".
+            kc = _find(root, "KeyCount")
+            if kc is not None and (kc.text or "").strip().isdigit():
+                declared = int(kc.text.strip())
+                if declared and not contents:
+                    raise TierHTTPError(
+                        200, "ListObjectsV2",
+                        f"response declares KeyCount={declared} but no Contents "
+                        f"element was recognised (root element {root.tag!r})",
+                    )
+            for c in contents:
                 k = _find(c, "Key")
                 s = _find(c, "Size")
                 if k is not None and k.text:
