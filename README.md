@@ -381,6 +381,23 @@ is a derived number and inherits their units: an earlier version of this line
 said 8.8×, which divided MiB/s by MB/s.
 Verify it on your own hardware before assuming it holds on yours.
 
+### Read-only toward the Hub
+
+Everything the Hugging Face surface forwards goes upstream with **the cache's own Hub
+token**. So Muninn forwards only `GET` and `HEAD`, plus the read-only `POST` endpoints
+downloads use; every other method is answered locally with **405** and never reaches the
+Hub. This holds in every mode — with `XHC_HF_AUTH=none`, with `XHC_HF_RULES=off`, and for a
+`*` key — because it is not authorisation: it is what the cache's credential may be used for.
+
+| forwarded `POST` | used by |
+|---|---|
+| `/api/{models,datasets,spaces}/<repo>/paths-info/<rev>` | `HfApi.get_paths_info`, which `HfFileSystem` uses to stat files |
+
+That is the only read among the `POST`s `huggingface_hub` 0.34.4 makes. Everything else is a
+write and is refused: commits and preupload, creating, moving or deleting repos, branches,
+tags, settings, LFS uploads, discussions, Space controls, collections. Pushing to the Hub goes
+direct to the Hub, with your own token.
+
 ### One hostname as a homepage and a cache
 
 `XHC_WEB_ROOT=/srv/www` serves static files at `/`. Unset by default, so nothing

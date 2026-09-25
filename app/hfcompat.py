@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import posixpath
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -494,6 +495,56 @@ def _reserved_refusal(entry: _Reserved, full_path: str, request: Request) -> Res
     return PlainTextResponse(reason + "\n", status_code=404)
 
 
+# ---------------------------------------------------------------------------
+# READ-ONLY TOWARD THE HUB.
+#
+# Everything this surface forwards goes out with the CACHE's Hub token
+# (_apply_upstream_auth), so forwarding a write would let any client commit,
+# create or delete repos, change settings or open discussions AS THE CACHE --
+# with whatever write access that token has, and on an open cache, for anyone.
+# Muninn has no push path for Hugging Face; nothing legitimate needs this.
+#
+# So only GET and HEAD go upstream, plus POSTs that are reads in disguise,
+# named one by one. Taken from huggingface_hub 0.34.4, every POST it makes:
+#
+#   api/{type}s/{repo}/paths-info/{rev}   HfApi.get_paths_info, which
+#                                         HfFileSystem uses to stat files. READ.
+#
+# Every other POST in that library writes: create_commit and preupload,
+# create_repo, move_repo, create_branch, create_tag, super_squash_history,
+# permanently_delete_lfs_files, the LFS batch/verify/complete calls,
+# discussions, Space secrets/variables/hardware/storage/pause/restart/
+# duplicate, collections, access requests, webhooks, jobs, inference
+# endpoints -- and validate-yaml, which is only called on the way to a push.
+# None of them is on a download or listing path.
+#
+# Applies in EVERY mode, with or without XHC_HF_AUTH and XHC_HF_RULES: this is
+# not authorisation, it is what the cache's credential may be used for.
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_POSTS = (
+    re.compile(r"api/(models|datasets|spaces)/[^/]+(/[^/]+)?/paths-info/.+"),
+)
+
+
+def _may_forward(method: str, full_path: str) -> bool:
+    if method in ("GET", "HEAD"):
+        return True
+    if method == "POST":
+        return any(p.fullmatch(full_path) for p in _READ_ONLY_POSTS)
+    return False
+
+
+def _read_only_refusal(request: Request, full_path: str) -> Response:
+    log.warning("refused to forward %s /%s: read-only toward the Hub", request.method, full_path)
+    return PlainTextResponse(
+        f"Muninn is read-only toward the Hugging Face Hub: {request.method} requests "
+        "are not forwarded, except the read-only POST endpoints downloads use.\n",
+        status_code=405,
+        headers={"allow": "GET, HEAD"},
+    )
+
+
 def _web_root_file(full_path: str) -> Path | None:
     """Resolve a request path inside XHC_WEB_ROOT, or None.
 
@@ -576,6 +627,14 @@ async def catch_all(full_path: str, request: Request) -> Response:
     reserved = _reserved_path(full_path)
     if reserved is not None and not (reserved.served_here and reserved.enabled()):
         return _reserved_refusal(reserved, full_path, request)
+
+    # 0w. NO WRITES REACH THE HUB, whatever the credentials or rules say: what
+    #     goes upstream carries the cache's own token. Before the credential gate
+    #     because the answer is the same for everyone and discloses nothing.
+    #     A reserved path is Muninn's and is answered locally below, never
+    #     forwarded, so it keeps its own 404.
+    if reserved is None and not _may_forward(request.method, full_path):
+        return _read_only_refusal(request, full_path)
 
     # 0a. THE CREDENTIAL GATE FOR THIS ENTIRE SURFACE, and its position is the
     #     design. It sits AFTER the web root so a homepage and its assets stay
@@ -1201,6 +1260,10 @@ async def serve_file(
 
 async def proxy_upstream(full_path: str, request: Request) -> Response:
     """Transparent pass-through for everything that is not file bytes."""
+    # Checked again here, at the one function that forwards arbitrary methods,
+    # so a new caller cannot skip it.
+    if not _may_forward(request.method, full_path):
+        return _read_only_refusal(request, full_path)
     if (denied := hfauthz.require_path(request, full_path)) is not None:
         return denied
     url = f"{settings.upstream}/{quote(full_path)}"

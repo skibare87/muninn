@@ -435,7 +435,6 @@ ROUTES = [
     ("GET", "/api/models/{repo}/commits/main"),
     ("POST", "/api/models/{repo}/paths-info/main"),
     ("GET", "/api/models/{repo}/xet-read-token/main"),
-    ("POST", "/{repo}/resolve/main/config.json"),
     ("GET", "/{repo}/raw/main/config.json"),
     ("GET", "/{repo}/blob/main/config.json"),
     ("GET", "/{repo}"),
