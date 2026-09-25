@@ -90,8 +90,12 @@ def enforcing() -> bool:
     return settings.hf_auth == "key" and settings.hf_rules == "enforce"
 
 
-def _segments(full_path: str) -> list[str]:
+def segments(full_path: str) -> list[str]:
     """Split a path, refusing empty and dot segments.
+
+    Called by the catch-all for EVERY request, in every mode -- not only when
+    rules are enforced -- because the same walk routes around XHC_ALLOW_REPOS
+    and the ingest policy just as well as around a key's rules.
 
     THE UPSTREAM CLIENT NORMALISES `..` BEFORE SENDING. So
     `org/allowed/resolve/main/../../../org/secret/...` would be authorised as
@@ -143,7 +147,7 @@ def classify(full_path: str, dataset_params: list[str]) -> Target:
     `dataset_params` is the request's `dataset` query values, which is where the
     datasets-server proxy carries its repo id.
     """
-    segs = _segments(full_path)
+    segs = segments(full_path)
     if not segs:
         return _SURFACE
     head = segs[0].lower()

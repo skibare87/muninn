@@ -1162,9 +1162,12 @@ answers with the cache's own account — name, email, organisations — not the 
 download calls it. Where a path could name two repositories — `/api/models/org/refs` is
 either `org/refs`'s info or canonical `org`'s refs, and Muninn cannot know which the Hub will
 choose — **both** must be allowed. That includes a sub-resource Muninn has never heard of, so
-a narrow key is refused a brand-new Hub endpoint rather than having it guessed at. Paths with
-`.`, `..` or empty segments are refused with 400: the upstream client normalises them, so
-`org/allowed/../secret` would otherwise be authorised as one repository and fetched as another.
+a narrow key is refused a brand-new Hub endpoint rather than having it guessed at.
+
+**Paths with `.`, `..` or empty segments are refused with 400, in every mode** — with rules
+off and with `XHC_HF_AUTH=none` too. The upstream client normalises them, so
+`org/allowed/../secret` would otherwise be checked as one repository — by a key's rules, or by
+`XHC_ALLOW_REPOS` — and fetched as another.
 
 **A refusal is `403` with `X-Error-Code: GatedRepo`** and an `X-Error-Message` naming the key
 and the repository, e.g. `refused by this cache's rules: key 3f2a… has no rule granting pull

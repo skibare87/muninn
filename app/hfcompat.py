@@ -628,6 +628,17 @@ async def catch_all(full_path: str, request: Request) -> Response:
     if reserved is not None and not (reserved.served_here and reserved.enabled()):
         return _reserved_refusal(reserved, full_path, request)
 
+    # 0d. NO DOT OR EMPTY SEGMENTS, in every mode. The upstream client
+    #     normalises them, so `org/allowed/../secret` would be checked -- by the
+    #     ingest policy, by XHC_ALLOW_REPOS, by a key's rules -- as one repo and
+    #     fetched as another. Reserved paths are matched on the normalised path
+    #     above, so this cannot shadow them.
+    if reserved is None:
+        try:
+            hfauthz.segments(full_path)
+        except hfauthz.BadPath as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     # 0w. NO WRITES REACH THE HUB, whatever the credentials or rules say: what
     #     goes upstream carries the cache's own token. Before the credential gate
     #     because the answer is the same for everyone and discloses nothing.

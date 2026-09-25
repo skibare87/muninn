@@ -210,3 +210,36 @@ def test_hf_hub_download_and_snapshot_download_still_work_end_to_end(mode, tmp_p
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+# ---------------- dot segments, in every mode ----------------
+
+TRAVERSALS = [
+    "/org/ok/resolve/main/%2E%2E/%2E%2E/%2E%2E/org/secret/resolve/main/config.json",
+    "/api/models/org/ok/%2E%2E/secret",
+    "/api/models/org/ok/.%2E/secret/tree/main",
+    "/org/ok/%2E/resolve/main/config.json",
+    "/org//secret/resolve/main/config.json",
+]
+
+
+@pytest.mark.parametrize("path", TRAVERSALS)
+def test_dot_and_empty_segments_are_refused_in_every_mode(mode, monkeypatch, path):
+    """Not only under rules: with XHC_HF_AUTH=none the same walk routes around
+    XHC_ALLOW_REPOS, which is checked on the repo the path NAMES while the
+    upstream client fetches the repo the normalised path names."""
+    from app import hfcompat, policy
+
+    client, headers, upstream, _ = mode
+    monkeypatch.setattr(policy, "load", lambda: {
+        "mode": "allowlist", "allow": ["models/org/ok*"], "deny": [],
+        "scope": "all", "max_file_bytes": None})
+
+    async def _metadata(*a, **k):
+        upstream.calls.append(f"METADATA {a}")
+        raise AssertionError("must not be reached")
+
+    monkeypatch.setattr(hfcompat, "fetch_metadata", _metadata)
+    r = client.get(path, headers=headers)
+    assert r.status_code == 400, f"{path} -> {r.status_code} {r.text}"
+    assert upstream.calls == [], upstream.calls
