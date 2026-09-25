@@ -703,6 +703,20 @@ ENV_GROUPS = [
         {"oidc_issuer": "https://idp.example.com"},
     ),
     (
+        # admin from an IdP claim: needs login, and the two only as a pair
+        {
+            "XHC_OIDC_ISSUER": "https://idp.example.com",
+            "XHC_OIDC_CLIENT_ID": "cid",
+            "XHC_OIDC_CLIENT_SECRET": "csec",
+            "XHC_OIDC_REDIRECT_URI": "https://cache.example/_auth/callback",
+            "XHC_SESSION_SECRET": "signing",
+            "XHC_AUTHZ_DB": "/srv/authz.db",
+            "XHC_OIDC_ADMIN_CLAIM": "realm_access.roles",
+            "XHC_OIDC_ADMIN_VALUE": "muninn-admin",
+        },
+        {"oidc_admin_claim": "realm_access.roles", "oidc_admin_value": "muninn-admin"},
+    ),
+    (
         {
             "XHC_JWT_ISSUERS": '{"issuer": "https://k8s.example", "audience": "muninn",'
                                ' "subject_template": "k8s:{sub}"}',

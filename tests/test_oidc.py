@@ -460,3 +460,35 @@ async def test_pkce_is_on_by_default(key):
     flag is for what a real login actually shows."""
     c = FakeClient(key, {})
     assert c.pkce is True
+
+
+# ---------------- claims, for XHC_OIDC_ADMIN_CLAIM ----------------
+
+
+@pytest.mark.asyncio
+async def test_a_completed_login_carries_the_verified_claims(key):
+    """Admin-from-claim reads Identity.claims. If complete() dropped them, every
+    login would read as "claim absent" and nobody would ever be admin."""
+    c = FakeClient(key, {})
+    state, nonce = await begin(c)
+    c._token_response = {"id_token": mint(
+        key, nonce=nonce, realm_access={"roles": ["muninn-admin"]})}
+    ident = await c.complete("code", state)
+    assert ident.claims["realm_access"] == {"roles": ["muninn-admin"]}
+    assert "realm_access" not in repr(ident), "claims can be personal data; keep them out of repr"
+
+
+def test_claim_lookup_shapes():
+    from app.oidc import ABSENT, claim_at, claim_grants
+
+    claims = {"realm_access": {"roles": ["a", "b"]}, "https://x.example/roles": "b",
+              "flat": None}
+    assert claim_at(claims, "realm_access.roles") == ["a", "b"]
+    assert claim_at(claims, "https://x.example/roles") == "b"
+    assert claim_at(claims, "realm_access.missing") is ABSENT
+    assert claim_at(claims, "nope") is ABSENT
+    assert claim_at(claims, "flat") is None, "present-and-null is not absent"
+    assert claim_at(claims, "flat.deeper") is ABSENT
+    assert claim_grants(["a", "b"], "b") and claim_grants("b", "b")
+    assert not claim_grants(["ab"], "b") and not claim_grants("B", "b")
+    assert not claim_grants(True, "True") and not claim_grants(None, "None")

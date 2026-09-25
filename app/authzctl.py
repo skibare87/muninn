@@ -13,6 +13,7 @@ disabled here is refused on the very next request.
     python -m app.authzctl list
     python -m app.authzctl disable-key KEY_ID | enable-key KEY_ID | delete-key KEY_ID
     python -m app.authzctl delete-principal svc:ci
+    python -m app.authzctl grant-admin SUBJECT | revoke-admin SUBJECT
 
 Output is JSON on stdout; errors go to stderr with a non-zero exit. ONLY `mint`
 ever prints a secret, and with --secret-file it prints none: the secret goes to
@@ -97,6 +98,11 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("delete-principal",
                    help="delete a principal and its keys").add_argument("subject")
+    sub.add_parser("grant-admin",
+                   help="make an existing principal an administrator -- the "
+                        "recovery path for an instance with no admin").add_argument("subject")
+    sub.add_parser("revoke-admin",
+                   help="remove admin; refused for the last admin").add_argument("subject")
     return ap
 
 
@@ -161,6 +167,8 @@ def _run(args: argparse.Namespace, store: AuthzStore) -> None:
     elif args.cmd == "delete-principal":
         authzadmin.delete_principal(store, args.subject)
         _emit({"subject": args.subject, "deleted": True})
+    elif args.cmd in ("grant-admin", "revoke-admin"):
+        _emit(authzadmin.set_admin(store, args.subject, args.cmd == "grant-admin"))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -13,6 +13,26 @@ FIRST LOGIN BECOMES ADMIN, and the claim is made inside a single IMMEDIATE
 transaction in the store, not read-then-write here. Two people opening the login
 page at the same instant on a fresh deployment is exactly the case a read then a
 write gets wrong, and it is the case that decides who administers the service.
+
+UNLESS THE PROVIDER DECIDES (XHC_OIDC_ADMIN_CLAIM + XHC_OIDC_ADMIN_VALUE). Then
+admin is recomputed from the verified id_token at EVERY login -- granted when the
+claim carries the value, revoked when it does not -- and being first grants
+nothing. Precedence in that mode, highest first:
+
+    XHC_BOOTSTRAP_ADMIN names this login    admin, whatever the claim says
+    the claim carries the value             admin
+    otherwise                               NOT admin, even if it was before
+
+The bootstrap sits above the claim because it is the break-glass path: a claim
+mapping broken at the provider must not be able to lock out the operator who
+would fix it. In this mode it is therefore a STANDING grant rather than the
+creation-only one it is otherwise, and belongs unset outside an emergency.
+
+A revocation at the provider reaches Muninn at that user's NEXT LOGIN; nothing
+here polls the provider. Once it is in the store it applies to every session on
+its next request, because admin is never in the cookie (require_login re-reads
+the principal). So an existing session is bounded by XHC_SESSION_TTL, and that
+bound is documented rather than hidden.
 """
 
 from __future__ import annotations
@@ -50,6 +70,43 @@ def client() -> oidc.OIDCClient:
 
 def enabled() -> bool:
     return bool(settings.oidc_issuer)
+
+
+def admin_from_idp() -> bool:
+    """Whether the identity provider, not this store, decides who is admin."""
+    return bool(settings.oidc_admin_claim and settings.oidc_admin_value)
+
+
+# One diagnostic per process for an id_token without the configured claim. Once,
+# because a provider that omits the claim for every non-admin would otherwise
+# log on every ordinary login; at all, because a provider that NEVER emits it
+# (not in the scopes, not mapped into the id_token, a typo in the name) looks
+# exactly like "nobody is an admin" and needs saying somewhere.
+_missing_claim_logged = False
+
+
+def _claim_admin(claims: dict) -> bool:
+    global _missing_claim_logged  # noqa: PLW0603 - once-per-process latch
+    name = settings.oidc_admin_claim or ""
+    value = oidc.claim_at(claims, name)
+    if value is oidc.ABSENT:
+        if not _missing_claim_logged:
+            _missing_claim_logged = True
+            # Claim NAMES only. Values can be personal data and group lists.
+            log.warning(
+                "XHC_OIDC_ADMIN_CLAIM %r is absent from the id_token, so this "
+                "login is not admin. Claims present: %s. If no login ever carries "
+                "it, the provider is not putting it in the id_token (check its "
+                "scopes and mappers). Logged once per process.",
+                name, ", ".join(sorted(claims)) or "(none)",
+            )
+        return False
+    return oidc.claim_grants(value, settings.oidc_admin_value or "")
+
+
+def _bootstrap_names(subject: str, email: str) -> bool:
+    b = settings.bootstrap_admin
+    return bool(b) and b in (subject, email)
 
 
 def current_session(request: Request) -> session.Session | None:
@@ -151,9 +208,12 @@ async def callback(request: Request) -> Response:
     if st is None:
         raise HTTPException(status_code=503, detail="authorisation store unavailable")
 
-    principal = st.claim_or_get_principal(
-        identity.subject, identity.email, settings.bootstrap_admin
-    )
+    if admin_from_idp():
+        principal = _sync_admin(st, identity)
+    else:
+        principal = st.claim_or_get_principal(
+            identity.subject, identity.email, settings.bootstrap_admin
+        )
     if principal.disabled:
         # Authenticated, and still not allowed in. Refusing here rather than
         # issuing a cookie means a disabled account cannot get a session at all.
@@ -173,6 +233,43 @@ async def callback(request: Request) -> Response:
         ),
     )
     return response
+
+
+def _sync_admin(st: authzstore.AuthzStore, identity) -> authzstore.Principal:
+    """Record what the provider says about admin for this login, and log it.
+
+    Evaluated before the disabled check on purpose: a revocation must land on
+    a disabled account too, or re-enabling it later would restore an admin
+    flag the provider withdrew in the meantime.
+    """
+    by_claim = _claim_admin(getattr(identity, "claims", None) or {})
+    by_bootstrap = _bootstrap_names(identity.subject, identity.email)
+    result = st.sync_admin_at_login(
+        identity.subject, identity.email, by_claim or by_bootstrap
+    )
+    who = identity.subject[:12] + "..."
+    if by_bootstrap and not by_claim:
+        log.warning(
+            "admin granted to %s by XHC_BOOTSTRAP_ADMIN, not by the identity "
+            "provider. That is the break-glass path; unset it once the claim is fixed.",
+            who,
+        )
+    if result.was_admin and not result.principal.is_admin:
+        log.warning("admin revoked for %s: the id_token no longer carries it", who)
+    elif result.was_admin is False and result.principal.is_admin:
+        log.info("admin granted to %s at login", who)
+    if result.admins_after == 0:
+        # Allowed, and deliberately loud. Refusing would keep admin for the one
+        # person whose role was just revoked. Recovery is any login carrying
+        # the claim, XHC_BOOTSTRAP_ADMIN, or `authzctl grant-admin`.
+        log.error(
+            "this instance now has no admin: the last one logged in without "
+            "XHC_OIDC_ADMIN_CLAIM=%r carrying %r. Grant the role at the identity "
+            "provider and log in, set XHC_BOOTSTRAP_ADMIN, or run "
+            "`python -m app.authzctl grant-admin SUBJECT`.",
+            settings.oidc_admin_claim, settings.oidc_admin_value,
+        )
+    return result.principal
 
 
 @router.post("/logout")
@@ -206,6 +303,9 @@ async def me(request: Request) -> JSONResponse:
                     "authenticated": True,
                     "email": principal.email,
                     "is_admin": principal.is_admin,
+                    # The console hides its admin toggle when this is true:
+                    # the next login would overwrite whatever it set.
+                    "admin_from_idp": admin_from_idp(),
                 }
             )
     return JSONResponse({"login_enabled": True, "authenticated": False})

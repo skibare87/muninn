@@ -50,6 +50,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from .authz import Key, Principal, Rule
 
@@ -119,6 +120,19 @@ def hash_secret(secret: str) -> str:
 def secret_matches(secret: str, stored_hash: str) -> bool:
     """Constant-time. Timing a comparison is a different attack from guessing."""
     return hmac.compare_digest(hash_secret(secret), stored_hash)
+
+
+class AdminSync(NamedTuple):
+    """What a claim-mode login did to the admin flag, for the caller to log.
+
+    `was_admin` is None for a principal created by this login. `admins_after`
+    counts every admin in the store once the login committed, so a login that
+    left the instance with none can say so.
+    """
+
+    principal: Principal
+    was_admin: bool | None
+    admins_after: int
 
 
 def _now() -> str:
@@ -206,6 +220,57 @@ class AuthzStore:
             )
             return Principal(subject, email, is_admin=is_admin, disabled=False)
 
+    def sync_admin_at_login(
+        self, subject: str, email: str, is_admin: bool
+    ) -> AdminSync:
+        """Get-or-create a principal and SET its admin flag, in one transaction.
+
+        The claim-mode counterpart of claim_or_get_principal
+        (XHC_OIDC_ADMIN_CLAIM): the caller has already decided, from the
+        id_token, whether this login is an admin, and the store records it --
+        granting OR revoking. There is no first-principal grant here; being
+        first proves nothing once a provider decides the role.
+
+        THE LAST ADMIN IS NOT PROTECTED HERE, unlike set_admin, and that is the
+        decision rather than an omission. The guard exists because an instance
+        with no admin has no way back through the UI. In this mode there is one
+        that does not go through the UI at all: the provider grants the role
+        and the next login restores admin. Refusing instead would keep admin
+        for exactly the person whose role was just revoked -- when they are the
+        only admin, which is the case where it matters most. The caller logs a
+        zero-admin result loudly; see AdminSync.admins_after.
+
+        One IMMEDIATE transaction, so the flag written and the count reported
+        describe the same state.
+        """
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT * FROM principals WHERE subject=?", (subject,)
+            ).fetchone()
+            if row is None:
+                was_admin = None
+                disabled = False
+                c.execute(
+                    "INSERT INTO principals(subject,email,is_admin,disabled,created_at)"
+                    " VALUES (?,?,?,0,?)",
+                    (subject, email, 1 if is_admin else 0, _now()),
+                )
+            else:
+                was_admin = bool(row["is_admin"])
+                disabled = bool(row["disabled"])
+                email = row["email"]
+                if was_admin != is_admin:
+                    c.execute("UPDATE principals SET is_admin=? WHERE subject=?",
+                              (1 if is_admin else 0, subject))
+            admins = c.execute(
+                "SELECT COUNT(*) AS n FROM principals WHERE is_admin=1"
+            ).fetchone()["n"]
+            c.commit()
+        self._invalidate()
+        return AdminSync(Principal(subject, email, is_admin=is_admin, disabled=disabled),
+                         was_admin, admins)
+
     def create_principal(
         self, subject: str, email: str = "", is_admin: bool = False
     ) -> Principal:
@@ -265,6 +330,13 @@ class AuthzStore:
         """
         with self._connect() as c:
             c.execute("BEGIN IMMEDIATE")
+            # Checked, not trusted: an UPDATE matching no rows succeeds, and a
+            # break-glass grant that reports success after promoting nobody is
+            # the worst possible time to learn that.
+            if not c.execute(
+                "SELECT 1 FROM principals WHERE subject=?", (subject,)
+            ).fetchone():
+                raise KeyError(f"no such principal: {subject}")
             if not is_admin:
                 others = c.execute(
                     "SELECT COUNT(*) AS n FROM principals WHERE is_admin=1 AND subject<>?",

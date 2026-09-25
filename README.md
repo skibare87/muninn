@@ -1247,7 +1247,9 @@ because by then nobody is watching.
 
 **The first person to log in becomes admin.** The claim is made in a single `BEGIN IMMEDIATE`
 transaction, so two simultaneous first logins cannot both win — a race with exactly one
-correct answer, deciding who administers the service.
+correct answer, deciding who administers the service. With
+[admin from the identity provider](#admin-from-the-identity-provider-xhc_oidc_admin_claim)
+configured, this does not happen: being first grants nothing.
 
 After that:
 
@@ -1262,6 +1264,77 @@ user could edit their own, "create a key" and "grant myself push to everything" 
 same operation. A newly created key therefore grants nothing until an administrator sets an
 allowlist, which the UI says rather than leaving the user to discover.
 
+#### Admin from the identity provider (`XHC_OIDC_ADMIN_CLAIM`)
+
+For an organisation whose provider already says who administers what: admin follows a
+role or group there, so **revoking it at the provider removes admin here**.
+
+```yaml
+environment:
+  XHC_OIDC_ADMIN_CLAIM: realm_access.roles   # Keycloak realm roles
+  XHC_OIDC_ADMIN_VALUE: muninn-admin
+```
+
+- **Admin is recomputed at every login** from the verified id_token: granted when the claim
+  carries the value, **revoked** when it does not — including for someone who was admin
+  before.
+- **The first-login grant is off.** The first person to log in is not made admin; with a
+  provider deciding the role, being first proves nothing.
+- **The claim** is a name, or a dotted path into nested claims (`realm_access.roles`). A
+  top-level claim whose own name contains dots — namespaced claims are URLs, such as
+  `https://cache.example.com/roles` — is matched as a whole first, then the dotted path.
+- **Matching is exact**: the claim equals the value, or is a list with an element equal to
+  it. No prefix, substring or case-folding, and a claim of any other type (boolean, number,
+  object) grants nothing.
+- **The claim must be in the id_token.** Some providers put groups only in the access
+  token or at the userinfo endpoint; map it into the id_token and request whatever scope
+  carries it (`XHC_OIDC_SCOPES`). An id_token **without** the claim is not admin, and the
+  first time that happens the log names the claim and lists the claim *names* the token did
+  carry, once per process — a provider that never emits it looks exactly like "nobody is an
+  admin" otherwise.
+- **Both variables or neither.** One without the other refuses to start, naming the missing
+  one, as does either without `XHC_OIDC_ISSUER`.
+- **The console's admin toggle is gone** in this mode, and `POST
+  /_console/users/{subject}/admin` returns `409`: the target's next login would silently
+  undo it. Grant or revoke the role at the provider.
+
+**How fast a revocation lands.** Muninn learns of a change at the provider **at that user's
+next login**; nothing here polls the provider. Once a login has recorded it, it applies to
+every session that user holds **on its next request**, because admin is never in the session
+cookie — each request re-reads the principal. So an admin whose role is revoked at the
+provider, and who does not log in again, keeps admin until their session expires: the bound
+is **`XHC_SESSION_TTL`** (12 hours by default). Shorten it if that is too long. To cut a
+session off sooner, revoke in the store as well — `authzctl revoke-admin` or disabling the
+user both apply on the next request.
+
+**The last admin is demoted like anyone else**, and the log says so at `ERROR` ("this
+instance now has no admin"). Refusing would keep admin for exactly the person whose role was
+just revoked, when they are the only admin — the case the feature exists for. An instance
+with no admin is recoverable three ways, none needing a restart:
+
+1. grant the role at the provider and log in;
+2. set `XHC_BOOTSTRAP_ADMIN` (below) and log in as that person;
+3. `python -m app.authzctl grant-admin SUBJECT` — applies to that user's existing session
+   on its next request, and lasts until their next login recomputes it.
+
+**`XHC_BOOTSTRAP_ADMIN` is the break-glass path, and outranks the claim.** Precedence at
+each login in this mode:
+
+| | admin? |
+|---|---|
+| `XHC_BOOTSTRAP_ADMIN` names this login's subject or email | yes, whatever the claim says |
+| the claim carries `XHC_OIDC_ADMIN_VALUE` | yes |
+| otherwise | **no**, even if they were admin before |
+
+So in this mode it is a **standing** grant, evaluated at every login rather than only when
+the principal is first created, and each login it grants logs a warning saying so. That is
+what lets it rescue an instance whose claim mapping is broken at the provider; it is also why
+it belongs **unset outside an emergency**, and why a subject is a better value than an email,
+which most providers let users change.
+
+Workload tokens (`XHC_JWT_ISSUERS`) are unaffected: they authenticate `/v2` and the Hugging
+Face surface, never the console, so no JWT is ever an admin.
+
 #### The console at `/console`
 
 `examples/web-root/` ships two pages: the homepage at `/`, and the key-management
@@ -1274,7 +1347,7 @@ a management surface under four sections of marketing copy is somewhere nobody l
 | | |
 | --- | --- |
 | any signed-in user | create, disable and delete **their own** keys; see their allowlist |
-| admin | all users, each with an editable allowlist, admin toggle, disable, and delete |
+| admin | all users, each with an editable allowlist, admin toggle (absent when [the provider decides admin](#admin-from-the-identity-provider-xhc_oidc_admin_claim)), disable, and delete |
 
 Creating a key shows the `docker login` line and the `HF_ENDPOINT`/`HF_TOKEN` pair with
 the values filled in. Deleting a user takes their keys and allowlist with them, and is
@@ -1295,7 +1368,9 @@ what makes a copy of the database less than a full compromise.
 Sessions are a signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) carrying nothing but the
 subject and an expiry. **No role, no key, no rule** — everything is re-read from the store on
 every request, so disabling a user or revoking admin takes effect on their next request
-rather than whenever their cookie happens to expire.
+rather than whenever their cookie happens to expire. (A revocation made *at the identity
+provider* reaches the store at that user's next login; see
+[above](#admin-from-the-identity-provider-xhc_oidc_admin_claim).)
 
 The login is deliberately **not** a second gate on `/v2`. Pulls and pushes authenticate with
 a key, every time; a browser session never authorises one. Keeping the two credential kinds
@@ -1376,6 +1451,7 @@ python -m app.authzctl --db /srv/authz/authz.db <command>   # or set XHC_AUTHZ_D
 | `list` | principals and keys as JSON, never secrets |
 | `disable-key` / `enable-key` / `delete-key KEY_ID` | |
 | `delete-principal SUBJECT` | |
+| `grant-admin` / `revoke-admin SUBJECT` | the recovery path for an instance with no admin; revoking the last admin is refused, and an unknown subject is an error |
 
 `--secret-file PATH` writes the secret to a **new** file created `0600` and prints only the
 key id. It refuses an existing file (`--overwrite` replaces it) and is created *before*
@@ -2066,9 +2142,11 @@ choosing it.
 | `XHC_OIDC_SCOPES` | `openid email profile` | scopes requested at the provider |
 | `XHC_OIDC_DISCOVERY_URL` | *(derived)* | where the discovery document lives, when it is not `<issuer>/.well-known/openid-configuration`. Changes only where it is **fetched**; the issuer stays the trust anchor and a document declaring a different one is refused |
 | `XHC_OIDC_PKCE` | `1` | set `0` only if a provider **rejects** the parameter. Not advertising support is not the same as refusing it |
-| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself |
+| `XHC_OIDC_ADMIN_CLAIM` | *(unset)* | id_token claim that decides admin, e.g. `groups` or `realm_access.roles` (dotted for nested). With `XHC_OIDC_ADMIN_VALUE`, admin is recomputed at **every** login — granted or **revoked** — and the first-login grant is off. Both or neither; needs `XHC_OIDC_ISSUER`. See [Admin from the identity provider](#admin-from-the-identity-provider-xhc_oidc_admin_claim) |
+| `XHC_OIDC_ADMIN_VALUE` | *(unset)* | the value that grants admin: equal to a string claim, or to one element of a list claim. Exact match |
+| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself. **With `XHC_OIDC_ADMIN_CLAIM` set it is instead a standing break-glass grant**, applied at every login of that person whatever the claim says — leave it unset outside an emergency |
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
-| `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
+| `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h). With `XHC_OIDC_ADMIN_CLAIM`, also the longest an existing session keeps admin after the role is revoked at the provider |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |
 | `XHC_HF_AUTH` | `none` | `key` requires a credential from `XHC_AUTHZ_DB` on the **Hugging Face surface** — the catch-all serving everything not claimed by another router. Accepts Basic **or** `Bearer <key_id>:<secret>`, so a user can set `HF_TOKEN` to that and Hugging Face's own tooling works unchanged. Also accepts `Bearer <jwt>` from an issuer in `XHC_JWT_ISSUERS`. The web root stays public, so a homepage still renders logged out |
 | `XHC_HF_RULES` | `enforce` | with `XHC_HF_AUTH=key`: `enforce` lets a key pull only the Hugging Face repos its rules cover (`models/org/*` and so on), on hits as well as misses; `off` lets any live key pull anything, the behaviour before this setting existed. **Upgrading with `XHC_HF_AUTH=key` on changes behaviour** for principals with only registry rules. See [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules). No effect when `XHC_HF_AUTH=none` |

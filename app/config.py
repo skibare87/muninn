@@ -252,9 +252,10 @@ class Settings:
     # next restart. That leaves the table non-empty, so the intended admin's
     # first login silently does not make them one.
     #
-    # Consulted ONLY at creation, never on a later login. So it is idempotent,
-    # harmless to leave set, and cannot re-promote someone who was deliberately
-    # demoted. It also never creates a principal by itself -- admin is granted
+    # Consulted ONLY at creation, never on a later login -- EXCEPT with
+    # XHC_OIDC_ADMIN_CLAIM set, where it is a standing grant (see below). So,
+    # outside that mode, it is idempotent, harmless to leave set, and cannot
+    # re-promote someone who was deliberately demoted. It also never creates a principal by itself -- admin is granted
     # by a COMPLETED login and by nothing else, or the environment would be a
     # way to mint an administrator.
     #
@@ -262,6 +263,25 @@ class Settings:
     # at most providers. It is accepted only because nobody knows their own
     # subject before their first login.
     bootstrap_admin: str | None = None
+    # ADMIN FROM THE IDENTITY PROVIDER. When both are set, admin is recomputed
+    # from the id_token at EVERY login: granted when the claim carries the
+    # value, REVOKED when it does not. The first-login bootstrap is off in this
+    # mode -- being first proves nothing once a provider decides the role.
+    #
+    # The claim is a name, or a dotted path into nested claims
+    # (`realm_access.roles`). A top-level claim whose own name contains dots
+    # (namespaced claims are URLs) is matched first, as a whole. The value
+    # matches a string claim exactly, or one element of a list claim exactly.
+    #
+    # Both or neither: one without the other is refused at startup, because a
+    # half-set pair is an operator who believes the provider decides admin
+    # while it does not.
+    #
+    # XHC_BOOTSTRAP_ADMIN changes meaning in this mode: it becomes a STANDING
+    # grant, evaluated at every login alongside the claim, so a broken claim
+    # mapping cannot lock out the operator who would fix it. See webauth.py.
+    oidc_admin_claim: str | None = None
+    oidc_admin_value: str | None = None
     # Signs the session cookie. MUST be set when OIDC is on; there is no
     # generated default, because a per-process random key silently logs
     # everyone out on restart and silently fails to log anyone out across
@@ -484,6 +504,26 @@ class Settings:
                     "the token exchange both carry the client secret."
                 )
 
+        # Fails on the ARGUMENTS, before any I/O: half an admin mapping would
+        # boot a service whose operator believes the IdP decides admin while
+        # the first-login grant is still what does.
+        oidc_admin_claim = (os.environ.get("XHC_OIDC_ADMIN_CLAIM") or "").strip() or None
+        oidc_admin_value = (os.environ.get("XHC_OIDC_ADMIN_VALUE") or "").strip() or None
+        if bool(oidc_admin_claim) != bool(oidc_admin_value):
+            have, lack = (
+                ("XHC_OIDC_ADMIN_CLAIM", "XHC_OIDC_ADMIN_VALUE") if oidc_admin_claim
+                else ("XHC_OIDC_ADMIN_VALUE", "XHC_OIDC_ADMIN_CLAIM")
+            )
+            raise ValueError(
+                f"{have} is set but {lack} is not. Admin from an identity-provider "
+                "claim needs both: the claim to read and the value that grants admin."
+            )
+        if oidc_admin_claim and not oidc_issuer:
+            raise ValueError(
+                "XHC_OIDC_ADMIN_CLAIM is set but XHC_OIDC_ISSUER is not: admin is "
+                "read from the login's id_token, and without an issuer there is no login."
+            )
+
         metrics_auth = (
             os.environ.get("XHC_METRICS_AUTH") or cls.metrics_auth
         ).strip().lower()
@@ -564,6 +604,8 @@ class Settings:
             oidc_discovery_url=os.environ.get("XHC_OIDC_DISCOVERY_URL") or None,
             oidc_pkce=_env_bool("XHC_OIDC_PKCE", cls.oidc_pkce),
             bootstrap_admin=os.environ.get("XHC_BOOTSTRAP_ADMIN") or None,
+            oidc_admin_claim=oidc_admin_claim,
+            oidc_admin_value=oidc_admin_value,
             session_secret=os.environ.get("XHC_SESSION_SECRET") or None,
             session_ttl_s=_env_float("XHC_SESSION_TTL", cls.session_ttl_s),
             negative_ttl_s=_env_float("XHC_NEGATIVE_TTL", cls.negative_ttl_s),
