@@ -18,9 +18,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from pathlib import Path
 
 _cached: str | None = None
+
+# When this process started, as near as the process can tell: the moment this
+# module was first imported. A poller that submitted a job before this time and
+# now cannot find it knows the process restarted underneath it -- which it can
+# tell even if the job ledger is lost. Not the container's start time; the
+# process is what holds the jobs.
+PROCESS_STARTED_AT = time.time()
 
 
 def source_fingerprint() -> str:

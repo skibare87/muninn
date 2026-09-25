@@ -32,7 +32,7 @@ from . import (
 )
 from . import registry as ociregistry
 from .config import settings
-from .jobs import manager
+from .jobs import ACTIVE_STATES, manager
 
 logging.basicConfig(
     level=os.environ.get("XHC_LOG_LEVEL", "INFO").upper(),
@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI):
     # Before anything reads pins: validates XHC_STATE_DIR (raising, never
     # falling back) and copies in-tree state across on first use.
     statedir.prepare()
+    # After prepare(), so the ledger is read from wherever state lives. Never
+    # raises for an unreadable ledger: job history is not protection (see
+    # JobManager.load_ledger for why this is the opposite of pins).
+    manager.load_ledger()
 
     if os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() in ("1", "true", "yes"):
         # This is the exact misconfiguration the whole design exists to avoid.
@@ -165,6 +169,10 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
+        # Record the final state of anything still running. A graceful stop
+        # leaves those jobs running in the ledger, so the next boot reports
+        # them as interrupted -- which is what they are.
+        manager.flush()
         await hfcompat.close_client()
         await ociregistry.close_client()
         await orphans.close_client()
@@ -233,7 +241,7 @@ async def prometheus_metrics(
         "muninn_cache_files": view.nb_files,
         "muninn_cache_repos": len(view.repos),
         "muninn_scan_duration_seconds": view.scan_duration_s,
-        "muninn_ingest_jobs_active": sum(1 for j in jobs if j.state in ("pending", "running")),
+        "muninn_ingest_jobs_active": sum(1 for j in jobs if j.state in ACTIVE_STATES),
         # Bytes fetched by in-flight ingests. Without this a running prewarm and
         # a stalled one look identical on this endpoint (an internal issue).
         # downloaded_bytes is a METHOD. Uncalled it is a truthy bound method, so

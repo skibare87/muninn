@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import platform
+import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from . import build, cachefs, orphans, policy, refs, viewer
 from .config import XET_ENV_KEYS, settings
-from .jobs import manager
+from .jobs import ACTIVE_STATES, manager
 
 router = APIRouter(prefix="/_cache", tags=["manage"])
 
@@ -81,9 +82,14 @@ async def status() -> dict:
     view = await cachefs.get_view()
     disk = cachefs.disk_stats()
     jobs = manager.list()
-    active = [j for j in jobs if j.state in ("pending", "running")]
+    active = [j for j in jobs if j.state in ACTIVE_STATES]
+    now = time.time()
     return {
         "build": build.info(),
+        # A job submitted before started_at ran in a previous process. Its
+        # ledger entry says `interrupted`; this says so even without the ledger.
+        "started_at": build.PROCESS_STARTED_AT,
+        "uptime_s": round(now - build.PROCESS_STARTED_AT, 1),
         "cache_dir": settings.cache_dir,
         "upstream": settings.upstream,
         "hf_token_present": bool(settings.hf_token),
@@ -107,7 +113,12 @@ async def status() -> dict:
             "scan_ttl_s": view.ttl_s,
             "warnings": view.warnings[:20],
         },
-        "jobs": {"active": len(active), "total_tracked": len(jobs)},
+        "jobs": {
+            "active": len(active),
+            "total_tracked": len(jobs),
+            "interrupted": sum(1 for j in jobs if j.state == "interrupted"),
+            "ledger": manager.ledger_status(),
+        },
         "refs": {"ttl_s": settings.ref_ttl_s, **refs.stats()},
         "policy": policy.load(),
         "viewer": {"ttl_s": settings.viewer_cache_ttl_s, **viewer.stats()},
@@ -139,6 +150,11 @@ async def list_repos(refresh: bool = False) -> dict:
                 "nb_files": r.nb_files,
                 "last_accessed": r.last_accessed,
                 "pinned": r.pinned,
+                # complete is true / false / null. null means no prewarm
+                # recorded what this snapshot should hold -- unknown, NOT
+                # complete. Judged against what the prewarm asked for when it
+                # used allow_patterns. See README "What /_cache/repos reports".
+                **(r.completeness or {"complete": None}),
                 "revisions": r.revisions,
             }
             for r in view.repos
@@ -173,7 +189,16 @@ async def list_jobs() -> dict:
 async def get_job(job_id: str) -> dict:
     job = manager.get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="no such job")
+        # Not "it failed" and not "it finished": this process has no record.
+        # started_at lets the caller see whether a restart explains that.
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no such job in this process or its ledger "
+                f"(process started_at={build.PROCESS_STARTED_AT:.0f}; the ledger "
+                "keeps finished jobs for a bounded time, see README)"
+            ),
+        )
     return job.to_dict()
 
 

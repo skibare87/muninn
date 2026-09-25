@@ -21,7 +21,7 @@ from pathlib import Path
 
 from huggingface_hub import scan_cache_dir
 
-from . import statedir
+from . import manifests, statedir
 from .config import settings
 
 log = logging.getLogger("xhc.cachefs")
@@ -285,6 +285,9 @@ class RepoView:
     last_accessed: float
     pinned: bool
     revisions: list[dict]
+    # complete / files_present / files_expected / bytes_present / bytes_expected,
+    # rolled up from the revisions. See manifests.py for what "expected" means.
+    completeness: dict | None = None
 
 
 @dataclass
@@ -312,16 +315,22 @@ def _scan_sync() -> CacheView:
     repos: list[RepoView] = []
     for r in info.repos:
         key = repo_key(r.repo_type, r.repo_id)
-        revs = [
-            {
+        revs = []
+        for rev in r.revisions:
+            # From the scan already in hand: completeness is judged on local
+            # data only, and must never cost an upstream call per repo.
+            present = {
+                Path(f.file_path).relative_to(rev.snapshot_path).as_posix(): f.size_on_disk
+                for f in rev.files
+            }
+            revs.append({
                 "commit": rev.commit_hash,
                 "refs": sorted(rev.refs),
                 "size_on_disk": rev.size_on_disk,
                 "nb_files": rev.nb_files,
                 "last_modified": rev.last_modified,
-            }
-            for rev in r.revisions
-        ]
+                **manifests.completeness(r.repo_type, r.repo_id, rev.commit_hash, present),
+            })
         revs.sort(key=lambda x: x["last_modified"], reverse=True)
         repos.append(
             RepoView(
@@ -333,6 +342,7 @@ def _scan_sync() -> CacheView:
                 last_accessed=r.last_accessed,
                 pinned=key in pins,
                 revisions=revs,
+                completeness=manifests.summarise(revs),
             )
         )
     repos.sort(key=lambda r: r.size_on_disk, reverse=True)
@@ -568,6 +578,8 @@ def delete_revision_sync(repo_type: str, repo_id: str, commit: str) -> dict:
     strategy = info.delete_revisions(*match)
     freed = strategy.expected_freed_size
     strategy.execute()
+    for c in match:
+        manifests.forget(repo_type, repo_id, c)
     key = repo_key(repo_type, repo_id)
     # Only release the orphan mark if nothing of the repo survives.
     if not repo_is_cached(repo_type, repo_id):
@@ -595,6 +607,7 @@ def delete_repo_sync(repo_type: str, repo_id: str) -> dict:
     # The data is gone, so the orphan mark must go too -- otherwise it keeps
     # claiming to retain bytes that no longer exist and inflates retained_bytes.
     forget_orphan(repo_key(repo_type, repo_id))
+    manifests.forget(repo_type, repo_id)
     return {"deleted": True, "freed": freed, "revisions": commits}
 
 

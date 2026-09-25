@@ -34,7 +34,13 @@ state as it stood at migration time. It is not kept in sync after that.
 
 The HF viewer/datasets-server response cache is NOT durable state: it is
 regenerable from upstream and can be large, so it stays with the blobs in the
-cache tree (`hf_tree_dir()`), on purpose.
+cache tree (`hf_tree_dir()`), on purpose. So do the prewarm manifests
+(`.xhc/manifests/`, see manifests.py): they describe those blobs and are only
+meaningful while the blobs exist.
+
+The ingest job ledger (`jobs.json`) does live here, because its whole purpose
+is to outlive the process -- but it is history, not protection, and an
+unreadable one never stops the service (see JobManager.load_ledger).
 """
 
 from __future__ import annotations
@@ -54,6 +60,11 @@ TREE_DIR_NAME = ".xhc"
 
 # Durable files per protocol. Migration copies exactly these; anything else in
 # the old directory (the viewer cache, temp files) stays put.
+#
+# jobs.json (the ingest job ledger) also lives in the HF state dir but is
+# deliberately NOT listed: a failed eager migration here stops the boot, which
+# is right for protection and wrong for job history. hf_file() still carries it
+# across lazily, and the ledger's loader treats a failure as non-fatal.
 HF_FILES = ("pins.json", "orphans.json", "policy.json")
 OCI_FILES = ("pins.json", "orphans.json")
 

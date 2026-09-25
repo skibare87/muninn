@@ -251,9 +251,20 @@ def test_the_asymmetry_with_oci_is_real_and_not_recalled(tmp_path):
 # --------------------------------------------------------------------------
 
 
+def _ingest(mgr, job):
+    """Run the job exactly as the manager does: download, then verify as its
+    own `verifying` step. Verification moved OUT of _download_file so a job can
+    report that it is hashing rather than downloading; calling _download_file
+    alone would now skip the check this module exists to test."""
+    import asyncio
+
+    asyncio.run(mgr._run(job))
+    return job
+
+
 @pytest.fixture
 def ingest(hub, tmp_path, monkeypatch):
-    """The real _download_file, pointed at the fake Hub."""
+    """The real ingest path (JobManager._run), pointed at the fake Hub."""
     from app import jobs, metrics
     from app.config import settings
 
@@ -288,10 +299,11 @@ def test_muninn_refuses_bytes_that_contradict_the_etag(ingest, tmp_path):
     mgr, job, handler, metrics = ingest
     handler.etag = LYING_ETAG
 
-    with pytest.raises(jobs.IngestDigestMismatch) as excinfo:
-        mgr._download_file(job)
+    _ingest(mgr, job)
 
-    assert LYING_ETAG in str(excinfo.value), "the refusal names the digest it expected"
+    assert job.state == "error", "a failed check must never end in done"
+    assert jobs.IngestDigestMismatch.__name__ in job.error
+    assert LYING_ETAG in job.error, "the refusal names the digest it expected"
     blob = tmp_path / f"models--{REPO.replace('/', '--')}" / "blobs" / LYING_ETAG
     assert not blob.exists(), (
         "a blob whose NAME asserts a digest its bytes do not have must not survive: "
@@ -304,8 +316,9 @@ def test_muninn_accepts_an_honest_file_and_records_it_verified(ingest):
     """NEGATIVE CONTROL for the refusal. Without this, a check that refuses
     everything would look identical to a correct one."""
     mgr, job, handler, metrics = ingest
-    path = mgr._download_file(job)
-    assert path.read_bytes() == TRUE_BYTES
+    _ingest(mgr, job)
+    assert job.state == "done", job.error
+    assert Path(job.result_path).read_bytes() == TRUE_BYTES
     snap = metrics.snapshot()["ingest_verify"]
     assert snap["VERIFIED"] == 1
     assert snap["MISMATCH"] == 0
@@ -321,9 +334,10 @@ def test_a_non_sha256_etag_is_UNVERIFIABLE_and_not_counted_as_verified(ingest):
     handler.etag = "a" * 40  # a git object id, not a sha256
     handler.body = TRUE_BYTES
 
-    path = mgr._download_file(job)  # accepted: nothing to check against
+    _ingest(mgr, job)  # accepted: nothing to check against
 
-    assert path.read_bytes() == TRUE_BYTES
+    assert job.state == "done", job.error
+    assert Path(job.result_path).read_bytes() == TRUE_BYTES
     snap = metrics.snapshot()["ingest_verify"]
     assert snap["UNVERIFIABLE"] == 1
     assert snap["VERIFIED"] == 0, "unverifiable must never be counted as verified"
@@ -342,8 +356,9 @@ def test_truncation_by_under_declared_length_is_now_caught_too(ingest, tmp_path)
     handler.etag = HONEST_ETAG  # honest about the hash
     handler.declared_size = len(TRUE_BYTES) - 1  # lying about the length
 
-    with pytest.raises(jobs.IngestDigestMismatch):
-        mgr._download_file(job)
+    _ingest(mgr, job)
+    assert job.state == "error"
+    assert jobs.IngestDigestMismatch.__name__ in job.error
     assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 1
 
 
@@ -359,9 +374,10 @@ def test_the_knob_is_what_makes_the_difference(ingest):
     handler.etag = LYING_ETAG
     settings.hf_verify_ingest = False
 
-    path = mgr._download_file(job)  # no refusal
+    _ingest(mgr, job)  # no refusal
 
-    assert path.resolve().name == LYING_ETAG
+    assert job.state == "done", job.error
+    assert Path(job.result_path).resolve().name == LYING_ETAG
     assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 0
 
 
@@ -402,7 +418,8 @@ def test_verify_tree_hashes_each_blob_once_and_reports_all_three_outcomes(tmp_pa
     (snap / "alias.bin").symlink_to(snap / "good.bin")  # second ref, same inode
 
     metrics.reset()
-    verified, unverifiable, mismatches = jobs.verify_tree(snap, since=0)
+    tv = jobs.verify_tree(snap, since=0)
+    verified, unverifiable, mismatches = tv.verified, tv.unverifiable, tv.mismatches
 
     assert verified == 1, "the duplicate reference must not be hashed twice"
     assert unverifiable == 1
@@ -431,7 +448,10 @@ def test_verify_tree_skips_blobs_that_were_not_fetched_this_run(tmp_path):
     os.utime(blob, (old, old))
 
     metrics.reset()
-    verified, unverifiable, mismatches = jobs.verify_tree(snap, since=time.time() - 60)
+    tv = jobs.verify_tree(snap, since=time.time() - 60)
 
-    assert (verified, unverifiable, mismatches) == (0, 0, [])
+    assert (tv.verified, tv.unverifiable, tv.mismatches) == (0, 0, [])
+    # ...and says so, rather than reporting an empty check: the file WAS seen,
+    # it was just not new.
+    assert tv.already_present == 1
     assert metrics.snapshot()["ingest_verify"]["VERIFIED"] == 0
