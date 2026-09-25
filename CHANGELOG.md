@@ -9,6 +9,28 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.24 — 2026-09-25
+
+v0.9.24 -- GCS listings parse; a listing that cannot be read is an error, not an empty bucket
+
+GCS's XML API answers ListObjectsV2 in the namespace
+http://doc.s3.amazonaws.com/2006-03-01, where S3 and MinIO use
+http://s3.amazonaws.com/doc/2006-03-01/. Muninn matched only the latter, so
+on GCS every tier listing parsed as empty. At each start the reconcile then
+re-enqueued everything, the per-object existence check HEADed every object,
+and the tier status totals read zero. No data was harmed and nothing was
+uploaded twice, but that was one HEAD per object at every start.
+
+XML elements are now matched by local name, whatever their namespace. A
+listing that declares KeyCount > 0 while no Contents element is recognised
+now raises an error instead of yielding nothing.
+
+Correction to v0.9.23's notes: "ListObjectsV2" was listed among what a real
+GCS deployment verified. It was not verified: that was inferred from uploads
+succeeding. The parser is now tested against the exact response shape a real
+GCS bucket returned, but it has not yet run against live GCS.
+
+
 ## v0.9.23 — 2026-09-25
 
 v0.9.23 -- tier status totals count uploads; GCS verified in a real deployment
