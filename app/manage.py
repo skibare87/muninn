@@ -9,6 +9,7 @@ set in advance, edge nodes should only ever see cache hits.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import platform
 from typing import Literal
 
@@ -27,8 +28,9 @@ RepoType = Literal["model", "dataset", "space"]
 async def require_manage_token(authorization: str | None = Header(default=None)) -> None:
     if not settings.manage_token:
         return
+    # compare_digest so the comparison does not leak the token's prefix
     expected = f"Bearer {settings.manage_token}"
-    if authorization != expected:
+    if authorization is None or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="invalid or missing management token")
 
 
