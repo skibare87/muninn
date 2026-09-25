@@ -276,7 +276,7 @@ class Settings:
     # is recorded as UNVERIFIABLE rather than passed off as checked: an
     # unverifiable file and a verified one must never render the same.
     #
-    # MEASURED before defaulting this on: sha256 runs ~8.8x faster than bytes
+    # MEASURED before defaulting this on: sha256 runs ~9.2x faster than bytes
     # arrive from upstream on this host, so the check is not the bottleneck the
     # ticket assumed it would be.
     hf_verify_ingest: bool = True
