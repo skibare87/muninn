@@ -50,7 +50,7 @@ _docker_bytes_ingested = 0
 _tier_requests: Counter[str] = Counter()  # "proto|kind|result"
 _tier_verify: Counter[str] = Counter()  # verified | mismatch
 _tier_upload: Counter[str] = Counter()  # ok | failed | skipped_* | verify_mismatch | dropped_*
-_tier_index_writes: Counter[str] = Counter()  # ok | failed | skipped_exists
+_tier_index_writes: Counter[str] = Counter()  # signed | unsigned | failed | skipped_exists
 # BODY bytes only. A HEAD transfers none and is never counted here -- the
 # served counter once booked HEADs as bytes, and every figure built on it
 # was inflated.
@@ -67,7 +67,7 @@ _TIER_UPLOAD_SERIES: tuple[str, ...] = (
     "ok", "failed", "skipped_exists", "skipped_evicted", "verify_mismatch",
     "dropped_queue_full",
 )
-_TIER_INDEX_SERIES: tuple[str, ...] = ("ok", "failed", "skipped_exists")
+_TIER_INDEX_SERIES: tuple[str, ...] = ("signed", "unsigned", "failed", "skipped_exists")
 
 # Bounds the label cardinality: a client that sends a unique header per request
 # would otherwise grow this map without limit and blow up the scrape.

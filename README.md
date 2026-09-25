@@ -1923,8 +1923,15 @@ heavily across repos.
   R2 a token scopes to a whole bucket, never to a prefix. So index objects are
   signed with `XHC_TIER2_INDEX_KEY`, an HMAC key from **your configuration**,
   never stored in the bucket. The signature also covers the observation time,
-  so an old signed observation cannot be replayed under a newer name. With no
-  key, **no index is written at all.**
+  so an old signed observation cannot be replayed under a newer name.
+- **The index is written with or without the key.** Without it, each entry is
+  written **unsigned** and says so in the object itself (`"auth": "unsigned"`
+  in a commit entry's body, `auth: unsigned` metadata on a ref or tag entry).
+  Nothing reads the index yet, so an unsigned entry costs no trust today.
+  **Whether a later restore will use unsigned entries is not decided.** An
+  unsigned index can be restored from only if that policy allows it. Entries
+  are immutable and never re-signed, so **set the key from the start** if you
+  want everything written to stay restorable under a signed-only policy.
 - **On a mismatch** the bytes are discarded and nothing is linked;
   `muninn_tier_verify_total{result="mismatch"}` counts it and the key is logged
   and listed under `tier.bad_keys` on `/_cache/status`. That key is not read
@@ -2002,7 +2009,7 @@ that byte in the same pass and sends it.
 |---|---|
 | read-through for OCI blobs, OCI manifests by digest, and HF files with a sha256 ETag | serve anything from the tier when the **upstream is unreachable for metadata**. A Hugging Face miss still needs the Hub's `HEAD`, and a tag still needs the registry |
 | write-back after `done`, with the upload-time hash | read or restore from the **index**, which is written but never read. A model deleted upstream does **not** survive through the tier yet |
-| write the signed index (with `XHC_TIER2_INDEX_KEY`) | tier small, non-LFS Hugging Face files (`config.json`, tokenizers), which are keyed by git blob id. A model restored without its `config.json` is not a model, so that is the next phase's first job |
+| write the index: signed with `XHC_TIER2_INDEX_KEY`, marked unsigned without it | tier small, non-LFS Hugging Face files (`config.json`, tokenizers), which are keyed by git blob id. A model restored without its `config.json` is not a model, so that is the next phase's first job |
 | verify every tier read | |
 | static keys, and a GKE metadata-server token for GCS | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
 | | parallel ranged reads from the tier: one stream per object |
@@ -2082,13 +2089,13 @@ content. That is why the index is signed with a key the bucket does not hold.
 | `XHC_TIER2_UPLOAD_CONCURRENCY` | `2` | concurrent uploads |
 | `XHC_TIER2_QUEUE_MAX` | `10000` | in-memory upload queue bound; the reconciler covers overflow |
 | `XHC_TIER2_RECONCILE_INTERVAL` | `21600` | seconds between reconciles (and one at startup); `0` disables, and the queue is then best-effort |
-| `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects. Unset: **no index is written** |
+| `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects. Unset: the index is still written, **unsigned**, and marked so; see the trust section |
 | `XHC_TIER2_CHECKSUM_HEADER` | `true` (s3), `false` (gs) | also send `x-amz-checksum-sha256` on single PUTs |
 
 Tier metrics: `muninn_tier_requests_total{proto,kind,result=hit|miss|error|refused}`,
 `muninn_tier_verify_total{result=verified|mismatch}`,
 `muninn_tier_upload_total{result=ok|failed|skipped_exists|skipped_evicted|verify_mismatch|dropped_queue_full}`,
-`muninn_tier_index_writes_total{result=ok|failed|skipped_exists}`,
+`muninn_tier_index_writes_total{result=signed|unsigned|failed|skipped_exists}`,
 `muninn_tier_bytes_read_total` and `muninn_tier_bytes_written_total` (body
 bytes only; a HEAD is never counted), and the gauges `muninn_tier_healthy`,
 `muninn_tier_upload_queue_depth`, `muninn_tier_objects`, `muninn_tier_bytes`

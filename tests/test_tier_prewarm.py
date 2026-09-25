@@ -280,6 +280,14 @@ def test_tier_fills_are_bounded_by_snapshot_max_workers(world, monkeypatch):
     assert inflight["max"] == 2
 
 
+def test_a_prewarm_without_a_key_writes_an_unsigned_index_for_every_file(world):
+    _prewarm()
+    for n in FILES:
+        body = world.objects[tier.hf_commit_index_key("model", REPO, COMMIT, n)].body
+        entry = json.loads(body)
+        assert entry["etag"] == _etag(n) and entry["auth"] == tier.AUTH_UNSIGNED
+
+
 def test_allow_patterns_limit_what_is_asked_of_the_tier(world):
     async def go():
         m = jobs.JobManager()

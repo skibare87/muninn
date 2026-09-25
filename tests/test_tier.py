@@ -568,12 +568,16 @@ def test_write_back_after_done_uploads_content_and_index(fake, hub):
     canon = json.dumps([tier.INDEX_VERSION, "hf-commit", tier.hf_host(), f"models/{REPO}",
                         COMMIT, FILENAME, ETAG, len(TRUE_BYTES), ""], separators=(",", ":"))
     assert idx["sig"] == hmac.new(INDEX_KEY, canon.encode(), hashlib.sha256).hexdigest()
+    assert idx["auth"] == tier.AUTH_SIGNED and idx["version"] == tier.INDEX_VERSION
 
     refs_ = [k for k in fake.objects if "/refs/main/" in k]
     assert len(refs_) == 1 and refs_[0].endswith(f"-{COMMIT}")
     meta = fake.objects[refs_[0]].metadata
     assert meta["x-amz-meta-sig"] and meta["x-amz-meta-observed-at"]
+    assert meta["x-amz-meta-auth"] == tier.AUTH_SIGNED
     assert fake.objects[refs_[0]].body == b""
+    writes = metrics.snapshot()["tier_index_writes"]
+    assert writes["signed"] == 2 and writes["unsigned"] == 0
 
 
 async def _settle_after(coro):
@@ -582,11 +586,32 @@ async def _settle_after(coro):
     return r
 
 
-def test_no_index_is_written_without_a_key(fake, hub, monkeypatch):
+def test_without_a_key_the_index_is_written_unsigned_and_says_so(fake, hub, monkeypatch):
+    """Phase 1 writes the index regardless, so a later phase can restore what
+    this one ingested -- if its policy accepts unsigned entries. The object
+    itself says it is unsigned; nothing has to infer it from a missing field."""
     _set_tier(monkeypatch, fake, index_key=None)
     _run(lambda: _settle_after(_get(RESOLVE)))
-    assert _hf_key() in fake.objects, "known positive: content was still uploaded"
-    assert not [k for k in fake.objects if "/index/" in k]
+    assert _hf_key() in fake.objects
+
+    idx = json.loads(fake.objects[tier.hf_commit_index_key("model", REPO, COMMIT, FILENAME)].body)
+    assert idx == {"etag": ETAG, "size": len(TRUE_BYTES), "auth": tier.AUTH_UNSIGNED,
+                   "version": tier.INDEX_VERSION}
+    (ref,) = [k for k in fake.objects if "/refs/main/" in k]
+    meta = fake.objects[ref].metadata
+    assert meta["x-amz-meta-auth"] == tier.AUTH_UNSIGNED
+    assert "x-amz-meta-sig" not in meta and meta["x-amz-meta-observed-at"]
+    writes = metrics.snapshot()["tier_index_writes"]
+    assert writes["unsigned"] == 2 and writes["signed"] == 0
+    assert tier.status()["index"].startswith("unsigned")
+
+
+def test_an_existing_index_entry_is_skipped_not_rewritten(fake, hub):
+    idx_key = tier.hf_commit_index_key("model", REPO, COMMIT, FILENAME)
+    fake.seed(idx_key, b'{"placed": "earlier"}')
+    _run(lambda: _settle_after(_get(RESOLVE)))
+    assert fake.objects[idx_key].body == b'{"placed": "earlier"}'
+    assert metrics.snapshot()["tier_index_writes"]["skipped_exists"] == 1
 
 
 def test_nothing_is_uploaded_from_a_job_that_ends_in_error(fake, hub):
@@ -975,6 +1000,7 @@ def test_oci_tag_fetch_writes_manifest_and_a_signed_tag_observation(fake, monkey
     tags = [k for k in fake.objects if "/index/oci/ghcr.io/tags/org/img/v1/" in k]
     assert len(tags) == 1 and tags[0].endswith(MANIFEST_DIGEST)
     assert fake.objects[tags[0]].metadata["x-amz-meta-sig"]
+    assert fake.objects[tags[0]].metadata["x-amz-meta-auth"] == tier.AUTH_SIGNED
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1013,8 @@ def test_tier_series_exist_at_zero_and_count(fake, hub):
     for needle in ('muninn_tier_requests_total{proto="hf",kind="blob",result="hit"} 0',
                    'muninn_tier_verify_total{result="mismatch"} 0',
                    'muninn_tier_upload_total{result="verify_mismatch"} 0',
+                   'muninn_tier_index_writes_total{result="unsigned"} 0',
+                   'muninn_tier_index_writes_total{result="signed"} 0',
                    "muninn_tier_bytes_read_total 0", "muninn_tier_bytes_written_total 0"):
         assert needle in body, needle
     fake.seed(_hf_key(), TRUE_BYTES)

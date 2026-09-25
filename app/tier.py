@@ -12,8 +12,10 @@ THE SPLIT THIS IS BUILT ON.
   REQUEST -- the Hub's HEAD, or the digest in the URL -- and never from the
   bucket. A bucket can withhold content; it cannot forge it.
 - MAPPINGS (revision -> commit -> file -> etag, tag -> digest) are only as
-  trustworthy as whoever can write the bucket. Phase 1 WRITES a signed index of
-  them and never READS it; restoring from it is phase 2.
+  trustworthy as whoever can write the bucket. Phase 1 WRITES an index of them
+  -- HMAC-signed when XHC_TIER2_INDEX_KEY is set, marked unsigned when it is
+  not -- and never READS it. Restoring from it, and whether an unsigned entry
+  may be restored at all, is phase 2.
 
 ONE HASH PASS, IN BOTH DIRECTIONS. A tier read hashes the bytes as they land in
 a temporary file and renames it into place only on a match -- it never fetches
@@ -69,6 +71,10 @@ BACKOFF_S: tuple[float, ...] = (1, 4, 15, 45)
 REPROBE_S = 60.0
 MANIFEST_MAX = 32 * 1024 * 1024
 INDEX_VERSION = "muninn-tier-index-v1"
+# How an index object says whether it is signed, in the object itself: a field
+# of a commit object's JSON body, and user metadata on a ref or tag object.
+AUTH_SIGNED = "hmac-sha256-v1"
+AUTH_UNSIGNED = "unsigned"
 
 # ---------------------------------------------------------------------------
 # state
@@ -532,6 +538,8 @@ class Upload:
     metadata: dict[str, str] = field(default_factory=dict)
     # Index objects that must follow this content, never precede it.
     then: list[Upload] = field(default_factory=list)
+    # Index objects only: whether it carries a signature.
+    signed: bool = False
 
 
 def enqueue(item: Upload) -> bool:
@@ -555,41 +563,53 @@ def _content(key: str, path: Path, sha_hex: str, content_type: str | None = None
     return Upload(kind="content", key=key, path=path, sha256=sha_hex, content_type=content_type)
 
 
+def _auth(*sig_args) -> dict[str, str]:
+    """The authentication fields for one index object.
+
+    Signed when XHC_TIER2_INDEX_KEY is set. Otherwise written anyway and MARKED
+    unsigned in the object, so a later reader never has to infer it from an
+    absent field. Nothing reads the index in phase 1, so an unsigned entry
+    costs no trust today; whether phase 2 will restore from one is a policy
+    decision that has not been made. Writing it keeps that option open, and
+    setting the key from the start keeps the stronger one open too: an entry
+    written unsigned is never re-signed later (index objects are immutable and
+    skipped when they already exist).
+    """
+    if cfg().index_key:
+        return {"auth": AUTH_SIGNED, "sig": index_sig(*sig_args)}
+    return {"auth": AUTH_UNSIGNED}
+
+
 def _hf_commit_index(repo_type: str, repo_id: str, commit: str, path: str, etag: str,
-                     size: int) -> Upload | None:
-    if not cfg().index_key:
-        return None
+                     size: int) -> Upload:
     host, repo = hf_host(), f"{repo_type}s/{repo_id}"
-    body = s3client.to_json({
-        "etag": etag, "size": size,
-        "sig": index_sig("hf-commit", host, repo, commit, path, etag, size),
-    })
+    auth = _auth("hf-commit", host, repo, commit, path, etag, size)
+    body = s3client.to_json({"etag": etag, "size": size, "version": INDEX_VERSION, **auth})
     return Upload(kind="index", key=hf_commit_index_key(repo_type, repo_id, commit, path),
-                  body=body, content_type="application/json")
+                  body=body, content_type="application/json", signed="sig" in auth)
 
 
 def _hf_ref_index(repo_type: str, repo_id: str, ref: str, commit: str,
                   observed_at: float) -> Upload | None:
-    if not cfg().index_key or ref == commit:
-        return None
+    if ref == commit:
+        return None  # a commit-pinned request observes no ref
     host, repo = hf_host(), f"{repo_type}s/{repo_id}"
     obs = _observed(observed_at)
+    auth = _auth("hf-ref", host, repo, ref, "", commit, 0, obs)
     return Upload(
         kind="index", key=hf_ref_index_key(repo_type, repo_id, ref, observed_at, commit),
-        metadata={"sig": index_sig("hf-ref", host, repo, ref, "", commit, 0, obs),
-                  "observed-at": obs},
+        metadata={**auth, "observed-at": obs, "version": INDEX_VERSION}, signed="sig" in auth,
     )
 
 
 def _oci_tag_index(upstream: str, repo: str, tag: str, digest: str,
-                   observed_at: float, media: str) -> Upload | None:
-    if not cfg().index_key:
-        return None
+                   observed_at: float, media: str) -> Upload:
     obs = _observed(observed_at)
+    auth = _auth("oci-tag", upstream, repo, tag, "", digest, 0, obs)
     return Upload(
         kind="index", key=oci_tag_index_key(upstream, repo, tag, observed_at, digest),
-        metadata={"sig": index_sig("oci-tag", upstream, repo, tag, "", digest, 0, obs),
-                  "observed-at": obs, "media-type": media},
+        metadata={**auth, "observed-at": obs, "media-type": media, "version": INDEX_VERSION},
+        signed="sig" in auth,
     )
 
 
@@ -609,9 +629,7 @@ def enqueue_oci_manifest(upstream: str, digest: str, media: str, repo: str | Non
     item = _content(oci_manifest_key(upstream, digest), ocistore.manifest_path(upstream, digest),
                     digest.split(":", 1)[1], content_type=media)
     if repo and tag:
-        idx = _oci_tag_index(upstream, repo, tag, digest, time.time(), media)
-        if idx is not None:
-            item.then.append(idx)
+        item.then.append(_oci_tag_index(upstream, repo, tag, digest, time.time(), media))
     enqueue(item)
 
 
@@ -654,10 +672,9 @@ def _hf_job_items(job) -> list[Upload]:
         if (_SHA256_RE.match(etag) and fresh and not tier_sourced
                 and st.st_size >= t.min_size):
             item = _content(hf_content_key(job.repo_type, job.repo_id, etag), blob, etag)
-            if idx is not None:
-                item.then.append(idx)
+            item.then.append(idx)
             items.append(item)
-        elif idx is not None:
+        else:
             # Git-object files (phase 2 content), content already in the tier,
             # or content below MIN_SIZE: the mapping is still true, so record it.
             loose.append(idx)
@@ -814,7 +831,7 @@ async def _put_index(item: Upload) -> None:
             f"PUT {item.key}",
         )
         if r.status_code == 200:
-            metrics.record_tier_index_write("ok")
+            metrics.record_tier_index_write("signed" if item.signed else "unsigned")
             metrics.record_tier_bytes(written=len(item.body))
         else:
             metrics.record_tier_index_write("failed")
@@ -1033,8 +1050,7 @@ async def reconcile() -> dict:
 
     The bucket is the durable record of what was uploaded; there is no state
     file, so a restart loses nothing but time and nothing new can be
-    unreadable. Also backfills the signed index for local snapshots and refs
-    when XHC_TIER2_INDEX_KEY is set.
+    unreadable. Also backfills the index for local snapshots and refs.
     """
     started = time.time()
     summary: dict = {"started_at": started}
@@ -1068,29 +1084,29 @@ async def reconcile() -> dict:
                 enq += enqueue(_content(key, path, digest.split(":", 1)[1],
                                         content_type=media if kind == "manifests" else None))
         summary["content_enqueued"] = enq
-        if cfg().index_key:
-            index = await _list_keys(f"{_base()}/index/hf/")
-            files, refs = await asyncio.to_thread(_local_hf_index, view.repos)
-            ienq = 0
-            for repo_type, repo_id, commit, path, etag, size in files:
-                if hf_commit_index_key(repo_type, repo_id, commit, path) in index:
-                    continue
-                item = _hf_commit_index(repo_type, repo_id, commit, path, etag, size)
+        # The index, with or without a key: unsigned entries are marked so.
+        index = await _list_keys(f"{_base()}/index/hf/")
+        files, refs = await asyncio.to_thread(_local_hf_index, view.repos)
+        ienq = 0
+        for repo_type, repo_id, commit, path, etag, size in files:
+            if hf_commit_index_key(repo_type, repo_id, commit, path) in index:
+                continue
+            item = _hf_commit_index(repo_type, repo_id, commit, path, etag, size)
+            ienq += enqueue(item)
+        # A ref observation is "<ref dir>/<observed_at>-<commit>"; any
+        # observation of this ref at this commit is enough.
+        seen_refs = {
+            (k.rsplit("/", 1)[0], k.rsplit("/", 1)[1].split("-", 1)[-1])
+            for k in index if "/refs/" in k
+        }
+        for repo_type, repo_id, ref, commit, mtime in refs:
+            ref_dir = hf_ref_index_key(repo_type, repo_id, ref, 0, commit).rsplit("/", 1)[0]
+            if (ref_dir, commit) in seen_refs:
+                continue
+            item = _hf_ref_index(repo_type, repo_id, ref, commit, mtime)
+            if item is not None:
                 ienq += enqueue(item)
-            # A ref observation is "<ref dir>/<observed_at>-<commit>"; any
-            # observation of this ref at this commit is enough.
-            seen_refs = {
-                (k.rsplit("/", 1)[0], k.rsplit("/", 1)[1].split("-", 1)[-1])
-                for k in index if "/refs/" in k
-            }
-            for repo_type, repo_id, ref, commit, mtime in refs:
-                ref_dir = hf_ref_index_key(repo_type, repo_id, ref, 0, commit).rsplit("/", 1)[0]
-                if (ref_dir, commit) in seen_refs:
-                    continue
-                item = _hf_ref_index(repo_type, repo_id, ref, commit, mtime)
-                if item is not None:
-                    ienq += enqueue(item)
-            summary["index_enqueued"] = ienq
+        summary["index_enqueued"] = ienq
         summary["ok"] = True
     except s3client.TierAuthError as exc:
         _mark_unhealthy(str(exc))
@@ -1141,7 +1157,8 @@ async def start() -> None:
         "object-store tier ENABLED at %s (read=%s write=%s read_mode=%s index=%s). "
         "Muninn never deletes from it: it grows without bound until the operator "
         "sets a retention rule, and retention is the operator's cost decision.",
-        t.url, t.read, t.write, t.read_mode, "signed" if t.index_key else "OFF (no key)",
+        t.url, t.read, t.write, t.read_mode,
+        "signed" if t.index_key else "UNSIGNED (XHC_TIER2_INDEX_KEY unset)",
     )
     if t.read_mode == "stream":
         log.warning("XHC_TIER2_READ_MODE=stream serves tier bytes to Hugging Face "
@@ -1175,7 +1192,9 @@ def status() -> dict:
         "read": t.read,
         "write": t.write,
         "read_mode": t.read_mode,
-        "index": "signed" if t.index_key else "off (XHC_TIER2_INDEX_KEY unset)",
+        "index": "signed" if t.index_key else (
+            "unsigned: XHC_TIER2_INDEX_KEY is unset. Entries are written and marked "
+            "unsigned; whether a later restore will trust them is not decided"),
         "healthy": _s.healthy,
         "probe": _s.probe,
         "last_error": _s.last_error,
