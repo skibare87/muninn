@@ -1,0 +1,71 @@
+# EXCERPT -- the parts of a model-serving Deployment that point it at Muninn.
+# Not in kustomization.yaml; copy what you need into your own manifests.
+#
+# It is written for the `muninn` namespace because the provisioning init
+# container writes the key Secret there. Secrets cannot be referenced across
+# namespaces; to run model pods elsewhere, see README.md ("Model pods in
+# another namespace").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-model-server
+  namespace: muninn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: example-model-server
+  template:
+    metadata:
+      labels:
+        app: example-model-server
+        # Admitted by networkpolicy.yaml (where the CNI enforces it).
+        muninn-client: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: server
+          image: your-model-server-image
+          env:
+            # Muninn's Service. <service>.<namespace>.svc, port 8080.
+            - name: HF_ENDPOINT
+              value: http://muninn.muninn.svc:8080
+            # The Muninn key, as key_id:secret. With XHC_HF_AUTH=key Muninn
+            # accepts it as `Authorization: Bearer <key_id>:<secret>`, which is
+            # exactly what huggingface_hub sends for HF_TOKEN, so no client code
+            # changes. It is NOT a Hub token and is useless against the Hub.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: muninn-pod-key, key: HF_TOKEN }
+            # Correct HERE, on the client, and wrong on the cache. Between the
+            # pod and Muninn, Xet buys nothing and costs CPU and a second chunk
+            # cache per pod. (Muninn also refuses the Xet token endpoints, so a
+            # client with Xet on falls back to plain HTTP anyway.)
+            #
+            # THE CONSEQUENCE TO PLAN FOR: with Xet off, huggingface_hub
+            # refuses any single file larger than MAX_HTTP_DOWNLOAD_SIZE before
+            # sending a request. In huggingface_hub 0.34.4 that is
+            #   constants.py:       MAX_HTTP_DOWNLOAD_SIZE = 50 * 1000 * 1000 * 1000  # 50 GB
+            #   file_download.py:   elif expected_size and expected_size > constants.MAX_HTTP_DOWNLOAD_SIZE:
+            #                           raise ValueError("The file is too large ...")
+            # Decimal, so the ceiling is 46.57 GiB, and there is no environment
+            # variable for it. Muninn reports the true size and cannot help:
+            # the refusal happens on metadata, before any GET. Ordinary sharded
+            # weights are far below it; a single huge file (some GGUFs) is not.
+            # See the repository README, "Two client-side limits".
+            - name: HF_HUB_DISABLE_XET
+              value: "1"
+            # The first pod to ask for a cold file waits for the ingest to
+            # start before its first byte. The 10 s default times that pod out
+            # while every later pod is served from disk. 600 s.
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: "600"
+            # A small, disposable local cache. A re-pull is a LAN-speed read
+            # from Muninn, so there is nothing here worth keeping.
+            - name: HF_HUB_CACHE
+              value: /models/hf
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      volumes:
+        - name: models
+          emptyDir: {}

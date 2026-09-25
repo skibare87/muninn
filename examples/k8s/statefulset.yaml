@@ -1,0 +1,327 @@
+# Muninn as a single-replica StatefulSet.
+#
+# ONE replica, always. Muninn is single-node by design (README, Limitations):
+# two replicas would be two independent caches each fetching from the Hub, each
+# with its own pins and key store, behind one Service that alternates between
+# them. A StatefulSet rather than a Deployment so the volumes follow the pod,
+# and so a rollout never runs two pods against one ReadWriteOnce volume. The
+# cost is a short outage on every update: the old pod stops before the new one
+# starts. In-flight ingests become `interrupted` and are resumed by re-submitting
+# them (see prewarm/).
+#
+# THREE VOLUMES, three lifetimes:
+#
+#   state  /state  small PVC. XHC_STATE_DIR (pins, orphan marks, runtime
+#                  policy, job ledger) AND XHC_AUTHZ_DB (principals, keys,
+#                  rules). This is the volume you must not lose.
+#   cache  /cache  the blob cache, HF_HUB_CACHE. Large. Replaceable.
+#   xet    /xet    hf_xet's chunk scratch, HF_XET_CACHE. Disposable (emptyDir).
+#
+# If the CACHE volume is lost: every blob is fetched again on its next request,
+# and nothing that protects or authorises is lost -- pins, orphan marks, policy,
+# job history and every key live on `state`. Also lost with it, and rebuilt by
+# re-running the prewarm: the saved file listings behind `complete` on
+# /_cache/repos (they sit beside the blobs, so repos report `complete: null`
+# until re-prewarmed), and the regenerable dataset-metadata cache.
+#
+# ONE EXCEPTION, and it is not a re-fetch: under XHC_ORPHAN_POLICY=retain a
+# repo deleted from the Hub is kept because the copy on `cache` is the ONLY
+# copy. Its orphan mark survives on `state`; its bytes do not, and nothing can
+# fetch them again. If you retain orphans as an archive, the blob volume is not
+# disposable. Use a PVC for it (as below), not an emptyDir.
+#
+# To put the blobs on local NVMe instead, replace the `cache` claim template
+# with a local-volume StorageClass (it stays a PVC, pinned to one node), or
+# with an emptyDir -- see the commented block under `volumes:`.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: muninn
+  labels:
+    app.kubernetes.io/name: muninn
+spec:
+  replicas: 1
+  serviceName: muninn
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: muninn
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: muninn
+    spec:
+      serviceAccountName: muninn
+      # No API token in the serving container. The init container gets one
+      # through the projected `provisioner-token` volume below.
+      automountServiceAccountToken: false
+      # Graceful stop flushes the job ledger. It does not wait for ingests:
+      # they are recorded as `interrupted` and resumed by re-submitting.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # The image declares no USER and would run as root. Nothing it does
+        # needs root: it binds 8080 and writes only to the mounted volumes.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        # Without this the kubelet re-chowns EVERY file on every volume at
+        # every pod start, before any container runs and before any probe can
+        # see it. On a cache with millions of blobs that is minutes to hours
+        # of startup that looks like a hang. OnRootMismatch skips it once the
+        # volume root already has the right group.
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # Principal, rules and the model pods' key. Idempotent; see
+        # provision.py for every case and README.md for the RBAC.
+        - name: provision
+          image: ghcr.io/skibare87/muninn
+          command: ["python", "/opt/muninn-provision/provision.py"]
+          env:
+            - name: XHC_AUTHZ_DB
+              value: /state/authz.db
+            - name: PROVISION_SUBJECT
+              value: "svc:model-pods"
+            - name: PROVISION_KEY_LABEL
+              value: k8s-model-pods
+            - name: PROVISION_SECRET_NAME
+              value: muninn-pod-key
+            - name: PROVISION_SECRET_KEY
+              value: HF_TOKEN
+            - name: PROVISION_RULES_FILE
+              value: /opt/muninn-provision/rules
+            - name: PROVISION_MINT_DIR
+              value: /run/mint
+            - name: HOME
+              value: /tmp
+          volumeMounts:
+            - { name: state, mountPath: /state }
+            - { name: provision, mountPath: /opt/muninn-provision, readOnly: true }
+            - { name: provisioner-token, mountPath: /var/run/muninn-provisioner, readOnly: true }
+            - { name: mint, mountPath: /run/mint }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: muninn
+          image: ghcr.io/skibare87/muninn
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # --- the cache's own Hub identity ---------------------------------
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: muninn-upstream, key: HF_TOKEN }
+            - name: XHC_MANAGE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: muninn-upstream, key: XHC_MANAGE_TOKEN }
+
+            # --- volumes (see the header) --------------------------------------
+            - name: HF_HUB_CACHE
+              value: /cache
+            - name: HF_XET_CACHE
+              value: /xet
+            - name: XHC_STATE_DIR
+              value: /state
+            - name: XHC_AUTHZ_DB
+              value: /state/authz.db
+            # Measured with this env, non-root and read-only: serving, a stream
+            # miss and a verified prewarm wrote nothing outside the mounted
+            # volumes (hf_xet puts its logs under HF_XET_CACHE). HOME and
+            # HF_HOME point at the scratch volume anyway, so that a code path
+            # which does write under them lands somewhere writable instead of
+            # failing on the read-only root.
+            - name: HOME
+              value: /tmp
+            - name: HF_HOME
+              value: /tmp/hf-home
+
+            # --- who may pull ---------------------------------------------------
+            # A Muninn key on every Hugging Face request, and its rules decide
+            # which repositories it may pull -- on cache hits as well as misses.
+            # This is the control that holds whatever the CNI does with
+            # networkpolicy.yaml. /healthz and /metrics stay unauthenticated.
+            - name: XHC_HF_AUTH
+              value: key
+            - name: XHC_HF_RULES
+              value: enforce
+            # A server-wide ceiling on what can be INGESTED at all, whoever
+            # asks. Belt and braces with the per-key rules, and they are
+            # matched differently: this list is case-SENSITIVE (fnmatch) and
+            # needs the type prefix; key rules are case-insensitive. Env only
+            # SEEDS this policy -- after a PUT /_cache/policy the stored policy
+            # wins and edits here are ignored.
+            - name: XHC_INGEST_POLICY
+              value: allowlist
+            - name: XHC_ALLOW_REPOS
+              value: "models/Qwen/Qwen2.5-0.5B-Instruct"
+
+            # --- ingest -----------------------------------------------------------
+            # Simultaneous ingest JOBS. Sets the memory limit below -- read the
+            # note there before raising it.
+            - name: XHC_INGEST_CONCURRENCY
+              value: "2"
+            # hf_xet's chunk cache, in bytes. Keep it under the `xet` emptyDir's
+            # sizeLimit or the kubelet evicts the pod for exceeding it.
+            - name: HF_XET_CHUNK_CACHE_SIZE_BYTES
+              value: "8589934592"
+            # DO NOT set HF_HUB_DISABLE_XET here. It belongs on the model pods.
+            # On the cache it turns the parallel Xet ingest into the single-
+            # stream LFS bridge (the ~3 MB/s failure mode), and Muninn logs a
+            # warning at boot if it sees it.
+
+            # --- surface ----------------------------------------------------------
+            # This example serves Hugging Face only. The OCI registry defaults
+            # ON and writes to /docker, which is on the read-only root here. To
+            # use it, set this to "1" and mount a volume at /docker (or set
+            # XHC_DOCKER_DIR), and read README "Docker and OCI pull-through".
+            - name: XHC_DOCKER_ENABLED
+              value: "0"
+            # /docs, /redoc and /openapi.json describe the management API to
+            # anyone who asks. Not needed to operate the cache.
+            - name: XHC_DOCS
+              value: "0"
+            # Capacity. Unset, eviction targets the filesystem's size, which is
+            # right for a PVC. On an emptyDir it is NOT: statfs reports the whole
+            # node disk, so set this below the emptyDir's sizeLimit.
+            # - name: XHC_CACHE_MAX_SIZE
+            #   value: "180G"
+
+          # /healthz is unauthenticated even with XHC_HF_AUTH=key, returns 200
+          # {"ok": true, "free_bytes": N} when it can stat the cache volume and
+          # 503 {"ok": false, ...} when it cannot. It is a statvfs, not a scan:
+          # cheap at any cache size. Nothing at startup scans the cache before
+          # the port opens, but the three probes are still split so a slow
+          # start is never read as a dead process.
+          #
+          # Kubernetes ignores the image's Docker HEALTHCHECK, which also
+          # fetches /metrics. These probes leave /metrics out on purpose: here
+          # a failing liveness probe RESTARTS the pod and kills every ingest in
+          # flight, so a metrics bug must not be able to do that. Alert on the
+          # /metrics scrape itself (`up == 0`) instead.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            # 10 minutes to first success.
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 30
+            # Generous: a restart kills every ingest in flight and every client
+            # streaming from one, so require ~3 minutes of consecutive failure.
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+          # MEMORY. Measurements, not guarantees -- hf_xet 1.6.0 via
+          # huggingface_hub 0.34.4, one deployment:
+          #   - with Xet (the default, and the fast path): about 2 to 2.5 GiB
+          #     peak per concurrent ingest, roughly independent of file size
+          #     above a few GB;
+          #   - with HF_HUB_DISABLE_XET=1 on the cache: about 50 MiB, at roughly
+          #     60% of the throughput in one measurement -- and see the warning
+          #     in `env` about what disabling Xet on the cache costs.
+          # Hence: limit >= 2.5 GiB x XHC_INGEST_CONCURRENCY, plus headroom for
+          # the server and page cache. 2 x 2.5 GiB + 1 GiB = 6 GiB here.
+          #
+          # CAVEAT, from the code rather than a measurement: XHC_INGEST_CONCURRENCY
+          # bounds JOBS. A prewarm is one job, but it downloads up to 8 files at
+          # once (snapshot_download max_workers=8). Whether the peak above is per
+          # file or per job was not measured; if it is per file, one prewarm of a
+          # many-shard repo can need several times this. Watch the first large
+          # prewarm (kubectl top pod) before trusting the limit.
+          # Request = limit for memory, so the scheduler reserves what an ingest
+          # will actually use and an OOM-kill is a limit, not node pressure.
+          resources:
+            requests: { cpu: "2", memory: 6Gi }
+            limits: { memory: 6Gi }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: state, mountPath: /state }
+            - { name: cache, mountPath: /cache }
+            - { name: xet, mountPath: /xet }
+            - { name: tmp, mountPath: /tmp }
+
+      volumes:
+        - name: xet
+          emptyDir:
+            sizeLimit: 10Gi
+        # HOME, HF_HOME and temporary files. Small.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        # The freshly minted secret lives here for milliseconds, in RAM only.
+        - name: mint
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: provision
+          configMap:
+            name: muninn-provision
+        # The service-account token, projected by hand so that ONLY the init
+        # container mounts it (automountServiceAccountToken is false above).
+        - name: provisioner-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - { key: ca.crt, path: ca.crt }
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: { fieldPath: metadata.namespace }
+        # --- blobs on local disk instead of a PVC -------------------------------
+        # Delete the `cache` entry from volumeClaimTemplates and use:
+        #
+        # - name: cache
+        #   emptyDir:
+        #     sizeLimit: 500Gi
+        #
+        # then set XHC_CACHE_MAX_SIZE below sizeLimit (see `env`). The blobs go
+        # with the pod: every restart onto a new node starts cold. Pins and keys
+        # survive on `state`; retained orphans do NOT (see the header).
+
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Pins, policy, job ledger and the key store: kilobytes to megabytes.
+        # Pick a StorageClass that is replicated or backed up -- this is the
+        # volume whose loss locks every model pod out until keys are re-issued.
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Size it to your working set of models. Fast local or NVMe-backed
+        # storage matters more than durability here.
+        resources:
+          requests:
+            storage: 200Gi
