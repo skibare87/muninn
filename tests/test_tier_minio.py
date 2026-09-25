@@ -50,7 +50,7 @@ from app.config import TierSettings, settings
 
 pytestmark = pytest.mark.minio
 
-IMAGE = os.environ.get("MUNINN_TEST_MINIO_IMAGE", "minio/minio:latest")
+IMAGE = os.environ.get("MUNINN_TEST_MINIO_IMAGE", "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1")
 BUCKET = "muninn-tier-test"
 
 

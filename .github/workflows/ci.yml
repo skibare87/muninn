@@ -40,7 +40,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: docker pull minio/minio:latest
+      - run: docker pull cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
       - run: pytest -m minio -rs
         env:
           MUNINN_TEST_MINIO_REQUIRED: "1"
