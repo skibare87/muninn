@@ -363,6 +363,16 @@ Two limits, stated here rather than left to be discovered:
   *not* fetched on this run are skipped — a repeat prewarm does not re-hash the
   half it already had. That makes it a check on ingest and not a scrub: on-disk
   rot in a blob nobody re-fetched is a different problem and is not covered.
+  The job's `verify` field and the log line say which is which:
+  `new_verified` / `new_unverifiable` / `mismatched` for files fetched this run,
+  `already_present_not_reverified` for the rest. A re-prewarm of a complete repo
+  reads "0 new files verified; N already present", not "0 verified".
+- **A job is `done` only after verification passes.** While the hash runs the
+  job says `verifying`, with `finished_at` still null; `done` and `finished_at`
+  are set together, and a mismatch ends in `error`, never `done`. (An earlier
+  version marked a snapshot `done` before verifying it, so a large file could
+  sit at `done` for minutes while still being checked.) Gate on `done`, not on
+  the bytes appearing.
 
 Why the default is on: sha256 measured at **1692 MiB/s** on this host against an
 observed ingest rate of **192 MB/s** — about **9.2× faster than bytes arrive**,
@@ -1365,10 +1375,10 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 
 | method | path | purpose |
 |---|---|---|
-| `GET` | `/_cache/status` | disk, capacity, watermarks, active jobs, scan cost, **effective Xet env** |
-| `GET` | `/_cache/repos?refresh=true` | cached repos with size, file count, revisions, pin state |
+| `GET` | `/_cache/status` | disk, capacity, watermarks, active jobs, scan cost, **effective Xet env**, process `started_at` / `uptime_s` |
+| `GET` | `/_cache/repos?refresh=true` | cached repos with size, file count, revisions, pin state, **`complete`** and present/expected counts |
 | `POST` | `/_cache/prewarm` | ingest a repo ahead of a rollout |
-| `GET` | `/_cache/jobs`, `/_cache/jobs/{id}` | ingest progress, elapsed, throughput |
+| `GET` | `/_cache/jobs`, `/_cache/jobs/{id}` | ingest state, progress, elapsed, throughput, verification counts; survives a restart as `interrupted` |
 | `GET`/`POST`/`DELETE` | `/_cache/pins` | pin management |
 | `GET`/`DELETE` | `/_cache/orphans` | repos deleted upstream and retained |
 | `POST` | `/_cache/orphans/check` | run an upstream liveness sweep now |
@@ -1399,6 +1409,92 @@ curl -X POST localhost:8080/_cache/prewarm -H 'content-type: application/json' -
 `allow_patterns` matters on the Hub: many repos ship both `.safetensors` and
 `.bin` copies of the same weights, and pulling both doubles your footprint for
 nothing.
+
+### Jobs, restarts, and whether a snapshot is complete
+
+**Job states.** A job only moves forward:
+
+```
+pending -> running -> verifying -> done
+                  \-------+------> error
+pending | running | verifying  --(process restart)-->  interrupted
+```
+
+`verifying` appears only with `XHC_HF_VERIFY=1` (the default). `done` means the
+bytes landed **and** passed verification, and it always comes with
+`finished_at`. `/_cache/status` counts `pending`, `running` and `verifying` as
+active.
+
+**Jobs survive a restart.** Job records are kept in a small ledger,
+`jobs.json` in the HF state directory (`<HF_HUB_CACHE>/.xhc/`, or
+`$XHC_STATE_DIR/hf/`). When the process starts, any job the ledger last saw as
+`pending`, `running` or `verifying` is reported as **`interrupted`**, with
+`interrupted_at` set to the new process's start time and `downloaded_bytes`
+showing the last recorded progress. It is **not** resumed automatically and
+**not** dropped: a poller holding its id gets an answer instead of
+`no such job`.
+
+- **Bound.** Finished and interrupted jobs are kept for at most **7 days**, and
+  at most the newest **50 prewarm (snapshot) jobs** and **200 file jobs**. Those
+  two limits are separate, so a burst of client cache misses cannot push the
+  prewarms you are polling out of the history. Active jobs are never dropped.
+- **Write rate.** A state change is written at once, except that changes less
+  than 0.5 s after the previous write are batched into one write at the end of
+  that half-second. A prewarm finishing or failing is always written at once.
+  Progress on its own is written at most every 30 s. Each write replaces the
+  file atomically, so a kill never leaves half a ledger. A crash can lose at
+  most the last half-second of changes.
+- **An unreadable ledger does not stop the cache.** It is moved aside as
+  `jobs.json.corrupt.<epoch>`, the error is logged, and a fresh ledger starts.
+  This is the opposite of `pins.json`, which fails closed: an unreadable pins
+  file means the cache cannot tell what is protected, whereas lost job history
+  protects nothing and deletes nothing. `/_cache/status` → `jobs.ledger` shows
+  whether the ledger is being written and the last error.
+- **To tell whether the process restarted,** compare a job's `created_at` with
+  `started_at` on `/_cache/status`. That works even if the ledger was lost.
+
+**Resuming is re-submitting.** To finish an interrupted prewarm, `POST` the same
+prewarm again. It is safe and cheap: files already in the snapshot are skipped
+**without any request to the Hub**, because `snapshot_download` passes the
+commit and `huggingface_hub` returns a cached file before any network call. A
+half-downloaded file resumes from where it stopped with a `Range` request.
+Verification then hashes only the files fetched this time.
+`tests/test_snapshot_completeness.py` checks this against a local fake Hub by
+recording every request it receives.
+
+### What `/_cache/repos` reports
+
+Each repo and each revision carries:
+
+| field | meaning |
+|---|---|
+| `complete` | `true`, `false`, or **`null` when the expected set is unknown** |
+| `files_present` / `files_expected` | expected files held (with the right size) / expected files |
+| `bytes_present` / `bytes_expected` | the same in bytes; `bytes_expected` is `null` if the listing had no sizes |
+| `expected_scope` | per revision: `repo` (the whole repo was asked for) or `allow_patterns` |
+| `allow_patterns` | per revision, when the scope is `allow_patterns`: the pattern sets that were asked for |
+
+**Where "expected" comes from.** Before a prewarm downloads anything, it asks
+the Hub for the revision's file listing with sizes and saves it locally
+(`<HF_HUB_CACHE>/.xhc/manifests/`). Listing repos only reads that saved copy and
+never calls the Hub. Because the listing is saved *before* the download starts,
+a prewarm killed halfway shows up as `complete: false`, which is the case this
+exists for. A pinned repo holding 32 MB of a 52 GB snapshot no longer looks
+finished.
+
+**Judged against what was asked for.** A prewarm with `allow_patterns`
+expects only the files matching those patterns, matched by the same function
+`snapshot_download` uses. So `["*.json"]` that fetched every JSON file is
+`complete: true`, and `expected_scope: "allow_patterns"` says that it is
+complete relative to those patterns and not the whole repo. Several prewarms
+of one commit expect the union of what they asked for. One without patterns
+expects everything.
+
+**`null` is not "probably complete".** A snapshot built up file by file from
+client requests has no saved listing, and neither does one whose listing call
+failed. Those report `complete: null`, with `files_present` counting what is
+there. A repo is `false` if any revision is `false`, otherwise `null` if any is
+`null`, and `true` only when every revision is known to be complete.
 
 ### Retention: models deleted upstream
 
@@ -1596,12 +1692,17 @@ volumes:
 
 | unset (default) | `XHC_STATE_DIR` set |
 |---|---|
-| `<HF_HUB_CACHE>/.xhc/{pins,orphans,policy}.json` | `$XHC_STATE_DIR/hf/` |
+| `<HF_HUB_CACHE>/.xhc/{pins,orphans,policy,jobs}.json` | `$XHC_STATE_DIR/hf/` |
 | `<XHC_DOCKER_DIR>/.xhc/{pins,orphans}.json` | `$XHC_STATE_DIR/oci/` |
 
 The two protocols get separate subdirectories, so their pin files never
 collide. The viewer response cache stays with the blobs, because it is
-regenerable and can be large.
+regenerable and can be large. So do the prewarm listings used for
+`complete` (`.xhc/manifests/`): they describe the blobs and are useless without
+them. The job ledger `jobs.json` sits with the state so job history survives a
+lost cache disk, but it is not protection. It is copied across the first time
+it is read rather than at startup, and a failure to copy it is logged, not
+fatal.
 
 - **Migration.** At startup, and again the first time any path reads one of
   these files, a file absent from the state dir but present in the old `.xhc/`
