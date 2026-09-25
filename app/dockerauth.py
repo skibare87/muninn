@@ -34,7 +34,7 @@ import bcrypt
 from fastapi import Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import authz, authzstore
+from . import authz, authzstore, jwtauth
 from .config import settings
 
 log = logging.getLogger("xhc.dockerauth")
@@ -163,6 +163,21 @@ async def require_pull_auth(
     # credential stores answering the same question is how one of them silently
     # stops being consulted.
     if store() is not None:
+        token = presented_jwt(authorization, basic_password=True)
+        if token is not None:
+            refused = await authenticate_jwt(request, token)
+            if refused is None:
+                return
+            # The general reason, in the body and a header. The docker CLI
+            # prints neither -- only the status -- so this is for curl, a
+            # client's debug log and whoever reads Muninn's. The token is never
+            # echoed; the specific reason is in Muninn's log.
+            raise HTTPException(
+                status_code=401,
+                detail=f"workload token refused: {refused}",
+                headers={"www-authenticate": 'Basic realm="muninn"',
+                         "x-xhc-auth-error": refused},
+            )
         if authenticate(request, authorization):
             return
         raise HTTPException(
@@ -265,6 +280,87 @@ def authenticate(request: Request, authorization: str | None) -> bool:
     return True
 
 
+def presented_jwt(header: str | None, *, basic_password: bool) -> str | None:
+    """The workload JWT in an Authorization header, or None if there is none.
+
+    None whenever XHC_JWT_ISSUERS is unset, so a deployment without it parses
+    every credential exactly as before.
+
+    `Bearer <jwt>` on both surfaces. On /v2 also as the Basic PASSWORD, because
+    that is the only thing docker and containerd send: the USERNAME IS IGNORED,
+    whatever it is. The token carries the identity, and a username that could
+    disagree with it would be a second, weaker claim about who is asking. `jwt`
+    is the documented convention, so a log line or a docker config reads
+    sensibly, but nothing checks it.
+
+    THE SHAPE DECIDES, ONCE. A value shaped like a JWT goes to the JWT verifier
+    and only there: a failed JWT is never retried as a key, and a key is never
+    retried as a JWT, so the reason a credential was refused is the reason of
+    the one verifier that owns it. See jwtauth.looks_like_jwt for why the two
+    shapes cannot overlap.
+    """
+    if not header or not jwtauth.enabled():
+        return None
+    scheme, _, value = header.partition(" ")
+    scheme = scheme.strip().lower()
+    value = value.strip()
+    if scheme == "bearer" and jwtauth.looks_like_jwt(value):
+        return value
+    if scheme == "basic" and basic_password:
+        creds = parse_basic(header)
+        if creds is not None and jwtauth.looks_like_jwt(creds[1]):
+            return creds[1]
+    return None
+
+
+async def authenticate_jwt(request: Request, token: str) -> str | None:
+    """Verify a workload JWT and resolve its principal onto request.state.
+
+    Returns None on success, or the GENERAL reason it was refused -- safe to
+    send, never containing the token. The specific reason is logged.
+
+    UNKNOWN PRINCIPAL IS 401, NOT 403, on both surfaces. The token is genuine,
+    but a genuine token for nobody this cache knows is the same situation as an
+    unknown key id: the credential does not resolve to an identity, and every
+    other credential that does not resolve is a 401. A 403 would make `docker
+    login` report success for a principal that does not exist -- the exact
+    two-authorities disagreement authenticate() refuses for a disabled key.
+    """
+    request.state.authz_key = None
+    st = store()
+    if st is None:
+        log.error("workload JWT presented but no authorisation store; refusing")
+        return "authentication unavailable"
+    try:
+        ident = await jwtauth.verify(token)
+    except jwtauth.Rejected as exc:
+        log.info("workload token refused: %s", exc.detail)
+        return exc.public
+    key = st.principal_credential(ident.subject)
+    if key is None and ident.auto_create:
+        # EMPTY RULES, NEVER ADMIN. create_principal takes an explicit flag and
+        # is not the first-login path, so an auto-created workload can never
+        # take the first-admin grant. With no rules it authenticates and is
+        # refused every pull until an administrator grants it something --
+        # which is the point: it appears in the principal list, named, waiting.
+        try:
+            st.create_principal(ident.subject, is_admin=False)
+            log.warning("auto-created principal %s from issuer %s with no rules",
+                        ident.subject, ident.issuer)
+        except KeyError:
+            pass  # a concurrent request created it first
+        key = st.principal_credential(ident.subject)
+    if key is None:
+        log.info("workload token for %s from %s: no such principal",
+                 ident.subject, ident.issuer)
+        return "unknown principal"
+    if key.disabled:
+        log.info("workload token for %s: principal is disabled", ident.subject)
+        return "principal disabled"
+    request.state.authz_key = key
+    return None
+
+
 def parse_hf_credential(header: str | None) -> tuple[str, str] | None:
     """Parse a credential off the Hugging Face surface. Basic OR Bearer.
 
@@ -318,18 +414,47 @@ def authenticate_hf(request: Request, authorization: str | None) -> bool:
     return True
 
 
-def hf_unauthorized() -> Response:
+async def authenticate_hf_request(request: Request) -> Response | None:
+    """The HF-surface gate. None means authenticated (or the gate is off).
+
+    A workload JWT arrives here as `Authorization: Bearer <jwt>` -- which is
+    what huggingface_hub sends for HF_TOKEN, so HF_TOKEN_PATH pointing at a
+    projected token file works unchanged. Only Bearer: huggingface_hub never
+    sends Basic, and a browser or curl user has a key.
+    """
+    if settings.hf_auth != "key":
+        return None
+    authorization = request.headers.get("authorization")
+    token = presented_jwt(authorization, basic_password=False)
+    if token is not None:
+        refused = await authenticate_jwt(request, token)
+        if refused is None:
+            return None
+        return hf_unauthorized(f"workload token refused: {refused}")
+    if authenticate_hf(request, authorization):
+        return None
+    return hf_unauthorized()
+
+
+def hf_unauthorized(reason: str | None = None) -> Response:
     """401 for the HF surface.
 
     Carries a Basic challenge so a browser and curl prompt, and names the Bearer
     form in the body because `huggingface_hub` shows the body on failure and its
     users have an HF_TOKEN rather than a username and password.
     """
+    headers = {"www-authenticate": 'Basic realm="muninn"'}
+    if reason:
+        # huggingface_hub prints X-Error-Message; the reason is general and
+        # never contains the token.
+        headers["x-error-message"] = reason
+        headers["x-xhc-auth-error"] = reason.removeprefix("workload token refused: ")
     return JSONResponse(
-        {"error": "this cache requires a credential",
-         "hint": "set HF_TOKEN to '<key_id>:<key_secret>', or use HTTP Basic"},
+        {"error": reason or "this cache requires a credential",
+         "hint": "set HF_TOKEN to '<key_id>:<key_secret>' or to a workload token "
+                 "from a trusted issuer, or use HTTP Basic"},
         status_code=401,
-        headers={"www-authenticate": 'Basic realm="muninn"'},
+        headers=headers,
     )
 
 

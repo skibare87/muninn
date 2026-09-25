@@ -17,6 +17,7 @@ from . import (
     console,
     dockerauth,
     hfcompat,
+    jwtauth,
     manage,
     memcheck,
     metrics,
@@ -159,13 +160,31 @@ async def lifespan(app: FastAPI):
                 "consults no credentials at all."
             )
 
+    jwt_warm = None
+    if settings.jwt_issuers:
+        # Raises on a file key set that is missing or empty, or a CA or
+        # fetch-token file that cannot be read: refused at boot, not discovered
+        # as every workload being refused.
+        jwtauth.load()
+        # Remote key sets are fetched in the background, never blocking boot. A
+        # fetch that fails here is retried on first use.
+        jwt_warm = asyncio.create_task(jwtauth.warm())
+        surfaces = ["/v2"] if settings.docker_enabled else []
+        if settings.hf_auth == "key":
+            surfaces.append("the Hugging Face surface")
+        log.info("workload JWTs are accepted on: %s. Never on /_cache, which takes "
+                 "only XHC_MANAGE_TOKEN.", ", ".join(surfaces) or "NO SURFACE")
+        if settings.hf_auth != "key":
+            log.warning("XHC_JWT_ISSUERS is set but XHC_HF_AUTH is not `key`: the "
+                        "Hugging Face surface is unauthenticated and ignores tokens.")
+
     evictor = asyncio.create_task(cachefs.eviction_loop())
     docker_gc = asyncio.create_task(ocigc.gc_loop()) if settings.docker_enabled else None
     orphan_sweep = asyncio.create_task(orphans.orphan_loop())
     try:
         yield
     finally:
-        for task in (evictor, orphan_sweep, docker_gc):
+        for task in (evictor, orphan_sweep, docker_gc, jwt_warm):
             if task is None:
                 continue
             task.cancel()

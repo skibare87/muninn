@@ -130,6 +130,10 @@ class AuthzStore:
         self.path = str(path)
         self._lock = threading.Lock()
         self._cache: dict[str, Key] | None = None
+        # subject -> (disabled, rules). Loaded with the keys, under the same
+        # freshness check, for credentials that name a PRINCIPAL rather than a
+        # key -- a verified workload JWT (app/jwtauth.py).
+        self._principals: dict[str, tuple[bool, list[Rule]]] = {}
         # Long-lived handle used only for the freshness probe. See _data_version.
         self._probe: sqlite3.Connection | None = None
         self._cache_version: int | None = None
@@ -458,8 +462,13 @@ class AuthzStore:
                     " JOIN principals p ON p.subject = k.principal"
                 )
             }
+            principals = {
+                r["subject"]: (bool(r["disabled"]), by_principal.get(r["subject"], []))
+                for r in c.execute("SELECT subject, disabled FROM principals")
+            }
         with self._lock:
             self._cache = loaded
+            self._principals = principals
             # Recorded AFTER the load, so a commit landing mid-load leaves the
             # version behind and the next read reloads rather than trusting a
             # half-current snapshot.
@@ -468,6 +477,36 @@ class AuthzStore:
             except sqlite3.Error:
                 self._cache_version = None
         return loaded
+
+    def principal_credential(self, subject: str) -> Key | None:
+        """A principal as a credential, for an identity verified elsewhere.
+
+        Used by workload JWTs: the token proves WHO, and this returns what that
+        principal may do, in the same Key shape a key credential resolves to so
+        that decide(), both surfaces and the upload-session binding treat it
+        identically. None when no such principal exists.
+
+        NO SCOPE. A key's scope narrows one credential; a token has no row to
+        hang a narrowing on, so it carries its holder's full grant. To give a
+        workload less, give it its own principal.
+
+        The key_id is `jwt:<subject>`. A real key id cannot contain `:` -- it is
+        the Basic username, which ends at the first colon -- so this can never
+        name, or be confused in a log with, a stored key.
+
+        Read from the same snapshot as resolve(), refreshed on PRAGMA
+        data_version, so a principal disabled or deleted out of band is refused
+        on the very next request, exactly as a key is.
+        """
+        self._all_keys()
+        with self._lock:
+            entry = self._principals.get(subject)
+        if entry is None:
+            return None
+        disabled, rules = entry
+        return Key(key_id=f"jwt:{subject}", secret_hash="", principal=subject,
+                   rules=list(rules), scope=[], label="workload token",
+                   disabled=disabled)
 
     def resolve(self, key_id: str, secret: str) -> Key | None:
         """Resolve a presented credential. Returns None on any failure.

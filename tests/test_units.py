@@ -22,6 +22,7 @@ os.environ.setdefault("HF_HUB_CACHE", "/tmp/xhc-test-cache")
 from app.cachefs import repo_folder_name, repo_key
 from app.config import parse_size
 from app.hfcompat import is_xet_token_path, parse_resolve
+from app.jwtconfig import IssuerConfig
 from app.serving import parse_range
 
 
@@ -678,6 +679,9 @@ ENV_TO_SETTING = [
     ("XHC_BOOTSTRAP_ADMIN", "a@example.com", "bootstrap_admin", "a@example.com"),
     ("XHC_SESSION_SECRET", "sig", "session_secret", "sig"),
     ("XHC_SESSION_TTL", "600", "session_ttl_s", 600.0),
+    # --- workload identity. XHC_JWT_ISSUERS needs XHC_AUTHZ_DB, so it is in
+    # ENV_GROUPS below.
+    ("XHC_JWT_CACHE_TTL", "15", "jwt_cache_ttl_s", 15.0),
 ]
 
 # Settings that CANNOT be set one at a time, because enabling one imposes
@@ -697,6 +701,15 @@ ENV_GROUPS = [
         # the trailing slash is stripped, because discovery appends a path and
         # a doubled slash is a 404 at some providers and a redirect at others
         {"oidc_issuer": "https://idp.example.com"},
+    ),
+    (
+        {
+            "XHC_JWT_ISSUERS": '{"issuer": "https://k8s.example", "audience": "muninn",'
+                               ' "subject_template": "k8s:{sub}"}',
+            "XHC_AUTHZ_DB": "/srv/authz.db",
+        },
+        {"jwt_issuers": (IssuerConfig(issuer="https://k8s.example", audiences=("muninn",),
+                                      subject_template="k8s:{sub}"),)},
     ),
 ]
 

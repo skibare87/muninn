@@ -661,8 +661,9 @@ async def catch_all(full_path: str, request: Request) -> Response:
     #     Off by default. When on, it covers api paths, resolve paths, the
     #     datasets-server proxy and everything unrecognised, because it runs
     #     before any of them are parsed.
-    if not dockerauth.authenticate_hf(request, request.headers.get("authorization")):
-        return dockerauth.hf_unauthorized()
+    refused = await dockerauth.authenticate_hf_request(request)
+    if refused is not None:
+        return refused
 
     # 0b. PER-KEY RULES (XHC_HF_RULES), decided from the path alone and before
     #     any branch below, so a cached hit is refused exactly as a miss is.
