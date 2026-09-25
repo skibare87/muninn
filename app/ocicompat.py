@@ -523,7 +523,7 @@ def _key_id(request: Request) -> str | None:
     return key.key_id if key is not None else None
 
 
-def _resolve_or_error(name: str, request: Request | None = None, operation: str = "pull"):
+def _resolve_or_error(name: str, request: Request, operation: str = "pull"):
     """Resolve a reference AND authorise the operation on it.
 
     THE TWO ARE COUPLED ON PURPOSE. Every /v2 route that names a repository has to
@@ -532,19 +532,19 @@ def _resolve_or_error(name: str, request: Request | None = None, operation: str 
     immediately rather than silently granting. A separate `authorize()` call that
     each route must remember is a fail-open waiting for one distracted edit.
 
-    `request` is optional only so the existing internal callers that have no
-    request object keep working; when authz is enabled and no request is passed,
-    dockerauth.authorize refuses, because "I was not told who you are" must not
-    mean "proceed".
+    `request` is REQUIRED. It used to be optional, and the docstring said a
+    missing request would be refused -- while the code skipped authorisation
+    entirely when it was None. No caller ever omitted it, so nothing was open,
+    but the claim and the code disagreed about the fail-closed direction. There
+    is now no way to call this without the request that authorisation needs.
     """
     try:
         ref = registry.resolve(name)
     except registry.ResolveError as exc:
         return None, _err(400, "NAME_INVALID", str(exc))
-    if request is not None:
-        denied = dockerauth.authorize(request, operation, f"{ref.upstream}/{ref.repo}")
-        if denied is not None:
-            return None, denied
+    denied = dockerauth.authorize(request, operation, f"{ref.upstream}/{ref.repo}")
+    if denied is not None:
+        return None, denied
     return ref, None
 
 
