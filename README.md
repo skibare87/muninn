@@ -55,9 +55,9 @@ docker run -d --name muninn -p 8080:8080 \
 Or from source, which is also how you get the compose file's full env set:
 
 ```bash
-cp .env.example .env      # set HF_TOKEN and XHC_CACHE_PATH
+cp .env.example .env      # set HF_TOKEN, XHC_CACHE_PATH and XHC_MANAGE_TOKEN
 docker compose up -d --build
-curl -s localhost:8080/_cache/status | jq
+curl -s -H "Authorization: Bearer $XHC_MANAGE_TOKEN" localhost:8080/_cache/status | jq
 ```
 
 To run the published image under compose instead of building, replace the
@@ -157,7 +157,7 @@ exception, **whether or not the feature behind them is switched on**:
 |---|---|---|
 | `/v2`, `/v2/*` | OCI registry | `XHC_DOCKER_ENABLED=0` |
 | `/_cache/docker/*` | docker management API | `XHC_DOCKER_ENABLED=0` |
-| `/_cache/*` | management API | always on |
+| `/_cache/*` | management API | `XHC_MANAGE_TOKEN` unset or blank |
 | `/_auth/*`, `/_console/*` | browser login and key management | `XHC_OIDC_ISSUER` unset |
 | `/datasets-server/*` | datasets-server proxy | `XHC_DATASETS_SERVER=` (empty) |
 | `/docs`, `/docs/oauth2-redirect`, `/redoc`, `/openapi.json` | API documentation | `XHC_DOCS=0` |
@@ -210,7 +210,8 @@ Any host that can reach the port can otherwise cause an ingest of any repo —
 a typo can pull a 500 GB dataset onto the array.
 
 ```bash
-curl -X PUT localhost:8080/_cache/policy -H 'content-type: application/json' -d '{
+curl -X PUT localhost:8080/_cache/policy -H "Authorization: Bearer $XHC_MANAGE_TOKEN" \
+  -H 'content-type: application/json' -d '{
   "mode": "allowlist",
   "allow": ["models/meta-llama/*", "datasets/my-org/*"],
   "deny":  ["models/*/*-gguf"],
@@ -851,6 +852,9 @@ mistyped an image name.
 
 ### Docker management endpoints
 
+Part of the management API: off unless `XHC_MANAGE_TOKEN` is set, and behind the same
+bearer token.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/_cache/docker/prewarm` | pull an image and its closure ahead of a rollout; returns a job |
@@ -1404,9 +1408,9 @@ database, so an init container can provision before the server starts.
 > any principal. Handle it as a Secret — never in a compose file, an image, a command line or
 > a CI log — and rotate it the way you would rotate a root password.
 
-**Unconfigured means absent, not open.** The other `/_cache` routes serve anyone when
-`XHC_MANAGE_TOKEN` is unset. These do not: without **both** `XHC_AUTHZ_DB` and a non-empty
-`XHC_MANAGE_TOKEN` every one of them returns `404`, whatever you send. A wrong or missing
+**Unconfigured means absent, not open.** Like every `/_cache` route, these return `404`
+when `XHC_MANAGE_TOKEN` is unset or blank, whatever you send. They additionally return
+`404` without `XHC_AUTHZ_DB`, because there is no store to provision. A wrong or missing
 token is `401`.
 
 #### Endpoints
@@ -2130,7 +2134,17 @@ and `muninn_tier_last_reconcile_timestamp`. Tier bytes are never added to
 > image on the node. A pinned image survives its tag being dropped, because a pin is a root
 > in its own right.
 
-All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer …`.
+All under `/_cache`, and **off unless `XHC_MANAGE_TOKEN` is set.** With it unset or blank,
+every `/_cache` route — the read-only ones and `/_cache/docker/*` included — answers `404`
+with the plain-text body `the management API is disabled (XHC_MANAGE_TOKEN is unset)`, and
+the server logs one warning at startup saying so. With it set, every route requires
+`Authorization: Bearer $XHC_MANAGE_TOKEN`; a missing or wrong token is `401`. `/healthz` and
+`/metrics` are not part of this surface and do not depend on it (`/metrics` has its own
+`XHC_METRICS_AUTH`).
+
+> **Earlier releases left this API open** when `XHC_MANAGE_TOKEN` was unset, to
+> anything that could reach the port. It now switches it off. Scripts that called
+> `/_cache` without a token need one.
 
 | method | path | purpose |
 |---|---|---|
@@ -2145,8 +2159,9 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `DELETE` | `/_cache/viewer` | drop cached dataset metadata |
 | `POST` | `/_cache/evict` | force an LRU sweep |
 | `DELETE` | `/_cache/repos` | drop a repo, or one `revision` of it (409 if pinned) |
-| various | `/_cache/authz/*` | principals, rules and keys — see *Headless provisioning*. **Requires** the token: absent without it |
-| `GET` | `/healthz` | container healthcheck |
+| various | `/_cache/authz/*` | principals, rules and keys — see *Headless provisioning*. Also needs `XHC_AUTHZ_DB` |
+
+`GET /healthz` is the container healthcheck. It is not under `/_cache` and needs no token.
 
 `/_cache/status` echoes the Xet variables the process actually sees. A silently
 unset or wrong value there is the single most likely cause of a slow WAN ingest,
@@ -2158,7 +2173,8 @@ If you know your model set in advance — and with centralised model management
 you do — edge nodes should only ever see cache hits.
 
 ```bash
-curl -X POST localhost:8080/_cache/prewarm -H 'content-type: application/json' -d '{
+curl -X POST localhost:8080/_cache/prewarm -H "Authorization: Bearer $XHC_MANAGE_TOKEN" \
+  -H 'content-type: application/json' -d '{
   "repo_id": "meta-llama/Llama-3.1-70B-Instruct",
   "allow_patterns": ["*.safetensors", "*.json", "tokenizer*"],
   "pin": true
@@ -2268,9 +2284,10 @@ So Muninn checks cached repos against upstream every `XHC_ORPHAN_CHECK_INTERVAL`
 but applied automatically — you don't have to predict which models will vanish.
 
 ```bash
-curl localhost:8080/_cache/orphans | jq          # what is being retained, and why
-curl -X POST localhost:8080/_cache/orphans/check # sweep now
-curl -X DELETE localhost:8080/_cache/orphans \
+H="Authorization: Bearer $XHC_MANAGE_TOKEN"
+curl -H "$H" localhost:8080/_cache/orphans | jq          # what is being retained, and why
+curl -H "$H" -X POST localhost:8080/_cache/orphans/check # sweep now
+curl -H "$H" -X DELETE localhost:8080/_cache/orphans \
   -H 'content-type: application/json' -d '{"repo_id":"org/model"}'   # release one
 ```
 
@@ -2333,11 +2350,11 @@ Retention makes orphans unevictable, so freeing that space is a deliberate act:
 
 ```bash
 # whole repo, and the orphan mark is cleared with it
-curl -X DELETE localhost:8080/_cache/repos \
+curl -X DELETE localhost:8080/_cache/repos -H "Authorization: Bearer $XHC_MANAGE_TOKEN" \
   -H 'content-type: application/json' -d '{"repo_id":"org/model"}'
 
 # or a single revision, leaving the rest of the repo intact
-curl -X DELETE localhost:8080/_cache/repos \
+curl -X DELETE localhost:8080/_cache/repos -H "Authorization: Bearer $XHC_MANAGE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"repo_id":"org/model","revision":"<commit-sha>"}'
 ```
@@ -2463,7 +2480,7 @@ choosing it.
 | `XHC_VIEWER_CACHE_TTL` | `3600` | seconds; `0` disables freshness but keeps entries for deleted datasets |
 | `XHC_DATASETS_SERVER` | `https://datasets-server.huggingface.co` | upstream for the `/datasets-server/*` route; empty disables it |
 | `XHC_DATASETS_SERVER_ENDPOINTS` | `splits,first-rows,info,size,is-valid,parquet` | which of those to cache (never `rows`) |
-| `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*`. With `XHC_AUTHZ_DB` set it also enables `/_cache/authz`, which **mints keys** — handle it as a Secret |
+| `XHC_MANAGE_TOKEN` | unset | enables the `/_cache/*` management API and is the bearer token it requires. **Unset or blank means the management API is off**: every `/_cache` route answers `404`. With `XHC_AUTHZ_DB` set it also enables `/_cache/authz`, which **mints keys** — handle it as a Secret |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | range-GET parallelism in older `hf_xet`. **On hf-xet 1.6.0 it appears to have no effect:** the name is absent from the library, and 1, 4 and 32 gave the same time and memory on one ~110 MB/s link. Kept in the image for versions that read it |
