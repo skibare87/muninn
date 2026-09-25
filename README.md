@@ -1313,7 +1313,7 @@ just revoked, when they are the only admin — the case the feature exists for. 
 with no admin is recoverable three ways, none needing a restart:
 
 1. grant the role at the provider and log in;
-2. set `XHC_BOOTSTRAP_ADMIN` (below) and log in as that person;
+2. set `XHC_BOOTSTRAP_ADMIN` (below) to that person's subject and log in as them;
 3. `python -m app.authzctl grant-admin SUBJECT` — applies to that user's existing session
    on its next request, and lasts until their next login recomputes it.
 
@@ -1322,15 +1322,20 @@ each login in this mode:
 
 | | admin? |
 |---|---|
-| `XHC_BOOTSTRAP_ADMIN` names this login's subject or email | yes, whatever the claim says |
+| `XHC_BOOTSTRAP_ADMIN` equals this login's **subject** | yes, whatever the claim says |
 | the claim carries `XHC_OIDC_ADMIN_VALUE` | yes |
 | otherwise | **no**, even if they were admin before |
 
 So in this mode it is a **standing** grant, evaluated at every login rather than only when
 the principal is first created, and each login it grants logs a warning saying so. That is
 what lets it rescue an instance whose claim mapping is broken at the provider; it is also why
-it belongs **unset outside an emergency**, and why a subject is a better value than an email,
-which most providers let users change.
+it belongs **unset outside an emergency**.
+
+**In this mode it matches the subject only, never the email.** A grant re-applied at every
+login must not key on an address most providers let users edit. An email-shaped value (one
+containing `@`) refuses to start rather than silently matching nobody; use the person's
+subject, which `python -m app.authzctl list` and the console's user list both show. Outside
+this mode nothing changes: subject or email, at first creation only.
 
 Workload tokens (`XHC_JWT_ISSUERS`) are unaffected: they authenticate `/v2` and the Hugging
 Face surface, never the console, so no JWT is ever an admin.
@@ -2144,7 +2149,7 @@ choosing it.
 | `XHC_OIDC_PKCE` | `1` | set `0` only if a provider **rejects** the parameter. Not advertising support is not the same as refusing it |
 | `XHC_OIDC_ADMIN_CLAIM` | *(unset)* | id_token claim that decides admin, e.g. `groups` or `realm_access.roles` (dotted for nested). With `XHC_OIDC_ADMIN_VALUE`, admin is recomputed at **every** login — granted or **revoked** — and the first-login grant is off. Both or neither; needs `XHC_OIDC_ISSUER`. See [Admin from the identity provider](#admin-from-the-identity-provider-xhc_oidc_admin_claim) |
 | `XHC_OIDC_ADMIN_VALUE` | *(unset)* | the value that grants admin: equal to a string claim, or to one element of a list claim. Exact match |
-| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself. **With `XHC_OIDC_ADMIN_CLAIM` set it is instead a standing break-glass grant**, applied at every login of that person whatever the claim says — leave it unset outside an emergency |
+| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself. **With `XHC_OIDC_ADMIN_CLAIM` set it is instead a standing break-glass grant**, applied at every login of that person whatever the claim says, matching the **subject only** (an email-shaped value refuses to start) — leave it unset outside an emergency |
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h). With `XHC_OIDC_ADMIN_CLAIM`, also the longest an existing session keeps admin after the role is revoked at the provider |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |

@@ -279,7 +279,8 @@ class Settings:
     #
     # XHC_BOOTSTRAP_ADMIN changes meaning in this mode: it becomes a STANDING
     # grant, evaluated at every login alongside the claim, so a broken claim
-    # mapping cannot lock out the operator who would fix it. See webauth.py.
+    # mapping cannot lock out the operator who would fix it -- and it matches
+    # the SUBJECT only, so an email-shaped value is refused. See webauth.py.
     oidc_admin_claim: str | None = None
     oidc_admin_value: str | None = None
     # Signs the session cookie. MUST be set when OIDC is on; there is no
@@ -523,6 +524,19 @@ class Settings:
                 "XHC_OIDC_ADMIN_CLAIM is set but XHC_OIDC_ISSUER is not: admin is "
                 "read from the login's id_token, and without an issuer there is no login."
             )
+        # Fails on the ARGUMENTS: in claim mode the bootstrap is a standing
+        # grant matched on the SUBJECT only, so an email here would silently
+        # match nobody -- which surfaces as a failed break-glass, the one moment
+        # it must work. Refused instead, saying what to use.
+        bootstrap_admin = os.environ.get("XHC_BOOTSTRAP_ADMIN") or None
+        if oidc_admin_claim and bootstrap_admin and "@" in bootstrap_admin:
+            raise ValueError(
+                f"XHC_BOOTSTRAP_ADMIN={bootstrap_admin!r} looks like an email, but with "
+                "XHC_OIDC_ADMIN_CLAIM set it matches the SUBJECT only: a grant applied "
+                "at every login must not key on an address users can change. Set it to "
+                "the person's subject -- `python -m app.authzctl list` shows every "
+                "principal's subject, as does the console's user list."
+            )
 
         metrics_auth = (
             os.environ.get("XHC_METRICS_AUTH") or cls.metrics_auth
@@ -603,7 +617,7 @@ class Settings:
             oidc_scopes=os.environ.get("XHC_OIDC_SCOPES", cls.oidc_scopes),
             oidc_discovery_url=os.environ.get("XHC_OIDC_DISCOVERY_URL") or None,
             oidc_pkce=_env_bool("XHC_OIDC_PKCE", cls.oidc_pkce),
-            bootstrap_admin=os.environ.get("XHC_BOOTSTRAP_ADMIN") or None,
+            bootstrap_admin=bootstrap_admin,
             oidc_admin_claim=oidc_admin_claim,
             oidc_admin_value=oidc_admin_value,
             session_secret=os.environ.get("XHC_SESSION_SECRET") or None,

@@ -19,7 +19,7 @@ admin is recomputed from the verified id_token at EVERY login -- granted when th
 claim carries the value, revoked when it does not -- and being first grants
 nothing. Precedence in that mode, highest first:
 
-    XHC_BOOTSTRAP_ADMIN names this login    admin, whatever the claim says
+    XHC_BOOTSTRAP_ADMIN is this SUBJECT     admin, whatever the claim says
     the claim carries the value             admin
     otherwise                               NOT admin, even if it was before
 
@@ -27,6 +27,9 @@ The bootstrap sits above the claim because it is the break-glass path: a claim
 mapping broken at the provider must not be able to lock out the operator who
 would fix it. In this mode it is therefore a STANDING grant rather than the
 creation-only one it is otherwise, and belongs unset outside an emergency.
+Being standing, it matches the SUBJECT ONLY: a grant re-applied at every login
+must not key on an email, which most providers let the user edit. (Config
+refuses an email-shaped value in this mode; _sync_admin does not rely on that.)
 
 A revocation at the provider reaches Muninn at that user's NEXT LOGIN; nothing
 here polls the provider. Once it is in the store it applies to every session on
@@ -104,9 +107,15 @@ def _claim_admin(claims: dict) -> bool:
     return oidc.claim_grants(value, settings.oidc_admin_value or "")
 
 
-def _bootstrap_names(subject: str, email: str) -> bool:
+def _bootstrap_names(subject: str) -> bool:
+    """Claim mode only: XHC_BOOTSTRAP_ADMIN as a standing grant, SUBJECT ONLY.
+
+    Never the email. Outside claim mode the store also accepts an email, but
+    only at creation; here the grant is re-applied at every login, and an
+    email the user can change at their provider would make it self-service.
+    """
     b = settings.bootstrap_admin
-    return bool(b) and b in (subject, email)
+    return bool(b) and b == subject
 
 
 def current_session(request: Request) -> session.Session | None:
@@ -243,7 +252,7 @@ def _sync_admin(st: authzstore.AuthzStore, identity) -> authzstore.Principal:
     flag the provider withdrew in the meantime.
     """
     by_claim = _claim_admin(getattr(identity, "claims", None) or {})
-    by_bootstrap = _bootstrap_names(identity.subject, identity.email)
+    by_bootstrap = _bootstrap_names(identity.subject)
     result = st.sync_admin_at_login(
         identity.subject, identity.email, by_claim or by_bootstrap
     )

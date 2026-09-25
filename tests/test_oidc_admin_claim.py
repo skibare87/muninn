@@ -272,13 +272,41 @@ def test_bootstrap_admin_is_break_glass_in_claim_mode(login_app):
 
 
 def test_bootstrap_admin_re_grants_after_an_out_of_band_demotion(login_app):
-    _, store, login, _ = login_app(CLAIM, VALUE, bootstrap="glass@example.com")
+    _, store, login, _ = login_app(CLAIM, VALUE, bootstrap="sub-glass")
     store.create_principal("sub-other", is_admin=True)
     login("sub-glass", {}, email="glass@example.com")
     assert _admin(store, "sub-glass")
     store.set_admin("sub-glass", False)
     login("sub-glass", {}, email="glass@example.com")
     assert _admin(store, "sub-glass")
+
+
+def test_bootstrap_in_claim_mode_never_matches_on_email(login_app):
+    """A standing grant keyed on an email is self-service admin at any provider
+    that lets users edit their address. Here the email is the ONLY thing that
+    matches, and it must grant nothing -- tested at the login path directly,
+    past the startup refusal, so the login does not depend on config to hold."""
+    _, store, login, _ = login_app(CLAIM, VALUE, bootstrap="glass@example.com")
+    store.create_principal("sub-other", is_admin=True)
+    login("sub-mallory", {}, email="glass@example.com")
+    assert not _admin(store, "sub-mallory")
+    login("sub-mallory", _roles("reader"), email="glass@example.com")
+    assert not _admin(store, "sub-mallory")
+
+
+def test_bootstrap_in_claim_mode_matches_the_subject_whatever_the_email(login_app):
+    _, store, login, _ = login_app(CLAIM, VALUE, bootstrap="sub-glass")
+    store.create_principal("sub-other", is_admin=True)
+    login("sub-glass", _roles("reader"), email="someone-else@example.com")
+    assert _admin(store, "sub-glass")
+
+
+def test_unconfigured_bootstrap_still_matches_email_at_creation(login_app):
+    """Outside claim mode nothing changed: an email still works, once."""
+    _, store, login, _ = login_app(bootstrap="first@example.com")
+    login("sub-a", {})
+    login("sub-b", {}, email="first@example.com")
+    assert _admin(store, "sub-b")
 
 
 # ---------------- how fast a demotion lands ----------------
@@ -420,6 +448,42 @@ def test_an_admin_claim_without_a_login_is_refused_at_startup(monkeypatch):
     monkeypatch.setenv("XHC_OIDC_ADMIN_VALUE", "admins")
     with pytest.raises(ValueError, match="XHC_OIDC_ISSUER"):
         Settings.from_env()
+
+
+def test_an_email_shaped_bootstrap_is_refused_in_claim_mode(monkeypatch):
+    from app.config import Settings
+
+    for k, v in _LOGIN_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("XHC_OIDC_ADMIN_CLAIM", "groups")
+    monkeypatch.setenv("XHC_OIDC_ADMIN_VALUE", "admins")
+    monkeypatch.setenv("XHC_BOOTSTRAP_ADMIN", "glass@example.com")
+    with pytest.raises(ValueError, match="SUBJECT only") as exc:
+        Settings.from_env()
+    assert "authzctl list" in str(exc.value), "the refusal must say how to find the subject"
+
+
+def test_a_subject_bootstrap_is_accepted_in_claim_mode(monkeypatch):
+    """Positive control for the refusal above."""
+    from app.config import Settings
+
+    for k, v in _LOGIN_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("XHC_OIDC_ADMIN_CLAIM", "groups")
+    monkeypatch.setenv("XHC_OIDC_ADMIN_VALUE", "admins")
+    monkeypatch.setenv("XHC_BOOTSTRAP_ADMIN", "f3c1-9a2e")
+    assert Settings.from_env().bootstrap_admin == "f3c1-9a2e"
+
+
+def test_an_email_bootstrap_is_still_accepted_outside_claim_mode(monkeypatch):
+    from app.config import Settings
+
+    for k, v in _LOGIN_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("XHC_OIDC_ADMIN_CLAIM", raising=False)
+    monkeypatch.delenv("XHC_OIDC_ADMIN_VALUE", raising=False)
+    monkeypatch.setenv("XHC_BOOTSTRAP_ADMIN", "glass@example.com")
+    assert Settings.from_env().bootstrap_admin == "glass@example.com"
 
 
 def test_both_set_reaches_settings(monkeypatch):
