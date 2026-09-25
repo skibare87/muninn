@@ -913,6 +913,7 @@ the next node to pull it gets a local hit rather than a cold fetch.
 | `XHC_DOCKER_CACHE_ON_PUSH` | `1` | keep the pushed image locally |
 | `XHC_DOCKER_PUSH_LIMITS` | unset | path to a regctl-format file giving per-registry chunk sizes |
 | `XHC_DOCKER_BLOB_CHUNK` | unset | global chunk size for hosts with no entry in that file |
+| `XHC_DOCKER_PUSH_PENDING_MAX_SIZE` | unset | with `XHC_STATE_DIR` set, the most `store-forward` may hold on the state volume awaiting upstream (e.g. `20G`). Over it, pushes are refused with `507`. See [What survives what](#what-survives-what) |
 
 A worked example, since the settings above are easier to read than to assemble:
 
@@ -985,12 +986,55 @@ that "eventually" is a commitment rather than a hope.
 - **Outstanding forwards survive a restart.** Each one is recorded on disk before the client
   is answered and cleared only on confirmation, so a forward interrupted by a restart — or
   one that had already exhausted its retries — is re-enqueued on the next boot rather than
-  lost. Startup logs each recovered obligation at `WARNING`: those clients were told `201`
+  lost. With `XHC_STATE_DIR` set they also survive losing the docker dir: see
+  [What survives what](#what-survives-what). Startup logs each recovered obligation at `WARNING`: those clients were told `201`
   and the upstream does not have their content yet. An obligation marker that cannot be
   *read* is left in place rather than discarded, because unreadable is not the same as
   absent.
 - **Nothing pending is evictable.** Unconfirmed content is the only copy in existence, so
   it is pinned and GC leaves it alone.
+
+#### What survives what
+
+A pending push is three things: the **record** of what is owed (upstream, repository,
+digest, and for a manifest the tag it goes to), the **bytes** (the blob, or the manifest
+body), and the upstream **credentials**. The credentials come from `XHC_REGISTRY_AUTH_FILE`,
+so they survive whatever your configuration survives. An upload the client never finished
+was never answered `201`, and is not kept: the client retries it.
+
+| | `XHC_STATE_DIR` unset | `XHC_STATE_DIR` set |
+|---|---|---|
+| record | `<XHC_DOCKER_DIR>/_pending/<key>.json` | `$XHC_STATE_DIR/oci/pending/<key>.json` |
+| manifest body | inside the record, and in the cache | inside the record, and in the cache |
+| blob bytes | in the cache only | `$XHC_STATE_DIR/oci/pending/<key>.blob`, and in the cache |
+| process restart | survives | survives |
+| docker dir lost or replaced | **lost** | **survives** |
+| state dir lost | n/a | **lost** |
+
+- **Without `XHC_STATE_DIR`, the docker dir is the durable storage.** A pending push
+  survives a restart but not the disk. Do not put the docker dir on disposable storage with
+  `store-forward` unless you also set `XHC_STATE_DIR`.
+- **With it set, the bytes are held on the state volume before the client gets its `201`.**
+  If the state dir and docker dir share a filesystem the hold is a hard link and costs
+  nothing; otherwise it is a copy, hashed and checked against the digest and synced
+  before it counts. Once the upstream confirms, the held copy is deleted. The cache copy
+  stays or goes according to `XHC_DOCKER_CACHE_ON_PUSH`. If the docker dir is replaced
+  while a push is pending, the next boot puts the image back into the cache from the held
+  copy, so pulls from this cache still find it, and forwards it.
+- **The state volume needs room for what is in flight.** The hold is refused, and so is
+  the push, if copying it would leave less than 64 MiB free there, or would take the
+  pending area over `XHC_DOCKER_PUSH_PENDING_MAX_SIZE`. The client gets
+  `507 Insufficient Storage` and nothing is recorded, pinned or kept, so it can retry
+  once the queue drains. Muninn never accepts a push and drops it later. A record that
+  cannot be written is refused the same way: `507` if the volume is full, `503` otherwise.
+- **Upgrading.** The first boot with `XHC_STATE_DIR` set moves each existing
+  `<XHC_DOCKER_DIR>/_pending/*.json` to the state dir and holds its bytes there first. If
+  the bytes cannot be held, the boot stops and the old record stays where it was. Records
+  are **moved**, not copied like pins: a stale second copy would re-send a manifest to a
+  tag that may have moved on since. If a record's bytes are already gone, the record still
+  moves and shows up as a failed forward.
+- **Unsetting `XHC_STATE_DIR` again strands pending pushes in the state dir.** Wait until
+  `GET /_cache/docker/pending` is empty first.
 
 `GET /_cache/docker/pending` is the window into all of it, one row per outstanding forward
 with `state` (`running`, `retrying`, `failed`, `cancelled`, `done`), the `error` text if it
@@ -2431,7 +2475,7 @@ choosing it.
 |---|---|---|
 | `HF_TOKEN` | — | org token. Edge nodes then need no Hub credentials, and gated licences are accepted once, centrally. |
 | `HF_HUB_CACHE` | `/cache` | the array. Standard `huggingface_hub` layout. |
-| `XHC_STATE_DIR` | *(unset)* | absolute path for durable state (pins, orphan marks, runtime policy). Unset keeps it inside each cache tree. Set, it moves to `$XHC_STATE_DIR/hf/` and `$XHC_STATE_DIR/oci/`. See [Separating state from blobs](#separating-state-from-blobs) |
+| `XHC_STATE_DIR` | *(unset)* | absolute path for durable state (pins, orphan marks, runtime policy, and `store-forward` pushes not yet delivered upstream). Unset keeps it inside each cache tree. Set, it moves to `$XHC_STATE_DIR/hf/` and `$XHC_STATE_DIR/oci/`. See [Separating state from blobs](#separating-state-from-blobs) |
 | `XHC_CACHE_MAX_SIZE` | filesystem size | eviction target, e.g. `70T`. Binary units. |
 | `XHC_HIGH_WATER` / `XHC_LOW_WATER` | `0.90` / `0.75` | evict when above high, down to low |
 | `XHC_EVICT_INTERVAL` | `900` | background sweep, seconds |
@@ -2521,6 +2565,7 @@ volumes:
 |---|---|
 | `<HF_HUB_CACHE>/.xhc/{pins,orphans,policy,jobs}.json` | `$XHC_STATE_DIR/hf/` |
 | `<XHC_DOCKER_DIR>/.xhc/{pins,orphans}.json` | `$XHC_STATE_DIR/oci/` |
+| `<XHC_DOCKER_DIR>/_pending/` (store-forward pushes owed upstream) | `$XHC_STATE_DIR/oci/pending/`, with the bytes they need |
 
 The two protocols get separate subdirectories, so their pin files never
 collide. The viewer response cache stays with the blobs, because it is
@@ -2540,6 +2585,10 @@ fatal.
 - **Refuses to start** if the directory cannot be created or written, or is not
   an absolute path. It does not fall back to the cache tree, because a fallback
   would put protection back on the disk you just declared disposable.
+- **Pending `store-forward` pushes move here too, bytes and all**, so a push a client was
+  told succeeded survives replacing the blob disk. Size the volume for what can be in flight,
+  or bound it with `XHC_DOCKER_PUSH_PENDING_MAX_SIZE`. See
+  [What survives what](#what-survives-what).
 - **Put `XHC_AUTHZ_DB` on the same volume.** The key store holds principals,
   keys and grants, and losing it locks every user out until they are
   re-issued. It has exactly the same lifetime as the pins, and none of the
