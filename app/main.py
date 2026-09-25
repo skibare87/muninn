@@ -17,6 +17,7 @@ from . import (
     console,
     dockerauth,
     hfcompat,
+    httpclients,
     jwtauth,
     manage,
     managegate,
@@ -34,7 +35,6 @@ from . import (
     tier,
     webauth,
 )
-from . import registry as ociregistry
 from .config import settings
 from .jobs import ACTIVE_STATES, manager
 
@@ -208,10 +208,9 @@ async def lifespan(app: FastAPI):
         # them as interrupted -- which is what they are.
         manager.flush()
         await tier.stop()
-        await hfcompat.close_client()
-        await ociregistry.close_client()
-        await orphans.close_client()
-        await refs.close_client()
+        # Every long-lived outbound client (Hub, registries, refs, orphans,
+        # OIDC), on the loop that built it. See app/httpclients.py.
+        await httpclients.close_all()
 
 
 app = FastAPI(

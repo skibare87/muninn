@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import httpclients
 from .config import settings
 
 log = logging.getLogger("xhc.refs")
@@ -33,7 +34,6 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # (repo_type, repo_id, revision) -> (commit or None, monotonic checked_at)
 _cache: dict[tuple[str, str, str], tuple[str | None, float]] = {}
 _locks: dict[tuple[str, str, str], asyncio.Lock] = {}
-_client: httpx.AsyncClient | None = None
 
 # Observability for the tests and /_cache/status: how many upstream lookups we
 # actually made. Single-flight is only provable by counting.
@@ -44,18 +44,18 @@ def stats() -> dict:
     return dict(_stats)
 
 
+_http = httpclients.LoopBound(
+    "refs",
+    lambda: httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True),
+)
+
+
 def _get_client() -> httpx.AsyncClient:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
-    return _client
+    return _http.get()
 
 
 async def close_client() -> None:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    await _http.aclose()
 
 
 def is_immutable(revision: str) -> bool:

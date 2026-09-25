@@ -49,6 +49,8 @@ import httpx
 import jwt
 from jwt import PyJWKClient
 
+from . import httpclients
+
 log = logging.getLogger("xhc.oidc")
 
 # A login that has not completed in this long is abandoned, and its pending state
@@ -168,7 +170,12 @@ class OIDCClient:
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.scopes = scopes
+        # An injected client belongs to the caller, who closes it. Otherwise one
+        # is built on first use, bound to its event loop, and closed by the
+        # lifespan's shutdown (httpclients.close_all) -- it was never closed
+        # before, and a second lifespan in one process reused it on a dead loop.
         self._http = http
+        self._own = httpclients.LoopBound("oidc", lambda: httpx.AsyncClient(timeout=15))
         self._meta: dict | None = None
         self._jwks: PyJWKClient | None = None
         # state -> (nonce, code_verifier, created_at). In-process by design: a
@@ -179,9 +186,13 @@ class OIDCClient:
     # ---------------- provider discovery ----------------
 
     async def _client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=15)
-        return self._http
+        if self._http is not None:
+            return self._http
+        return self._own.get()
+
+    async def aclose(self) -> None:
+        """Close the client this object built, if any. Never an injected one."""
+        await self._own.aclose()
 
     async def metadata(self) -> dict:
         """Fetch and cache the discovery document.

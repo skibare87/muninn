@@ -22,7 +22,7 @@ import time
 
 import httpx
 
-from . import cachefs
+from . import cachefs, httpclients
 from .config import settings
 
 log = logging.getLogger("xhc.orphans")
@@ -32,23 +32,22 @@ log = logging.getLogger("xhc.orphans")
 # limits.
 _CONCURRENCY = 8
 
-_client: httpx.AsyncClient | None = None
 _lock = asyncio.Lock()
 _last_check: dict = {"at": None, "checked": 0, "orphaned": 0, "errors": 0}
 
 
+_http = httpclients.LoopBound(
+    "orphans",
+    lambda: httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True),
+)
+
+
 def _get_client() -> httpx.AsyncClient:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True)
-    return _client
+    return _http.get()
 
 
 async def close_client() -> None:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    await _http.aclose()
 
 
 def last_check() -> dict:

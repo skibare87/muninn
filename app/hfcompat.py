@@ -37,6 +37,7 @@ from . import (
     cachefs,
     dockerauth,
     hfauthz,
+    httpclients,
     managegate,
     metrics,
     policy,
@@ -72,24 +73,21 @@ _HOP_BY_HOP = {
 # bytes via aiter_raw(), may pass content-encoding through.
 _DECODED_DROP = _HOP_BY_HOP | {"content-encoding"}
 
-_client: httpx.AsyncClient | None = None
+_http = httpclients.LoopBound(
+    "hfcompat",
+    lambda: httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.request_timeout_s, read=None),
+        follow_redirects=False,
+    ),
+)
 
 
 def get_client() -> httpx.AsyncClient:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.request_timeout_s, read=None),
-            follow_redirects=False,
-        )
-    return _client
+    return _http.get()
 
 
 async def close_client() -> None:
-    global _client  # noqa: PLW0603 - module-level singleton client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    await _http.aclose()
 
 
 def parse_resolve(full_path: str) -> tuple[str, str, str, str] | None:

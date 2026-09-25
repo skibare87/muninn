@@ -97,6 +97,9 @@ class _State:
     reconcile: dict = field(default_factory=dict)
     refs_written: set[tuple] = field(default_factory=set)
     healthy_event: asyncio.Event | None = None
+    # Whether start() built `client` (and so stop() must discard it), as opposed
+    # to a test installing one with use_client().
+    owns_client: bool = False
 
 
 _s = _State()
@@ -1159,6 +1162,7 @@ async def start() -> None:
     t = cfg()
     if _s.client is None:
         _s.client = build_client()
+        _s.owns_client = True
     _s.healthy_event = asyncio.Event()
     if _s.healthy:
         _s.healthy_event.set()
@@ -1192,6 +1196,23 @@ async def stop() -> None:
     if _s.http is not None:
         await _s.http.aclose()
         _s.http = None
+    # Everything below is bound to THIS event loop, and a second start() in the
+    # same process runs on another. Before this, a restart kept an S3 client
+    # wrapping the httpx client closed just above, and upload workers waiting
+    # on a queue bound to the dead loop -- they died on their first get() and
+    # stop() swallowed it. Under uvicorn there is one start and one stop.
+    if _s.owns_client:
+        _s.client = None
+        _s.healthy = False
+        _s.owns_client = False
+    _s.healthy_event = None
+    if _s.queue is not None:
+        # Pending uploads are carried over, not dropped: a fresh queue with the
+        # same items, because the old one may be bound to this loop.
+        old, _s.queue = _s.queue, None
+        fresh = _ensure_queue()
+        while not old.empty():
+            fresh.put_nowait(old.get_nowait())
 
 
 def status() -> dict:

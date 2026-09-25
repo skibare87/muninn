@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import httpclients
 from .config import settings
 
 log = logging.getLogger("xhc.registry")
@@ -53,7 +54,6 @@ _SCHEME_RE = re.compile(r"^\s*([A-Za-z]+)")
 # optimisation.
 _basic_upstreams: set[str] = set()
 
-_client: httpx.AsyncClient | None = None
 _tokens: dict[tuple[str, str], tuple[str, float]] = {}
 _token_locks: dict[tuple[str, str], asyncio.Lock] = {}
 _creds_cache: dict | None = None
@@ -103,21 +103,21 @@ def resolve(name: str) -> Ref:
     return Ref(upstream=upstream, api=api, repo=repo)
 
 
+_http = httpclients.LoopBound(
+    "registry",
+    lambda: httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.request_timeout_s, read=None),
+        follow_redirects=True,
+    ),
+)
+
+
 def _get_client() -> httpx.AsyncClient:
-    global _client  # noqa: PLW0603 - module-level cache
-    if _client is None:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.request_timeout_s, read=None),
-            follow_redirects=True,
-        )
-    return _client
+    return _http.get()
 
 
 async def close_client() -> None:
-    global _client  # noqa: PLW0603 - module-level cache
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    await _http.aclose()
 
 
 def _load_credentials() -> dict:
