@@ -9,6 +9,46 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.18 — 2026-09-25
+
+v0.9.18 -- per-key rules on the Hugging Face surface; Muninn is read-only toward the Hub
+
+BREAKING on upgrade where XHC_HF_AUTH=key: a principal or key whose rules never
+mention Hugging Face loses HF access. Holders of an unrestricted `*` are
+unaffected. XHC_HF_RULES=off restores the old behaviour.
+
+Per-key rules. XHC_AUTHZ_DB rules now apply to the Hugging Face surface, in the
+shape XHC_ALLOW_REPOS already uses: `models/<org>/<name> pull`,
+`datasets/...`, `spaces/...`. They are checked at the point each route parses
+its repo id, on cache hits as well as misses, across file resolution, repo
+info, trees, viewer and datasets-server paths, and everything the catch-all
+forwards. A refusal is 403 with X-Error-Code: GatedRepo and a reason naming
+the key and repo, which huggingface_hub surfaces as GatedRepoError rather than
+as a connection problem. Listings need a type-wide grant (`models/*`); other
+Hub endpoints such as whoami-v2 need a bare `*`, because they answer with the
+cache's own Hub identity. XHC_HF_RULES=enforce (default) | off.
+
+Rules that could never match are refused when saved, through the API, the CLI
+and the console: `hf/...`, push on an HF pattern, an unknown type prefix, and
+a pattern that names neither a registry host nor an HF type (for example
+`library/*`, which never matched anything on /v2 either). A rule's first
+segment decides its surface: `models/...` never grants a registry reference,
+and no registry pattern grants an HF one, except a bare `*`.
+
+Read-only toward the Hub, in every mode. The catch-all used to forward every
+method with the cache's own HF token, so a caller could make write calls --
+commits, repo creation, endpoints, jobs, webhooks -- as the cache's Hub
+identity, up to that token's scopes. Now only GET, HEAD and the read-only
+paths-info POST reach the Hub; everything else is a local 405. This holds with
+XHC_HF_AUTH=none and XHC_HF_RULES=off.
+
+Dot and empty path segments are refused with 400 on every request, in every
+mode, before they can be normalised into a different repo on the way
+upstream.
+
+/v2 authorisation can no longer be skipped by a caller that omits the request.
+
+
 ## v0.9.17 — 2026-09-25
 
 v0.9.17 -- ingest jobs survive restarts, "done" means verified, snapshots say whether they are complete
