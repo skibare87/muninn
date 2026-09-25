@@ -9,6 +9,47 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.17 — 2026-09-25
+
+v0.9.17 -- ingest jobs survive restarts, "done" means verified, snapshots say whether they are complete
+
+A pod OOM-killed mid-prewarm came back with an empty /_cache/jobs, and its half-
+ingested snapshots listed as pinned repos that looked whole. A poller could not
+tell finished from died.
+
+Job ledger. Jobs are recorded in jobs.json in the state dir (XHC_STATE_DIR, or
+the in-tree .xhc/). On restart, anything pending, running or verifying becomes
+`interrupted`, with its last recorded progress and the new process's start
+time. It is not resumed and not dropped. Re-submitting the same prewarm is the
+resume: files already present are not re-fetched, and a partial blob continues
+with a Range request. Bounded to 7 days, 50 snapshot jobs and 200 file jobs,
+with active jobs never dropped. A corrupt ledger is set aside as
+jobs.json.corrupt.<epoch> and the service keeps serving; losing job history
+protects nothing, which is the opposite of pins.
+
+"done" now means verified. Jobs go pending -> running -> verifying -> done |
+error. A snapshot used to report `done` as soon as the download returned, with
+finished_at null for the minutes its verification took, so a client gating on
+`done` would use an unverified file. `done` and finished_at are now set
+together, and a mismatch ends in `error`. The verify log distinguishes new
+files verified from files already present and not re-verified.
+
+/_cache/status adds started_at, uptime_s, interrupted jobs and ledger health.
+A 404 for a job id names the process start time.
+
+Snapshot completeness. A prewarm records the expected file list, with sizes,
+before it starts downloading. /_cache/repos then reports complete (true,
+false, or null when unknown), files_present/files_expected and
+bytes_present/bytes_expected, judged against what was asked for, including
+allow_patterns. A file counts only if its size matches. Listing repos makes
+no Hub calls.
+
+Metrics: muninn_ingest_jobs_active now counts verifying jobs as active.
+
+Not covered: OCI prewarm keeps its own in-memory job table and still loses it
+on restart.
+
+
 ## v0.9.16 — 2026-09-25
 
 v0.9.16 -- Muninn's own paths never reach the Hub
