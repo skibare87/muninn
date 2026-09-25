@@ -1879,6 +1879,16 @@ unless `XHC_TIER2` is set; unset, every tier code path is skipped.
   renamed into place, the content is copied to the bucket in the background.
   Nothing is ever uploaded from `verifying`, from `error`, or from a partial
   file. Uploads never block serving and never hold an ingest slot.
+- **Prewarms read it too**, and a re-prewarm is how a lost disk is refilled.
+  A prewarm lists the revision (as it already does to judge completeness),
+  fills every sha256 file it names from the bucket, and then runs
+  `snapshot_download` as before. That only links what landed, and fetches the
+  rest from the Hub: small git-blob files, tier misses, and anything that
+  failed verification. Tier fills use the same verify-first path as a file
+  miss, under `huggingface_hub`'s per-blob lock, and at most
+  `XHC_SNAPSHOT_MAX_WORKERS` of them run at once. Files verified as they
+  arrived from the tier are counted in the job's `verify.verified_at_tier_read`
+  and are not hashed a second time.
 - **Fails open.** The tier is an accelerator and an archive, never the
   authority. An outage, a 5xx, a 401 or a verification failure falls through to
   the upstream. A 401 also disables the tier until the next probe (every 60 s).
@@ -1993,7 +2003,7 @@ that byte in the same pass and sends it.
 | read-through for OCI blobs, OCI manifests by digest, and HF files with a sha256 ETag | serve anything from the tier when the **upstream is unreachable for metadata**. A Hugging Face miss still needs the Hub's `HEAD`, and a tag still needs the registry |
 | write-back after `done`, with the upload-time hash | read or restore from the **index**, which is written but never read. A model deleted upstream does **not** survive through the tier yet |
 | write the signed index (with `XHC_TIER2_INDEX_KEY`) | tier small, non-LFS Hugging Face files (`config.json`, tokenizers), which are keyed by git blob id. A model restored without its `config.json` is not a model, so that is the next phase's first job |
-| verify every tier read | read from the tier during a **prewarm** (`snapshot_download` fetches from the Hub). Prewarmed files are written back like any other |
+| verify every tier read | |
 | static keys, and a GKE metadata-server token for GCS | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
 | | parallel ranged reads from the tier: one stream per object |
 | | delete anything from the tier, ever |

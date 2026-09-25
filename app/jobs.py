@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Literal
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub.utils import filter_repo_objects
 
 from . import build, cachefs, manifests, metrics, statedir, tier
 from .config import settings
@@ -231,6 +232,9 @@ class Job:
     # there. Unset when the tier missed, failed, or was refused and the job
     # fell through to the upstream.
     served_from: str | None = None
+    # Snapshot jobs: the sha256 blobs that landed from the tier (hashed as they
+    # arrived). Verification and write-back skip exactly these. Not persisted.
+    tier_etags: set[str] = field(default_factory=set, repr=False)
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     tier_decided: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
@@ -645,6 +649,15 @@ class JobManager:
                     # read zero.
                     watcher = asyncio.create_task(self._watch_snapshot(job))
                     try:
+                        expected = await asyncio.to_thread(self._record_manifest, job)
+                        # A re-prewarm after losing the disk is how a cache is
+                        # refilled, so the tier is asked first for every sha256
+                        # file the listing names. snapshot_download then only
+                        # links what landed and fetches the rest from the Hub.
+                        if tier.enabled() and expected:
+                            job.tier_etags = await tier.fill_snapshot(
+                                job.repo_type, job.repo_id, expected
+                            )
                         path = await asyncio.to_thread(self._download_snapshot, job)
                     finally:
                         watcher.cancel()
@@ -666,7 +679,12 @@ class JobManager:
                         _tree_bytes, Path(path), job.started_at or 0
                     )
                     job.final_bytes = fetched
-                    metrics.record_ingested(fetched)
+                    # "Ingested" is the upstream leg; tier bytes are counted on
+                    # muninn_tier_bytes_read_total instead.
+                    from_tier = await asyncio.to_thread(
+                        _tree_bytes, Path(path), job.started_at or 0, job.tier_etags
+                    ) if job.tier_etags else 0
+                    metrics.record_ingested(fetched - from_tier)
                 if settings.hf_verify_ingest:
                     job.state = "verifying"
                     self._persist(transition=True)
@@ -710,7 +728,7 @@ class JobManager:
             # Outside the download thread on purpose, so the job can say
             # `verifying` while a large file is hashed instead of `running`.
             counts = {"new_verified": 0, "new_unverifiable": 0, "mismatched": 0,
-                      "already_present_not_reverified": 0}
+                      "already_present_not_reverified": 0, "verified_at_tier_read": 0}
             if job.served_from == "tier" and path.resolve().name == job.etag:
                 # Hashed as it arrived from the tier and renamed into place
                 # only on a match. Hashing it again here would be a second
@@ -718,7 +736,7 @@ class JobManager:
                 # re-establish a fact already established. The resolve()
                 # check covers a branch that moved between the two HEADs, in
                 # which case this is a different blob and is hashed below.
-                job.verify = {**counts, "new_verified": 1, "verified_at": "tier-read"}
+                job.verify = {**counts, "new_verified": 1, "verified_at_tier_read": 1}
                 return
             try:
                 result = await asyncio.to_thread(verify_ingested, path)
@@ -735,17 +753,26 @@ class JobManager:
         # hook, so this runs once the tree has landed. Bad blobs are already
         # deleted by then; failing the job is what stops the rest being
         # treated as a good prewarm.
-        tv = await asyncio.to_thread(verify_tree, path, job.started_at or 0)
+        if job.tier_etags:
+            tv = await asyncio.to_thread(verify_tree, path, job.started_at or 0,
+                                         job.tier_etags)
+        else:
+            tv = await asyncio.to_thread(verify_tree, path, job.started_at or 0)
+        # new_verified includes the tier-read ones: they WERE verified, once,
+        # as they arrived. verified_at_tier_read says how many of them that was.
         job.verify = {
-            "new_verified": tv.verified,
+            "new_verified": tv.verified + tv.tier_verified,
             "new_unverifiable": tv.unverifiable,
             "mismatched": len(tv.mismatches),
             "already_present_not_reverified": tv.already_present,
+            "verified_at_tier_read": tv.tier_verified,
         }
         log.info(
-            "snapshot verify %s: %d new file(s) verified, %d new unverifiable, "
-            "%d mismatched; %d already present, not re-verified",
-            job.id, tv.verified, tv.unverifiable, len(tv.mismatches), tv.already_present,
+            "snapshot verify %s: %d new file(s) verified (%d of them as they arrived "
+            "from the tier), %d new unverifiable, %d mismatched; %d already present, "
+            "not re-verified",
+            job.id, tv.verified + tv.tier_verified, tv.tier_verified, tv.unverifiable,
+            len(tv.mismatches), tv.already_present,
         )
         if tv.mismatches:
             raise IngestDigestMismatch(
@@ -789,7 +816,7 @@ class JobManager:
         except asyncio.CancelledError:
             raise
 
-    def _record_manifest(self, job: Job) -> None:
+    def _record_manifest(self, job: Job) -> dict[str, tuple[int | None, str | None]] | None:
         """Record what this prewarm is about to fetch, BEFORE fetching it.
 
         Before, not after: the case this exists for is the prewarm that never
@@ -805,6 +832,12 @@ class JobManager:
         tree API when siblings is empty or too large to trust. If the branch
         moves between this call and snapshot_download's, the manifest is for a
         commit that is not the one downloaded, and that commit reports `null`.
+
+        Returns what the prewarm will fetch, path -> (size, sha256 or None),
+        filtered by its allow_patterns exactly as snapshot_download filters. The
+        sha256 is the LFS oid, which is the file's ETag and its blob name; it is
+        what the tier is asked for. None if the listing failed: the prewarm then
+        simply goes to the Hub, as it always did.
         """
         try:
             api = HfApi(endpoint=settings.upstream, token=settings.hf_token)
@@ -820,8 +853,8 @@ class JobManager:
             if not siblings or len(siblings) > _VERY_LARGE_REPO_THRESHOLD:
                 from huggingface_hub.hf_api import RepoFile
 
-                files = {
-                    f.path: f.size
+                entries = {
+                    f.path: (f.size, _lfs_sha256(f.lfs))
                     for f in api.list_repo_tree(
                         repo_id=job.repo_id, repo_type=job.repo_type,
                         revision=info.sha, recursive=True,
@@ -829,17 +862,22 @@ class JobManager:
                     if isinstance(f, RepoFile)
                 }
             else:
-                files = {s.rfilename: s.size for s in siblings}
+                entries = {s.rfilename: (s.size, _lfs_sha256(s.lfs)) for s in siblings}
+            files = {p: size for p, (size, _sha) in entries.items()}
             manifests.record(job.repo_type, job.repo_id, info.sha, files, job.allow_patterns)
+            kept = set(filter_repo_objects(entries, allow_patterns=job.allow_patterns))
+            return {p: v for p, v in entries.items() if p in kept}
         except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the prewarm
             log.warning(
                 "prewarm %s: could not record the expected file list (%s); "
                 "/_cache/repos will report completeness as unknown",
                 job.id, exc,
             )
+            return None
 
     def _download_snapshot(self, job: Job) -> Path:
-        self._record_manifest(job)
+        # The listing (_record_manifest) now runs first, in _run, so the tier
+        # can be consulted between it and this.
         return Path(
             snapshot_download(
                 repo_id=job.repo_id,
@@ -852,6 +890,15 @@ class JobManager:
                 max_workers=settings.snapshot_max_workers,
             )
         )
+
+
+def _lfs_sha256(lfs) -> str | None:
+    """The sha256 of an LFS (or Xet-backed) file from a listing entry, or None
+    for a git-blob file. BlobLfsInfo is a dict subclass with attributes."""
+    if not lfs:
+        return None
+    sha = getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
+    return sha if isinstance(sha, str) and _SHA256_RE.match(sha) else None
 
 
 def _finished_key(job: Job) -> float:
@@ -869,9 +916,13 @@ class TreeVerify:
     # it a re-prewarm of a complete repo logged "0 verified", which reads as
     # "nothing was checked" rather than "nothing new arrived".
     already_present: int = 0
+    # Fresh blobs that landed from the object-store tier and were verified as
+    # they arrived. Counted, never re-hashed.
+    tier_verified: int = 0
 
 
-def verify_tree(root: Path, since: float = 0.0) -> TreeVerify:
+def verify_tree(root: Path, since: float = 0.0,
+                tier_verified: frozenset[str] | set[str] = frozenset()) -> TreeVerify:
     """Verify every file freshly written under a snapshot root.
 
     Mismatched blobs are deleted by verify_ingested before this returns, so the
@@ -887,8 +938,13 @@ def verify_tree(root: Path, since: float = 0.0) -> TreeVerify:
 
     Deduplicated by inode, because the HF layout points many snapshot entries at
     one blob and hashing it once per reference would be the same work repeated.
+
+    `tier_verified` names blobs (by ETag) that were hashed as they arrived from
+    the object-store tier and renamed into place only on a match. They are
+    counted and NOT hashed again: that would be a second full read of a file
+    already checked, which on a large shard costs minutes.
     """
-    verified = unverifiable = already = 0
+    verified = unverifiable = already = from_tier = 0
     mismatches: list[str] = []
     seen: set[tuple[int, int]] = set()
     if not root.exists():
@@ -907,6 +963,9 @@ def verify_tree(root: Path, since: float = 0.0) -> TreeVerify:
             if st.st_mtime < since - 1:
                 already += 1
                 continue
+            if tier_verified and path.resolve().name in tier_verified:
+                from_tier += 1
+                continue
             try:
                 if verify_ingested(path) == "VERIFIED":
                     verified += 1
@@ -914,16 +973,17 @@ def verify_tree(root: Path, since: float = 0.0) -> TreeVerify:
                     unverifiable += 1
             except IngestDigestMismatch as exc:
                 mismatches.append(f"{path.name}: {exc}")
-    return TreeVerify(verified, unverifiable, mismatches, already)
+    return TreeVerify(verified, unverifiable, mismatches, already, from_tier)
 
 
-def _tree_bytes(root: Path, since: float = 0.0) -> int:
+def _tree_bytes(root: Path, since: float = 0.0, only: set[str] | None = None) -> int:
     """Bytes under `root` that were written at or after `since`.
 
     Symlinks are resolved, because the HF layout points snapshot entries at
     blobs. The mtime filter is what makes this "ingested" rather than "present":
     a snapshot that was already half-cached should not report the cached half as
     freshly pulled. Deduplicated by inode, so two refs to one blob count once.
+    `only`, when given, restricts the sum to blobs with those names.
     """
     total = 0
     seen: set[tuple[int, int]] = set()
@@ -931,14 +991,17 @@ def _tree_bytes(root: Path, since: float = 0.0) -> int:
         return 0
     for dirpath, _dirnames, filenames in os.walk(root):
         for fn in filenames:
+            p = os.path.join(dirpath, fn)
             try:
-                st = os.stat(os.path.join(dirpath, fn))  # follows symlinks
+                st = os.stat(p)  # follows symlinks
             except OSError:
                 continue
             key = (st.st_dev, st.st_ino)
             if key in seen:
                 continue
             seen.add(key)
+            if only is not None and os.path.basename(os.path.realpath(p)) not in only:
+                continue
             if st.st_mtime >= since - 1:
                 total += st.st_size
     return total

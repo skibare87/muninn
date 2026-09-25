@@ -190,6 +190,7 @@ def test_a_reprewarm_says_files_were_already_present_not_that_none_were_checked(
         "new_unverifiable": 0,
         "mismatched": 0,
         "already_present_not_reverified": 2,
+        "verified_at_tier_read": 0,
     }
     assert "2 already present, not re-verified" in caplog.text
     assert job.to_dict()["verify"]["already_present_not_reverified"] == 2

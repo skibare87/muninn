@@ -351,42 +351,43 @@ def hf_lock(repo_type: str, repo_id: str, etag: str) -> filelock.FileLock:
     return filelock.FileLock(str(p), thread_local=False)
 
 
-async def fill_hf_blob(job) -> bool:
-    """Try to put blobs/<etag> in place from the tier before hf_hub_download.
+async def _fill_blob(repo_type: str, repo_id: str, etag: str, size: int | None, *,
+                     stream: bool = False, on_answer=None) -> bool:
+    """Put blobs/<etag> in place from the tier, verified, under huggingface_hub's
+    own per-blob lock. Returns True only when the tier's bytes landed.
 
-    Returns True when the blob is now present and came from the tier. The
-    download that follows then finds it and only creates the snapshot link.
+    The one routine for both a file miss and a prewarm, so both keep the same
+    guarantees: one hash pass, rename only on a match, a mismatch marked bad
+    and never deleted from the tier.
 
-    Sets job.tier_source as soon as the tier has answered 200, which is the
-    moment serve_file needs in order to choose how to answer the client. It is
-    never cleared: a request that sees it waits for the job, whether the tier's
-    bytes verified or the job fell through to the Hub. job.served_from says
-    which of the two happened.
+    `on_answer` is called once the tier has answered 200, before any body byte
+    is read. `stream` writes where a tail-follower looks (file misses under
+    XHC_TIER2_READ_MODE=stream only); a failure after that raises
+    TierReadFailed instead of falling through, because a follower has already
+    been sent a prefix it cannot un-receive.
     """
     t = cfg()
-    etag = job.etag or ""
-    if not (readable() and _SHA256_RE.match(etag)):
+    if not (readable() and _SHA256_RE.match(etag or "")):
         return False
-    if (job.expected_size or 0) < t.min_size:
+    if (size or 0) < t.min_size:
         return False
-    key = hf_content_key(job.repo_type, job.repo_id, etag)
+    key = hf_content_key(repo_type, repo_id, etag)
     if key in _s.bad:
         return False
-    blobs = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_id, job.repo_type) / "blobs"
+    blobs = Path(settings.cache_dir) / cachefs.repo_folder_name(repo_id, repo_type) / "blobs"
     blob = blobs / etag
     if blob.exists():
         return False
-    stream = t.read_mode == "stream"
-    lock = hf_lock(job.repo_type, job.repo_id, etag)
+    lock = hf_lock(repo_type, repo_id, etag)
     await asyncio.to_thread(lock.acquire)
     try:
         if blob.exists():
             return False
-        resp = await open_read(key, "hf", "blob", job.expected_size)
+        resp = await open_read(key, "hf", "blob", size)
         if resp is None:
             return False
-        job.tier_source = True
-        job.tier_decided.set()
+        if on_answer is not None:
+            on_answer()
         # verify-first writes where tail_follow does not look, so no client
         # sees a byte before the hash has matched. stream writes to the path
         # tail_follow follows, and is documented as serving unverified bytes.
@@ -410,10 +411,72 @@ async def fill_hf_blob(job) -> bool:
             return False
         os.replace(tmp, blob)
         metrics.record_tier_verify("verified")
-        job.served_from = "tier"
         return True
     finally:
         await asyncio.to_thread(lock.release)
+
+
+async def fill_hf_blob(job) -> bool:
+    """A file miss: try the tier before hf_hub_download.
+
+    Returns True when the blob is now present and came from the tier. The
+    download that follows then finds it and only creates the snapshot link.
+
+    Sets job.tier_source as soon as the tier has answered 200, which is the
+    moment serve_file needs in order to choose how to answer the client. It is
+    never cleared: a request that sees it waits for the job, whether the tier's
+    bytes verified or the job fell through to the Hub. job.served_from says
+    which of the two happened.
+    """
+
+    def _answered() -> None:
+        job.tier_source = True
+        job.tier_decided.set()
+
+    ok = await _fill_blob(job.repo_type, job.repo_id, job.etag or "", job.expected_size,
+                          stream=cfg().read_mode == "stream", on_answer=_answered)
+    if ok:
+        job.served_from = "tier"
+    return ok
+
+
+async def fill_snapshot(repo_type: str, repo_id: str,
+                        expected: dict[str, tuple[int | None, str | None]]) -> set[str]:
+    """A prewarm: fill every expected sha256 blob from the tier first.
+
+    `expected` is the prewarm's own listing, path -> (size, sha256 or None),
+    already filtered by its allow_patterns. snapshot_download then runs as
+    before: it finds these blobs present and only links them, and fetches the
+    rest -- git-blob files, tier misses, and anything that failed verification
+    -- from the Hub.
+
+    Always verify-first: nothing tail-follows a prewarm. At most
+    XHC_SNAPSHOT_MAX_WORKERS fills run at once, the same bound the Hub fetch
+    uses, because each holds a connection and a file and the node matters.
+
+    Returns the ETags that landed from the tier. The job's verification skips
+    exactly these (they were hashed as they arrived) and the write-back does
+    not re-upload them.
+    """
+    if not readable():
+        return set()
+    wanted: dict[str, int | None] = {}
+    for size, sha in expected.values():
+        if sha and _SHA256_RE.match(sha):
+            wanted[sha] = size  # one fill per blob, however many paths name it
+    if not wanted:
+        return set()
+    sem = asyncio.Semaphore(max(1, settings.snapshot_max_workers))
+
+    async def one(etag: str, size: int | None) -> str | None:
+        async with sem:
+            return etag if await _fill_blob(repo_type, repo_id, etag, size) else None
+
+    got = await asyncio.gather(*(one(e, s) for e, s in wanted.items()))
+    filled = {e for e in got if e}
+    log.info("prewarm %s/%s: %d of %d sha256 blob(s) filled from the tier",
+             repo_type, repo_id, len(filled), len(wanted))
+    return filled
 
 
 async def read_oci_manifest(upstream: str, digest: str) -> tuple[bytes, str] | None:
@@ -584,7 +647,10 @@ def _hf_job_items(job) -> list[Upload]:
         etag = blob.name
         idx = _hf_commit_index(job.repo_type, job.repo_id, commit, path_in_repo, etag, st.st_size)
         fresh = since is None or st.st_mtime >= since
-        tier_sourced = job.kind == "file" and getattr(job, "served_from", None) == "tier"
+        tier_sourced = (
+            (job.kind == "file" and getattr(job, "served_from", None) == "tier")
+            or etag in getattr(job, "tier_etags", ())
+        )
         if (_SHA256_RE.match(etag) and fresh and not tier_sourced
                 and st.st_size >= t.min_size):
             item = _content(hf_content_key(job.repo_type, job.repo_id, etag), blob, etag)
