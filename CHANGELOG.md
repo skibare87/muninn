@@ -9,6 +9,52 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.22 — 2026-09-25
+
+v0.9.22 -- an optional object-store second tier (phase 1), and small files verified
+
+OBJECT-STORE TIER (XHC_TIER2, off by default). Muninn can keep a second copy of
+what it caches in an S3-compatible bucket or in GCS (s3://... or gs://...), so a
+replaced or rebuilt cache disk refills from the bucket instead of the upstream.
+
+  - Read-through: on a local miss, and for each file of a prewarm, content is
+    fetched from the tier first. It is verified against a value from the
+    request path -- the Hub's sha256 ETag or the client's digest -- never from
+    the bucket, so the bucket can withhold content but cannot substitute it. A
+    wrong object falls back to the upstream within the same request.
+    Verify-first by default (XHC_TIER2_READ_MODE=stream is opt-in). Each object
+    is hashed exactly once, while it is fetched.
+  - Write-back: after a job is done (verified), the file is uploaded in the
+    background, hashed while it is sent, using multipart above
+    XHC_TIER2_PART_SIZE. A reconciler compares local content against the bucket.
+  - An index (revision -> commit -> files, and OCI tag -> digest) is written from
+    now on, so a later release can restore from it. It is HMAC-signed when
+    XHC_TIER2_INDEX_KEY is set, and marked unsigned otherwise. Nothing reads it
+    yet.
+  - Credentials: static keys (env or file) or, for gs://, the GKE
+    metadata-server token (workload identity). A minimal SigV4 client on
+    httpx, with no new dependency. It never makes bucket-level calls. At every
+    start a probe checks that a missing key reads as 404, not 403.
+  - THE TIER GROWS WITHOUT BOUND. Muninn never deletes from it. Retention is the
+    operator's cost decision; the object layout puts the retention class first
+    so prefix lifecycle rules can target it.
+  - Phase 1 covers sha256-addressed content: OCI blobs and manifests, and HF LFS
+    files. Surviving an upstream deletion needs the restore path and is not in
+    this release.
+  - Tested against a real MinIO. GCS and R2 behaviour is exercised only against
+    fakes and is unverified.
+
+SMALL FILES VERIFIED. A non-LFS Hugging Face file's ETag is its git blob id,
+sha1(b"blob <size>\0" + content), measured to equal the Hub's ETag on real
+repos. Such files are now checked in the same single pass as sha256 ETags, and
+a mismatch fails the ingest. Only an ETag of neither shape is still
+UNVERIFIABLE.
+
+Also: `authzctl create-principal` warns when a subject contains '%3A', because
+workload-token subjects keep ':' literal. The README shows how to use a GKE
+cluster's public OIDC issuer, confirmed on a real cluster.
+
+
 ## v0.9.21 — 2026-09-25
 
 v0.9.21 -- admin from an identity-provider claim
