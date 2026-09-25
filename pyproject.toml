@@ -37,6 +37,10 @@ testpaths = ["tests"]
 # The MinIO suite needs a real S3-compatible server; CI runs it as its own job
 # with `pytest -m minio` (a later -m on the command line wins).
 addopts = "-q -m 'not minio'"
+# A test that runs this long is hung, not slow (the whole suite takes ~1 min).
+# Dump every thread's stack so the hang names its own location. One full run
+# hung once and never reproduced in seven more; this is how the next one is caught.
+faulthandler_timeout = 120
 markers = [
     "minio: needs a real S3-compatible server (MinIO); run with `pytest -m minio`",
 ]
