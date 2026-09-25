@@ -9,6 +9,39 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.21 — 2026-09-25
+
+v0.9.21 -- admin from an identity-provider claim
+
+XHC_OIDC_ADMIN_CLAIM and XHC_OIDC_ADMIN_VALUE make browser-console admin follow a
+role or group at the identity provider. Admin is recomputed at EVERY login:
+granted when the claim carries the value, revoked when it does not. Revoking the
+role at the provider demotes the user at their next login. A demotion recorded
+in Muninn applies on the user's next request, because admin is read from the
+store and never cached in the session. An open session keeps admin until
+XHC_SESSION_TTL at most.
+
+  - The claim may be a top-level name, including URL-style namespaced claims,
+    or a dotted path such as realm_access.roles. It may be a string or a list,
+    and the value must match exactly. A missing claim means not admin, and the
+    claim names the token did carry are logged once.
+  - In this mode the first-login-becomes-admin bootstrap is off.
+  - The last admin CAN be demoted, logged at ERROR: refusing would keep admin
+    for exactly the person whose role was revoked. Recovery needs no restart:
+    grant the role and log in, or use XHC_BOOTSTRAP_ADMIN, or run
+    `python -m app.authzctl grant-admin SUBJECT`.
+  - XHC_BOOTSTRAP_ADMIN becomes a standing break-glass grant, matched on the
+    SUBJECT only (never the email, which users can often change). A value
+    containing '@' logs a warning, because an email would match nobody.
+  - The console's admin toggle is refused in this mode, since the next login
+    would undo it.
+  - Workload JWT principals are never admin and never reach the console.
+
+New: `authzctl grant-admin` and `authzctl revoke-admin`. Revoking the last admin
+is refused. `set_admin` on an unknown subject now raises instead of reporting
+success.
+
+
 ## v0.9.20 — 2026-09-25
 
 v0.9.20 -- workload identity (JWT), and Kubernetes examples
