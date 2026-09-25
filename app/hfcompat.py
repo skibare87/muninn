@@ -12,7 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import posixpath
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -21,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     Response,
     StreamingResponse,
@@ -28,7 +32,7 @@ from fastapi.responses import (
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, dockerauth, metrics, policy, refs, serving, viewer
+from . import cachefs, dockerauth, metrics, policy, refs, serving, viewer, webauth
 from .config import settings
 from .jobs import manager
 
@@ -408,6 +412,88 @@ def _cache_headers(commit: str, etag: str | None, extra: dict | None = None) -> 
 
 
 
+# ---------------------------------------------------------------------------
+# Muninn-reserved paths. THE ONE LIST.
+#
+# Every path Muninn itself owns is claimed here, whether or not the surface
+# behind it is mounted. A surface switched off by configuration has no router,
+# so without this its paths reach the catch-all and are proxied to the Hub: an
+# operator who set XHC_DOCKER_ENABLED=0 got the Hub's 401 and HTML on /v2/,
+# with the upstream's headers. A disabled surface must answer locally.
+#
+# A path here that reaches the catch-all is ALWAYS answered locally, never
+# forwarded. That covers two cases with one rule: the surface is disabled, or
+# it is enabled but the method or sub-path does not exist on it (POST /healthz,
+# /_cache/typo). Both are Muninn's to answer, and neither is the Hub's.
+#
+# ADDING A SURFACE: add its path here in the same change that adds its router.
+# `subtree=True` claims the path and everything under it; `False` claims the
+# exact path (with or without a trailing slash) and leaves deeper paths to HF,
+# for single endpoints whose name could plausibly also be a Hub namespace.
+# More specific entries go first -- the first match names the setting.
+#
+# `served_here=True` marks the one surface whose handler lives INSIDE the
+# catch-all (datasets-server). While enabled it passes the early check so its
+# branch below can run; anything that branch does not take is refused by the
+# second check just before the proxy, so it still never reaches the Hub.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Reserved:
+    path: str
+    subtree: bool
+    enabled: Callable[[], bool]
+    disabled_reason: str
+    served_here: bool = False
+
+
+_DOCS_OFF = "the API documentation is disabled (XHC_DOCS=0)"
+
+_RESERVED: tuple[_Reserved, ...] = (
+    _Reserved("v2", True, lambda: settings.docker_enabled,
+              "the OCI registry surface is disabled (XHC_DOCKER_ENABLED=0)"),
+    _Reserved("_cache/docker", True, lambda: settings.docker_enabled,
+              "the docker management API is disabled (XHC_DOCKER_ENABLED=0)"),
+    _Reserved("_cache", True, lambda: True, ""),
+    _Reserved("_auth", True, webauth.enabled,
+              "the browser login is disabled (XHC_OIDC_ISSUER is unset)"),
+    _Reserved("_console", True, webauth.enabled,
+              "the key-management API is disabled (XHC_OIDC_ISSUER is unset)"),
+    _Reserved("datasets-server", True, lambda: bool(settings.datasets_server),
+              "the datasets-server proxy is disabled (XHC_DATASETS_SERVER is empty)",
+              served_here=True),
+    _Reserved("docs", False, lambda: settings.docs_enabled, _DOCS_OFF),
+    _Reserved("docs/oauth2-redirect", False, lambda: settings.docs_enabled, _DOCS_OFF),
+    _Reserved("redoc", False, lambda: settings.docs_enabled, _DOCS_OFF),
+    _Reserved("openapi.json", False, lambda: settings.docs_enabled, _DOCS_OFF),
+    _Reserved("healthz", False, lambda: True, ""),
+    _Reserved("metrics", False, lambda: True, ""),
+)
+
+
+def _reserved_path(full_path: str) -> _Reserved | None:
+    """The reserved entry this request path falls under, or None for HF paths.
+
+    Matched on the dot-segment-normalised path, because httpx normalises
+    `api/../v2/` to `/v2/` when it builds the upstream URL -- matching the raw
+    string would let that spelling through to the Hub.
+    """
+    key = posixpath.normpath("/" + full_path).lstrip("/")
+    for entry in _RESERVED:
+        if key == entry.path or (entry.subtree and key.startswith(entry.path + "/")):
+            return entry
+    return None
+
+
+def _reserved_refusal(entry: _Reserved, full_path: str, request: Request) -> Response:
+    if entry.enabled():
+        reason = f"no such Muninn endpoint: {request.method} /{full_path}"
+    else:
+        reason = entry.disabled_reason
+    return PlainTextResponse(reason + "\n", status_code=404)
+
+
 def _web_root_file(full_path: str) -> Path | None:
     """Resolve a request path inside XHC_WEB_ROOT, or None.
 
@@ -470,12 +556,26 @@ async def catch_all(full_path: str, request: Request) -> Response:
     #    homepage as well as a cache. Checked FIRST among the catch-all's
     #    branches because it is the only one keyed on a file existing rather
     #    than on a path shape -- and it falls through when the file is absent,
-    #    so HF traffic is untouched. /v2, /healthz, /metrics and /_cache never
-    #    reach here: their routers are mounted before this one.
+    #    so HF traffic is untouched. /v2, /healthz, /metrics and /_cache do not
+    #    reach here while their routers are mounted -- those are mounted before
+    #    this one. When a surface is switched off they DO; see 0r.
     if settings.web_root and request.method in ("GET", "HEAD"):
         served = _web_root_file(full_path)
         if served is not None:
             return FileResponse(served)
+
+    # 0r. MUNINN-RESERVED PATHS NEVER REACH THE HUB. After the web root, so an
+    #     operator may still serve their own page at a reserved path whose
+    #     surface they switched off (a static /docs, say): a local answer they
+    #     chose, not an upstream one. BEFORE the credential gate, because the
+    #     gate protects the Hub proxy and this branch never reaches it. A
+    #     docker client probing /v2/ on a cache with docker off should learn
+    #     that, not receive the HF surface's Basic challenge and try to log in
+    #     to a registry that is not there. Nothing is disclosed that the
+    #     surface's absence does not already disclose.
+    reserved = _reserved_path(full_path)
+    if reserved is not None and not (reserved.served_here and reserved.enabled()):
+        return _reserved_refusal(reserved, full_path, request)
 
     # 0a. THE CREDENTIAL GATE FOR THIS ENTIRE SURFACE, and its position is the
     #     design. It sits AFTER the web root so a homepage and its assets stay
@@ -553,6 +653,11 @@ async def catch_all(full_path: str, request: Request) -> Response:
         view = viewer.parse_path(full_path)
         if view is not None:
             return await serve_viewer(*view, full_path, request)
+
+    # The second half of 0r: a served_here surface whose branch above did not
+    # take the request (wrong method, bare prefix) is still Muninn's, not HF's.
+    if reserved is not None:
+        return _reserved_refusal(reserved, full_path, request)
 
     return await proxy_upstream(full_path, request)
 

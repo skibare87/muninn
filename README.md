@@ -147,6 +147,41 @@ fall back to the resolve path automatically — a client that leaves Xet enabled
 still works, it just gets served from cache. Disable with
 `XHC_BLOCK_CLIENT_XET=0`.
 
+### Muninn's own paths never reach the Hub
+
+Everything not claimed by another route goes to the Hub, which is how HF API
+paths Muninn does not model keep working. The paths Muninn itself owns are the
+exception, **whether or not the feature behind them is switched on**:
+
+| path | owned by | when switched off |
+|---|---|---|
+| `/v2`, `/v2/*` | OCI registry | `XHC_DOCKER_ENABLED=0` |
+| `/_cache/docker/*` | docker management API | `XHC_DOCKER_ENABLED=0` |
+| `/_cache/*` | management API | always on |
+| `/_auth/*`, `/_console/*` | browser login and key management | `XHC_OIDC_ISSUER` unset |
+| `/datasets-server/*` | datasets-server proxy | `XHC_DATASETS_SERVER=` (empty) |
+| `/docs`, `/docs/oauth2-redirect`, `/redoc`, `/openapi.json` | API documentation | `XHC_DOCS=0` |
+| `/healthz`, `/metrics` | health and Prometheus | always on |
+
+A request for one of these that no enabled route answers gets a local `404` with
+a one-line plain-text body, and nothing is forwarded. A switched-off surface
+names the setting that enables it (`the OCI registry surface is disabled
+(XHC_DOCKER_ENABLED=0)`); an enabled one with no such route or method says
+`no such Muninn endpoint: POST /healthz`. Without this, a cache with docker off
+answered `/v2/` with the Hub's `401`, its HTML and its headers.
+
+The first five rows are whole subtrees. The last two are exact paths only (a
+trailing slash included), so `/docs/…` deeper than those still goes to the Hub.
+The check matches the path after `..` segments are resolved, because the
+upstream client resolves them too.
+
+It runs **after** the web root, so a static page you put at a switched-off path
+(say `/docs/index.html`) is still served, and **before** the `XHC_HF_AUTH=key`
+credential gate, which protects the Hub proxy and has nothing to protect here.
+A docker client probing `/v2/` on a cache with docker off is told so, not sent a
+Basic challenge for a registry that does not exist. The docker CLI shows only
+`not found` for a 404 and discards the body; `curl` shows the reason.
+
 ### Mutable refs are revalidated
 
 A cache hit is a disk read, which is the point — but it means a moved `main`
@@ -356,9 +391,13 @@ discriminator is a **precedence rule** rather than a pattern:
 symptom would be *"the cache stopped working"* rather than *"a file was served"*.
 Keep it to a homepage and its assets.
 
-It cannot shadow `/v2`, `/healthz`, `/metrics` or `/_cache` — those routers are
-mounted before the HF catch-all, so they win by ordering. That ordering is now
-load-bearing for a security property and is pinned by a test.
+It cannot shadow `/v2`, `/healthz`, `/metrics` or `/_cache` while they are
+enabled — those routers are mounted before the HF catch-all, so they win by
+ordering. That ordering is now load-bearing for a security property and is
+pinned by a test. A **switched-off** surface has no router, so the web root can
+serve a file at its path; anything it does not serve is answered locally and
+never forwarded (see [Muninn's own paths never reach the
+Hub](#muninns-own-paths-never-reach-the-hub)).
 
 **Containment is enforced by resolving the path, not by comparing strings.** A
 prefix check on the raw request path is the classic bypass: `..` and symlinks both
@@ -1387,7 +1426,7 @@ experiments age out.
 | `XHC_STREAM_START_TIMEOUT` | `120` | seconds a `stream` miss waits for the first bytes to land |
 | `XHC_STREAM_POLL_INTERVAL` | `0.25` | seconds between checks for new bytes while streaming a miss |
 | `XHC_INGEST_POLICY` | `open` | `open` \| `allowlist` |
-| `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins |
+| `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins. Matched against `models/<org>/<name>`, `datasets/<org>/<name>` or `spaces/<org>/<name>`, so the type prefix is required: `models/org/name-*,datasets/my-org/*`. A bare `org/name-*` matches nothing. Case-sensitive, and `*` also matches `/` |
 | `XHC_POLICY_SCOPE` | `ingest` | `ingest` \| `all` — whether policy also gates cache hits |
 | `XHC_MAX_FILE_BYTES` | unset | refuse to ingest a file larger than this |
 | `XHC_VIEWER_ENDPOINTS` | `parquet,croissant` | dataset metadata endpoints to cache |
