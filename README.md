@@ -1665,8 +1665,21 @@ revocation is immediate.
 
 #### Kubernetes, worked
 
-The service account's `sub` is `system:serviceaccount:<namespace>:<name>`. Find the
-cluster's issuer — it is what goes in `issuer`, byte for byte:
+The service account's `sub` is `system:serviceaccount:<namespace>:<name>`, and the
+principal keeps the colons literal: `k8s:system:serviceaccount:<namespace>:<name>`. Only
+`%`, `/` and control characters are percent-encoded; a hand-encoded `%3A` matches no token.
+
+**On GKE, use the cluster's public issuer.** It is
+`https://container.googleapis.com/v1/projects/<project>/locations/<location>/clusters/<cluster>`,
+serves its discovery document anonymously, and advertises a public `jwks_uri`, so discovery
+works with no extra configuration. The in-cluster `/.well-known/openid-configuration`
+reached through the API server advertises a *private* `jwks_uri` (the control plane's
+internal address), so do not copy what `kubectl get --raw` shows there. Confirmed on a real
+GKE cluster: a projected token with the right audience pulled what its principal allows (200),
+was refused outside its rules (403), and a tampered signature, the pod's default token (wrong
+audience) and a service account with no principal were each refused (401).
+
+Elsewhere, find the cluster's issuer — it is what goes in `issuer`, byte for byte:
 
 ```bash
 kubectl get --raw /.well-known/openid-configuration | jq -r .issuer

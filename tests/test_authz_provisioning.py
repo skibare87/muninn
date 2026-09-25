@@ -644,3 +644,13 @@ def test_the_api_and_cli_accept_the_allowlist_shape(env):
               {"rules": ["models/google/gemma-4-* pull"]}, AUTH)
     assert r.status_code == 200, r.text
     assert _ctl(db, "set-rules", "svc:ci", "datasets/org/* pull").returncode == 0
+
+
+def test_create_principal_warns_on_a_percent_encoded_colon(tmp_path, capsys):
+    from app import authzctl
+
+    db = tmp_path / "a.db"
+    rc = authzctl.main(["--db", str(db), "create-principal", "k8s:system%3Aserviceaccount%3Ans%3Asa"])
+    err = capsys.readouterr().err
+    assert rc in (0, None)
+    assert "%3A" in err and "literal" in err

@@ -108,6 +108,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def _run(args: argparse.Namespace, store: AuthzStore) -> None:
     if args.cmd == "create-principal":
+        # A JWT subject is encoded only for '%', '/' and control characters, so
+        # ':' stays literal (k8s:system:serviceaccount:ns:sa). A '%3A' here is
+        # almost certainly a hand-encoded colon that no token will ever map to.
+        # Warned, not refused: a subject may legitimately contain it.
+        if "%3a" in args.subject.lower():
+            print(
+                f"warning: {args.subject!r} contains '%3A'. Workload-token subjects keep ':' "
+                "literal, e.g. k8s:system:serviceaccount:<ns>:<name>; a percent-encoded "
+                "colon will not match any token.",
+                file=sys.stderr,
+            )
         try:
             _emit(authzadmin.create_principal(store, args.subject, args.email, args.admin))
         except authzadmin.Conflict:
