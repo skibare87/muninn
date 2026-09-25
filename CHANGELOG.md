@@ -9,6 +9,40 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.16 — 2026-09-25
+
+v0.9.16 -- Muninn's own paths never reach the Hub
+
+The Hugging Face catch-all accepts every path and every method, so any path
+Muninn owns but did not route -- a disabled surface, a typo under /_cache, a
+POST to /healthz -- was proxied to huggingface.co and came back wearing the
+Hub's 401 and HTML. With XHC_DOCKER_ENABLED=0 a docker client probing /v2/ got
+the Hub's answer; with XHC_DOCS=0, /docs did.
+
+Reserved paths are now answered locally with 404 and a plain body naming why:
+the setting that enables a disabled surface, or "no such Muninn endpoint" for an
+enabled one with no matching route. One list in app/hfcompat.py covers /v2,
+/_cache (including /_cache/docker), /_auth, /_console, /datasets-server,
+/docs, /redoc, /openapi.json, /healthz and /metrics. Matching happens after
+resolving `..`, because the upstream client would otherwise normalise
+api/../v2/ into /v2/ on the way out.
+
+Order: web root, then reserved paths, then the Hugging Face credential gate.
+An operator's own web-root page still wins; a docker client probing a
+docker-off cache gets a 404 rather than the HF surface's login challenge.
+
+The docker CLI discards the body of a 404, so a docker user sees only "not
+found"; curl shows the reason.
+
+XHC_ALLOW_REPOS now documents what patterns match against:
+models/<org>/<name>, datasets/<org>/<name>, spaces/<org>/<name>. A bare
+org/name-* matches nothing.
+
+A test of the management token was passing on the Hub's 401 for a path that
+was never a route, and so never tested the token. It now targets a real route
+and checks that the refusal is Muninn's own.
+
+
 ## v0.9.15 — 2026-09-25
 
 v0.9.15 -- headless provisioning of principals, rules and keys
