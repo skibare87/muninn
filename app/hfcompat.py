@@ -33,7 +33,18 @@ from fastapi.responses import (
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, dockerauth, hfauthz, metrics, policy, refs, serving, viewer, webauth
+from . import (
+    cachefs,
+    dockerauth,
+    hfauthz,
+    metrics,
+    policy,
+    refs,
+    serving,
+    tier,
+    viewer,
+    webauth,
+)
 from .config import settings
 from .jobs import manager
 
@@ -1180,6 +1191,7 @@ async def serve_file(
         filename,
         expected_size=size or None,
         incomplete_path=incomplete,
+        etag=etag or None,
     )
 
     headers = _cache_headers(
@@ -1208,6 +1220,36 @@ async def serve_file(
         url = upstream_resolve_url(repo_type, repo_id, revision, filename)
         return RedirectResponse(url, status_code=302, headers=headers)
 
+    # --- the object-store tier -----------------------------------------------
+    # The job tries the tier before the Hub. Once it knows whether the tier is
+    # supplying the bytes, this request can choose how to answer.
+    #
+    # verify-first (the default): tier bytes land where tail_follow does not
+    # look and are renamed into place only after their hash matches, so this
+    # waits for the job exactly as `wait` does. A Hugging Face client in cache
+    # mode does not hash what it receives, so streaming unverified tier bytes
+    # to it would let a wrong object of the right length through in full.
+    tier_stream = False
+    if tier.enabled():
+        await job.tier_decided.wait()
+        if job.tier_source and (
+            settings.tier.read_mode == "verify-first" or settings.miss_policy == "wait"
+        ):
+            await job.done.wait()
+            if job.state == "error":
+                raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+            local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
+            if local is None:
+                raise HTTPException(
+                    status_code=500, detail="ingest reported success but file missing"
+                )
+            # TIER-HIT only when the tier's bytes are what landed. A tier
+            # object that failed verification fell through to the Hub inside
+            # the same job, and says so.
+            headers["x-xhc-cache"] = "TIER-HIT" if job.served_from == "tier" else "MISS-WAIT"
+            return serving.file_response(local.path, local.size, range_header, headers)
+        tier_stream = job.tier_source
+
     if settings.miss_policy == "wait":
         await job.done.wait()
         if job.state == "error":
@@ -1226,7 +1268,9 @@ async def serve_file(
         / commit
         / filename
     )
-    headers["x-xhc-cache"] = "MISS-STREAM"
+    # TIER-STREAM: served from the tier as it arrives, BEFORE verification.
+    # Only under XHC_TIER2_READ_MODE=stream, which is documented as such.
+    headers["x-xhc-cache"] = "TIER-STREAM" if tier_stream else "MISS-STREAM"
 
     # Honour Range on a miss too. Without this, a client resuming an
     # interrupted transfer that lands on a cold cache is served the whole file

@@ -17,7 +17,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import build, cachefs, orphans, policy, refs, viewer
+from . import build, cachefs, orphans, policy, refs, tier, viewer
 from .config import XET_ENV_KEYS, settings
 from .jobs import ACTIVE_STATES, manager
 
@@ -122,6 +122,7 @@ async def status() -> dict:
         "refs": {"ttl_s": settings.ref_ttl_s, **refs.stats()},
         "policy": policy.load(),
         "viewer": {"ttl_s": settings.viewer_cache_ttl_s, **viewer.stats()},
+        "tier": tier.status(),
         "orphans": {
             "policy": settings.orphan_policy,
             "count": len(_orphans := cachefs.load_orphans()),

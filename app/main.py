@@ -30,6 +30,7 @@ from . import (
     pushlimits,
     refs,
     statedir,
+    tier,
     webauth,
 )
 from . import registry as ociregistry
@@ -178,6 +179,10 @@ async def lifespan(app: FastAPI):
             log.warning("XHC_JWT_ISSUERS is set but XHC_HF_AUTH is not `key`: the "
                         "Hugging Face surface is unauthenticated and ignores tokens.")
 
+    # The object-store tier: probes in the background and fails open, so a
+    # bucket that is down at boot delays nothing. A no-op when XHC_TIER2 is unset.
+    await tier.start()
+
     evictor = asyncio.create_task(cachefs.eviction_loop())
     docker_gc = asyncio.create_task(ocigc.gc_loop()) if settings.docker_enabled else None
     orphan_sweep = asyncio.create_task(orphans.orphan_loop())
@@ -196,6 +201,7 @@ async def lifespan(app: FastAPI):
         # leaves those jobs running in the ledger, so the next boot reports
         # them as interrupted -- which is what they are.
         manager.flush()
+        await tier.stop()
         await hfcompat.close_client()
         await ociregistry.close_client()
         await orphans.close_client()
@@ -287,6 +293,7 @@ async def prometheus_metrics(
         gauges["muninn_docker_bytes"] = dstats["bytes"]
         if settings.docker_capacity_bytes:
             gauges["muninn_docker_capacity_bytes"] = settings.docker_capacity_bytes
+    gauges.update(tier.gauges())
     body = metrics.render(
         gauges,
         {
@@ -296,6 +303,14 @@ async def prometheus_metrics(
             "muninn_ingest_bytes_inflight": (
                 "Bytes fetched so far by ingests still running. Rises while a prewarm "
                 "is healthy; flat means stalled."
+            ),
+            "muninn_tier_bytes": (
+                "Bytes under the tier's content prefix at the last reconcile, from "
+                "LIST. It grows without bound: Muninn never deletes from the tier."
+            ),
+            "muninn_tier_bytes_read_total": "Body bytes read from the tier. HEADs are not counted.",
+            "muninn_tier_bytes_written_total": (
+                "Body bytes written to the tier. HEADs are not counted."
             ),
         },
     )

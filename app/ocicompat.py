@@ -27,7 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from . import dockerauth, metrics, ocigc, ocipush, ocistore, policy, registry, serving
+from . import dockerauth, metrics, ocigc, ocipush, ocistore, policy, registry, serving, tier
 from .config import settings
 
 log = logging.getLogger("xhc.oci")
@@ -268,6 +268,8 @@ class BlobJob:
     opened: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     failure: UpstreamError | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # The bytes are coming from the object-store tier rather than the upstream.
+    tier_source: bool = False
 
 
 class UpstreamError(Exception):
@@ -304,9 +306,16 @@ async def _write_blob(job: BlobJob, resp: httpx.Response) -> None:
         os.replace(tmp, job.final_path)
         job.size = written
         job.state = "done"
-        metrics.record_docker_bytes(ingested=written)
+        if job.tier_source:
+            metrics.record_tier_verify("verified")
+        else:
+            metrics.record_docker_bytes(ingested=written)
+            # Write-back: only after the digest matched and the rename landed.
+            tier.enqueue_oci_blob(job.upstream, job.digest, job.final_path, written)
     except ocistore.DigestMismatch as exc:
         job.state, job.error = "error", str(exc)
+        if job.tier_source:
+            tier.mark_bad(tier.oci_blob_key(job.upstream, job.digest), str(exc))
         log.error(
             "DIGEST MISMATCH on %s/%s -- discarding %d bytes, refusing to cache: %s",
             job.upstream,
@@ -326,6 +335,72 @@ async def _write_blob(job: BlobJob, resp: httpx.Response) -> None:
         async with _inflight_lock:
             if _inflight.get((job.upstream, job.digest)) is job:
                 _inflight.pop((job.upstream, job.digest), None)
+
+
+async def _finish(job: BlobJob) -> None:
+    job.opened.set()
+    job.done.set()
+    async with _inflight_lock:
+        if _inflight.get((job.upstream, job.digest)) is job:
+            _inflight.pop((job.upstream, job.digest), None)
+
+
+async def _tier_blob_verify_first(ref: registry.Ref, job: BlobJob, resp: httpx.Response) -> None:
+    """A blob from the tier under verify-first: hash while it lands, rename on a match.
+
+    NOT _write_blob, for two reasons the spec did not anticipate: the bytes must
+    land where no tail-follower looks (job.incomplete_path is None while this
+    runs), and a mismatch must FALL THROUGH to the upstream inside the same job
+    rather than end it in error, so the client still gets its blob.
+    """
+    key = tier.oci_blob_key(job.upstream, job.digest)
+    tmp = Path(str(job.final_path) + ".tier.incomplete")
+    ok = False
+    try:
+        got, written = await tier.hash_into(resp, tmp, flush=False)
+        if "sha256:" + got == job.digest:
+            ok = True
+        else:
+            tmp.unlink(missing_ok=True)
+            tier.mark_bad(key, f"expected {job.digest}, computed sha256:{got}")
+    except (httpx.HTTPError, OSError) as exc:
+        tmp.unlink(missing_ok=True)
+        metrics.record_tier_request("oci", "blob", "error")
+        log.warning("tier read of %s failed mid-body (%s); falling through to upstream",
+                    key, exc)
+    finally:
+        await resp.aclose()
+
+    if ok:
+        try:
+            job.final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(tmp, job.final_path)
+            job.size = written
+            job.state = "done"
+            metrics.record_tier_verify("verified")
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            job.state, job.error = "error", str(exc)
+        await _finish(job)
+        return
+
+    # Fall through to the upstream, still inside this job's single-flight slot.
+    job.tier_source = False
+    try:
+        up = await registry.open_stream(ref, f"blobs/{job.digest}")
+    except httpx.HTTPError as exc:
+        metrics.record_docker_upstream(ref.upstream, None)
+        job.state, job.error = "error", f"upstream unreachable: {exc}"
+        await _finish(job)
+        return
+    metrics.record_docker_upstream(ref.upstream, up.status_code)
+    if up.status_code != 200:
+        await up.aclose()
+        job.state, job.error = "error", f"upstream returned {up.status_code}"
+        await _finish(job)
+        return
+    job.incomplete_path = str(job.final_path) + ".incomplete"
+    await _write_blob(job, up)
 
 
 async def _proxy_blob_uncached(ref: registry.Ref, digest: str,
@@ -431,6 +506,35 @@ async def _ensure_blob(ref: registry.Ref, digest: str) -> BlobJob:
             _inflight.pop(key, None)
         job.opened.set()
         job.done.set()
+
+    # The object-store tier, before the upstream and inside the claimed slot,
+    # so a herd still costs one read of either.
+    if tier.enabled():
+        tresp = await tier.open_read(tier.oci_blob_key(ref.upstream, digest), "oci", "blob")
+        if tresp is not None:
+            size = int(tresp.headers.get("content-length") or 0) or None
+            verdict = policy.check_blob_size(size)
+            if not verdict.allowed:
+                await tresp.aclose()
+                await _abandon(UpstreamError(None, verdict.reason, {"x-xhc-policy": "denied"}))
+                raise job.failure
+            job.size = size
+            job.state = "running"
+            job.tier_source = True
+            if settings.tier.read_mode == "stream":
+                # Followers tail the .incomplete file as it lands. Docker checks
+                # the digest of what it receives, so a bad object fails the pull
+                # rather than being accepted; the key is then marked bad and the
+                # client's retry goes upstream.
+                job.opened.set()
+                task = asyncio.create_task(_write_blob(job, tresp))
+            else:
+                job.incomplete_path = None
+                job.opened.set()
+                task = asyncio.create_task(_tier_blob_verify_first(ref, job, tresp))
+            _tasks.add(task)
+            task.add_done_callback(_tasks.discard)
+            return job
 
     try:
         resp = await registry.open_stream(ref, f"blobs/{digest}")
@@ -584,12 +688,25 @@ async def _revalidate_tag(
     body = r.content
     media = r.headers.get("content-type") or "application/vnd.oci.image.manifest.v1+json"
     digest = r.headers.get("docker-content-digest") or ocistore.compute_digest(body)
+    held_before = ocistore.manifest_path(ref.upstream, digest).is_file()
+    prior = (
+        None if accept_fp == "immutable"
+        else ocistore.read_tag(ref.upstream, ref.repo, tag, accept_fp)
+    )
     try:
         ocistore.store_manifest(ref.upstream, digest, body, media)
     except ocistore.DigestMismatch as exc:
         log.error("manifest digest mismatch from %s for %s:%s: %s", ref.upstream, ref.key, tag, exc)
         return None
     ocistore.write_tag(ref.upstream, ref.repo, tag, accept_fp, digest, media)
+    if tier.writable():
+        # A tag observation is written to the index only when the mapping this
+        # cache holds CHANGES (or is new): one object per revalidation would be
+        # one per TTL per tag, forever.
+        moved = accept_fp != "immutable" and (prior is None or prior.get("digest") != digest)
+        if moved or not held_before:
+            tier.enqueue_oci_manifest(ref.upstream, digest, media,
+                                      ref.repo if moved else None, tag if moved else None)
     return ocistore.StoredManifest(body=body, media_type=media, digest=digest)
 
 
@@ -636,6 +753,17 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             return _manifest_response(held, head)
         if not verdict.allowed:
             return _denied(verdict.reason, "manifest")
+        if tier.enabled():
+            got = await tier.read_oci_manifest(ref.upstream, reference)
+            if got is not None:
+                body, media = got
+                ocistore.store_manifest(ref.upstream, reference, body, media)
+                metrics.record_docker("MISS", "manifest")
+                resp = _manifest_response(
+                    ocistore.StoredManifest(body=body, media_type=media, digest=reference), head
+                )
+                resp.headers["x-xhc-cache"] = "TIER-HIT"
+                return resp
         fetched = await _revalidate_tag(ref, reference, accept, "immutable", up)
         if fetched is None:
             return _unavailable(ref, up, reference, "manifest")
@@ -769,6 +897,21 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         if size:
             headers["content-length"] = str(size)
         return Response(content=b"", headers=headers)
+
+    if job.tier_source and settings.tier is not None and settings.tier.read_mode == "verify-first":
+        # Nothing is sent until the tier's bytes have hashed to their digest.
+        await job.done.wait()
+        if job.state != "done":
+            return _err(502, "UNAVAILABLE", job.error or "ingest failed")
+        size = job.final_path.stat().st_size
+        # Still set only if the tier's bytes are what landed; a mismatch fell
+        # through to the upstream inside the job.
+        headers["x-xhc-cache"] = "TIER-HIT" if job.tier_source else "MISS"
+        metrics.record_docker("MISS", "blob")
+        metrics.record_docker_bytes(served=size)
+        return serving.file_response(job.final_path, size, request.headers.get("range"), headers)
+    if job.tier_source:
+        headers["x-xhc-cache"] = "TIER-STREAM"
 
     if size is None:
         # No Content-Length upstream: wait for the ingest rather than guess a

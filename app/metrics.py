@@ -45,6 +45,30 @@ _docker_upstream: Counter[str] = Counter()  # "registry|statusclass"
 _docker_bytes_served = 0
 _docker_bytes_ingested = 0
 
+# The object-store second tier. Counted apart from both protocols' own
+# counters, so "served from the tier" never inflates "served" or "ingested".
+_tier_requests: Counter[str] = Counter()  # "proto|kind|result"
+_tier_verify: Counter[str] = Counter()  # verified | mismatch
+_tier_upload: Counter[str] = Counter()  # ok | failed | skipped_* | verify_mismatch | dropped_*
+_tier_index_writes: Counter[str] = Counter()  # ok | failed | skipped_exists
+# BODY bytes only. A HEAD transfers none and is never counted here -- the
+# served counter once booked HEADs as bytes, and every figure built on it
+# was inflated.
+_tier_bytes_read = 0
+_tier_bytes_written = 0
+
+_TIER_REQUEST_SERIES: tuple[str, ...] = tuple(
+    f"{proto}|{kind}|{result}"
+    for proto, kind in (("hf", "blob"), ("oci", "blob"), ("oci", "manifest"))
+    for result in ("hit", "miss", "error", "refused")
+)
+_TIER_VERIFY_SERIES: tuple[str, ...] = ("verified", "mismatch")
+_TIER_UPLOAD_SERIES: tuple[str, ...] = (
+    "ok", "failed", "skipped_exists", "skipped_evicted", "verify_mismatch",
+    "dropped_queue_full",
+)
+_TIER_INDEX_SERIES: tuple[str, ...] = ("ok", "failed", "skipped_exists")
+
 # Bounds the label cardinality: a client that sends a unique header per request
 # would otherwise grow this map without limit and blow up the scrape.
 MAX_CLIENT_LABELS = 200
@@ -88,6 +112,14 @@ def _seed() -> None:
         _requests.setdefault(result, 0)
     for result in _INGEST_VERIFY_SERIES:
         _ingest_verify.setdefault(result, 0)
+    for k in _TIER_REQUEST_SERIES:
+        _tier_requests.setdefault(k, 0)
+    for k in _TIER_VERIFY_SERIES:
+        _tier_verify.setdefault(k, 0)
+    for k in _TIER_UPLOAD_SERIES:
+        _tier_upload.setdefault(k, 0)
+    for k in _TIER_INDEX_SERIES:
+        _tier_index_writes.setdefault(k, 0)
 
 
 _seed()
@@ -142,6 +174,33 @@ def record_docker_bytes(served: int = 0, ingested: int = 0) -> None:
         _docker_bytes_ingested += ingested
 
 
+def record_tier_request(proto: str, kind: str, result: str) -> None:
+    with _lock:
+        _tier_requests[f"{proto}|{kind}|{result}"] += 1
+
+
+def record_tier_verify(result: str) -> None:
+    with _lock:
+        _tier_verify[result] += 1
+
+
+def record_tier_upload(result: str) -> None:
+    with _lock:
+        _tier_upload[result] += 1
+
+
+def record_tier_index_write(result: str) -> None:
+    with _lock:
+        _tier_index_writes[result] += 1
+
+
+def record_tier_bytes(read: int = 0, written: int = 0) -> None:
+    global _tier_bytes_read, _tier_bytes_written  # noqa: PLW0603
+    with _lock:
+        _tier_bytes_read += read
+        _tier_bytes_written += written
+
+
 def record_served(n: int) -> None:
     global _bytes_served  # noqa: PLW0603 - module-level counter
     with _lock:
@@ -167,13 +226,26 @@ def snapshot() -> dict:
             "docker_upstream": dict(_docker_upstream),
             "docker_bytes_served": _docker_bytes_served,
             "docker_bytes_ingested": _docker_bytes_ingested,
+            "tier_requests": dict(_tier_requests),
+            "tier_verify": dict(_tier_verify),
+            "tier_upload": dict(_tier_upload),
+            "tier_index_writes": dict(_tier_index_writes),
+            "tier_bytes_read": _tier_bytes_read,
+            "tier_bytes_written": _tier_bytes_written,
         }
 
 
 def reset() -> None:
     global _bytes_served, _bytes_ingested  # noqa: PLW0603 - test helper
     global _docker_bytes_served, _docker_bytes_ingested  # noqa: PLW0603 - test helper
+    global _tier_bytes_read, _tier_bytes_written  # noqa: PLW0603 - test helper
     with _lock:
+        _tier_requests.clear()
+        _tier_verify.clear()
+        _tier_upload.clear()
+        _tier_index_writes.clear()
+        _tier_bytes_read = 0
+        _tier_bytes_written = 0
         _requests.clear()
         _ingest_verify.clear()
         _upstream.clear()
@@ -257,6 +329,27 @@ def render(gauges: dict[str, float], help_text: dict[str, str] | None = None) ->
     emit(
         "muninn_docker_bytes_ingested_total", "counter", [("", snap["docker_bytes_ingested"])]
     )
+    emit(
+        "muninn_tier_requests_total",
+        "counter",
+        [
+            (
+                f'{{proto="{_escape(k.split("|")[0])}",kind="{_escape(k.split("|")[1])}",'
+                f'result="{_escape(k.split("|")[2])}"}}',
+                v,
+            )
+            for k, v in sorted(snap["tier_requests"].items())
+        ],
+    )
+    for name, key in (
+        ("muninn_tier_verify_total", "tier_verify"),
+        ("muninn_tier_upload_total", "tier_upload"),
+        ("muninn_tier_index_writes_total", "tier_index_writes"),
+    ):
+        emit(name, "counter",
+             [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap[key].items())])
+    emit("muninn_tier_bytes_read_total", "counter", [("", snap["tier_bytes_read"])])
+    emit("muninn_tier_bytes_written_total", "counter", [("", snap["tier_bytes_written"])])
     emit("muninn_bytes_served_total", "counter", [("", snap["bytes_served"])])
     emit("muninn_bytes_ingested_total", "counter", [("", snap["bytes_ingested"])])
 

@@ -27,7 +27,7 @@ from typing import Literal
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
-from . import build, cachefs, manifests, metrics, statedir
+from . import build, cachefs, manifests, metrics, statedir, tier
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
@@ -219,7 +219,20 @@ class Job:
     # progress are known to have been true.
     updated_at: float | None = None
     interrupted_at: float | None = None
+    # The upstream ETag this file job was submitted for (from serve_file's
+    # HEAD). The tier is keyed on it; None for snapshot jobs.
+    etag: str | None = None
+    # True once the object-store tier has answered 200 for this job's blob, and
+    # never cleared. tier_decided is set when that question has an answer
+    # either way, so a request can choose how to respond without racing the
+    # job: whatever the verification later finds, it chose the same way.
+    tier_source: bool = False
+    # "tier" when the bytes that landed came from the tier and were verified
+    # there. Unset when the tier missed, failed, or was refused and the job
+    # fell through to the upstream.
+    served_from: str | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    tier_decided: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
     def key(self) -> str:
@@ -314,6 +327,7 @@ class Job:
         job.recorded_bytes = rec.get("recorded_bytes")
         job.updated_at = rec.get("updated_at")
         job.done.set()
+        job.tier_decided.set()
         return job
 
 
@@ -554,6 +568,7 @@ class JobManager:
         filename: str,
         expected_size: int | None = None,
         incomplete_path: str | None = None,
+        etag: str | None = None,
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -564,6 +579,7 @@ class JobManager:
             filename=filename,
             expected_size=expected_size,
             incomplete_path=incomplete_path,
+            etag=etag,
         )
         return await self._submit(job)
 
@@ -614,6 +630,12 @@ class JobManager:
                 self._persist(transition=True)
                 log.info("ingest start %s %s", job.id, job.key)
                 if job.kind == "file":
+                    # The tier, if configured, is tried first. On a verified
+                    # hit the blob is already in place and hf_hub_download
+                    # only links it; on anything else it fetches as before.
+                    if tier.enabled():
+                        await tier.fill_hf_blob(job)
+                    job.tier_decided.set()
                     path = await asyncio.to_thread(self._download_file, job)
                 else:
                     # Sample the tree while it downloads. Without this a healthy
@@ -633,7 +655,10 @@ class JobManager:
                 # reporting nothing because it looks like a real measurement.
                 if job.kind == "file":
                     try:
-                        metrics.record_ingested(Path(path).stat().st_size)
+                        # Tier bytes are counted on muninn_tier_bytes_read_total
+                        # and never here: "ingested" is the upstream leg.
+                        if job.served_from != "tier":
+                            metrics.record_ingested(Path(path).stat().st_size)
                     except OSError:
                         pass
                 else:
@@ -662,6 +687,7 @@ class JobManager:
         finally:
             if job.finished_at is None:
                 job.finished_at = time.time()
+            job.tier_decided.set()
             job.done.set()
             cachefs.invalidate_view()
             async with self._lock:
@@ -670,6 +696,12 @@ class JobManager:
             self._history.append(job)
             self._prune(time.time())
             self._persist(transition=True, urgent=job.kind == "snapshot")
+            # Write-back fires on `done` and on nothing else: never from
+            # `verifying`, never from `error`, never from an .incomplete file.
+            if job.state == "done" and tier.writable():
+                t = asyncio.create_task(tier.after_hf_job(job))
+                self._tasks.add(t)
+                t.add_done_callback(self._tasks.discard)
 
     async def _verify(self, job: Job, path: Path) -> None:
         """Hash what this job ingested. Raises on any mismatch, which the caller
@@ -679,6 +711,15 @@ class JobManager:
             # `verifying` while a large file is hashed instead of `running`.
             counts = {"new_verified": 0, "new_unverifiable": 0, "mismatched": 0,
                       "already_present_not_reverified": 0}
+            if job.served_from == "tier" and path.resolve().name == job.etag:
+                # Hashed as it arrived from the tier and renamed into place
+                # only on a match. Hashing it again here would be a second
+                # full read of the file -- minutes on a large shard -- to
+                # re-establish a fact already established. The resolve()
+                # check covers a branch that moved between the two HEADs, in
+                # which case this is a different blob and is hashed below.
+                job.verify = {**counts, "new_verified": 1, "verified_at": "tier-read"}
+                return
             try:
                 result = await asyncio.to_thread(verify_ingested, path)
             except IngestDigestMismatch:

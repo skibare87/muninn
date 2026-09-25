@@ -93,6 +93,146 @@ def _parse_tag_ttl(default: float) -> float:
     return ALWAYS_REVALIDATE if value < 0 else value
 
 
+# ---------------------------------------------------------------------------
+# The object-store second tier (XHC_TIER2). Parsed here, next to everything
+# else read from the environment, so the docs test sees every knob.
+# ---------------------------------------------------------------------------
+
+_TIER_MIN_PART = 5 * 1024**2  # S3's floor for every part but the last
+
+
+@dataclass(frozen=True)
+class TierSettings:
+    scheme: str  # "s3" | "gs"
+    bucket: str
+    prefix: str  # no leading or trailing slash; may be ""
+    endpoint: str  # scheme://host[:port], no trailing slash
+    region: str
+    # Path-style (endpoint/bucket/key) unless the endpoint was derived for AWS,
+    # where virtual-hosted (bucket.endpoint/key) is used.
+    path_style: bool
+    credentials: str  # "static" | "gcp-metadata"
+    access_key_id: str | None = None
+    secret_access_key: str | None = field(default=None, repr=False)
+    read: bool = True
+    write: bool = True
+    read_mode: str = "verify-first"  # | "stream"
+    min_size: int = 0
+    upload_concurrency: int = 2
+    queue_max: int = 10000
+    reconcile_interval_s: float = 21600.0
+    index_key: bytes | None = field(default=None, repr=False)
+    part_size: int = 64 * 1024**2
+    checksum_header: bool = True
+
+    @property
+    def url(self) -> str:
+        return f"{self.scheme}://{self.bucket}/{self.prefix}".rstrip("/")
+
+
+def _env_secret(key: str) -> str | None:
+    """`KEY` or `KEY_FILE`, never both. A file is read and stripped.
+
+    Setting both is refused rather than resolved by precedence: whichever one
+    the operator did not mean would win silently, and it would be a credential.
+    """
+    direct = (os.environ.get(key) or "").strip() or None
+    path = (os.environ.get(f"{key}_FILE") or "").strip() or None
+    if direct and path:
+        raise ValueError(f"set {key} or {key}_FILE, not both")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                value = fh.read().strip()
+        except OSError as exc:
+            raise ValueError(f"{key}_FILE={path!r} cannot be read: {exc}") from exc
+        if not value:
+            raise ValueError(f"{key}_FILE={path!r} is empty")
+        return value
+    return direct
+
+
+def parse_tier() -> TierSettings | None:
+    """Parse XHC_TIER2 and its settings. Unset means the tier does not exist.
+
+    Fails on the ARGUMENTS, before any I/O: a half-configured tier refuses to
+    boot rather than discovering at the first miss that it has no credential.
+    The standard AWS_* variables are deliberately never read -- an ambient
+    credential meant for something else must not silently become the tier's.
+    """
+    raw = (os.environ.get("XHC_TIER2") or "").strip()
+    if not raw:
+        return None
+    m = re.match(r"^(s3|gs)://([^/]+)(?:/(.*))?$", raw)
+    if not m:
+        raise ValueError(f"XHC_TIER2 must be s3://bucket[/prefix] or gs://bucket[/prefix], got {raw!r}")
+    scheme, bucket, prefix = m.group(1), m.group(2), (m.group(3) or "").strip("/")
+
+    region = (os.environ.get("XHC_TIER2_REGION") or "auto").strip()
+    endpoint = (os.environ.get("XHC_TIER2_ENDPOINT") or "").strip().rstrip("/")
+    path_style = True
+    if not endpoint:
+        if scheme == "gs":
+            endpoint = "https://storage.googleapis.com"
+        elif region in ("auto", "us-east-1"):
+            endpoint, path_style = "https://s3.amazonaws.com", False
+        else:
+            endpoint, path_style = f"https://s3.{region}.amazonaws.com", False
+    if not re.match(r"^https?://[^/]+$", endpoint):
+        raise ValueError(f"XHC_TIER2_ENDPOINT must be scheme://host[:port], got {endpoint!r}")
+
+    creds = (
+        os.environ.get("XHC_TIER2_CREDENTIALS") or ("gcp-metadata" if scheme == "gs" else "static")
+    ).strip().lower()
+    if creds not in ("static", "gcp-metadata"):
+        raise ValueError(f"XHC_TIER2_CREDENTIALS must be static|gcp-metadata, got {creds!r}")
+    key_id = _env_secret("XHC_TIER2_ACCESS_KEY_ID")
+    secret = _env_secret("XHC_TIER2_SECRET_ACCESS_KEY")
+    if creds == "static" and not (key_id and secret):
+        raise ValueError(
+            "XHC_TIER2_CREDENTIALS=static needs XHC_TIER2_ACCESS_KEY_ID and "
+            "XHC_TIER2_SECRET_ACCESS_KEY (or their _FILE forms). AWS_* is never read."
+        )
+
+    read_mode = (os.environ.get("XHC_TIER2_READ_MODE") or "verify-first").strip().lower()
+    if read_mode not in ("verify-first", "stream"):
+        raise ValueError(f"XHC_TIER2_READ_MODE must be verify-first|stream, got {read_mode!r}")
+
+    part_size = parse_size(os.environ.get("XHC_TIER2_PART_SIZE"), 64 * 1024**2) or 0
+    if part_size < _TIER_MIN_PART:
+        raise ValueError(f"XHC_TIER2_PART_SIZE must be at least 5M (S3's part floor), got {part_size}")
+    concurrency = _env_int("XHC_TIER2_UPLOAD_CONCURRENCY", 2)
+    queue_max = _env_int("XHC_TIER2_QUEUE_MAX", 10000)
+    if concurrency < 1 or queue_max < 1:
+        raise ValueError("XHC_TIER2_UPLOAD_CONCURRENCY and XHC_TIER2_QUEUE_MAX must be >= 1")
+    interval = _env_float("XHC_TIER2_RECONCILE_INTERVAL", 21600.0)
+    if interval < 0:
+        raise ValueError(f"XHC_TIER2_RECONCILE_INTERVAL must be >= 0, got {interval}")
+
+    index_key = _env_secret("XHC_TIER2_INDEX_KEY")
+    return TierSettings(
+        scheme=scheme,
+        bucket=bucket,
+        prefix=prefix,
+        endpoint=endpoint,
+        region="us-east-1" if (region == "auto" and not path_style) else region,
+        path_style=path_style,
+        credentials=creds,
+        access_key_id=key_id,
+        secret_access_key=secret,
+        read=_env_bool("XHC_TIER2_READ", True),
+        write=_env_bool("XHC_TIER2_WRITE", True),
+        read_mode=read_mode,
+        min_size=parse_size(os.environ.get("XHC_TIER2_MIN_SIZE"), 0) or 0,
+        upload_concurrency=concurrency,
+        queue_max=queue_max,
+        reconcile_interval_s=interval,
+        index_key=index_key.encode() if index_key else None,
+        part_size=part_size,
+        checksum_header=_env_bool("XHC_TIER2_CHECKSUM_HEADER", scheme == "s3"),
+    )
+
+
 @dataclass
 class Settings:
     # --- upstream / identity -------------------------------------------------
@@ -430,6 +570,8 @@ class Settings:
     #   token  requires `Authorization: Bearer <XHC_MANAGE_TOKEN>`
     metrics_auth: str = "none"
     request_timeout_s: float = 60.0
+    # The object-store second tier. None: every tier code path is off.
+    tier: TierSettings | None = None
 
     xet_env: dict[str, str] = field(default_factory=dict)
 
@@ -676,6 +818,7 @@ class Settings:
             manage_token=os.environ.get("XHC_MANAGE_TOKEN") or None,
             metrics_auth=metrics_auth,
             request_timeout_s=_env_float("XHC_REQUEST_TIMEOUT", 60.0),
+            tier=parse_tier(),
             xet_env={k: os.environ[k] for k in XET_ENV_KEYS if k in os.environ},
         )
 

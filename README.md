@@ -1856,6 +1856,235 @@ If you need a door on it, put one in front — a reverse proxy doing basic auth 
 `docker login` today, at the cost of carving out `/healthz` and `/metrics`, which are
 unauthenticated by design.
 
+## Object-store tier (`XHC_TIER2`)
+
+> ⚠ **THE TIER GROWS WITHOUT BOUND. MUNINN NEVER DELETES FROM IT.** Nothing in
+> Muninn deletes an object from the bucket: not eviction, not a mismatch, not
+> an orphan sweep. How long to keep what is there is **your cost decision**.
+> Muninn does not default one, recommend one or ship one. Its size is on
+> `muninn_tier_objects` and `muninn_tier_bytes`, measured by LIST at each
+> reconcile.
+
+An optional S3-compatible bucket between the local disk and the upstream. Off
+unless `XHC_TIER2` is set; unset, every tier code path is skipped.
+
+- **Read-through.** On a local miss, Muninn reads the bucket **before** the Hub
+  or the registry. That covers OCI blobs, OCI manifests requested by digest, and
+  Hugging Face files whose ETag is a sha256 (LFS and Xet files, which is every
+  weight file). A fresh disk refills from the bucket, and the upstream is spared
+  the request. The Hub is still asked for metadata (the `HEAD` on every miss),
+  because that is where the expected hash comes from.
+- **Write-back.** After an ingest reaches `done` (verified, when
+  `XHC_HF_VERIFY` is on), and after an OCI blob's digest has matched and it is
+  renamed into place, the content is copied to the bucket in the background.
+  Nothing is ever uploaded from `verifying`, from `error`, or from a partial
+  file. Uploads never block serving and never hold an ingest slot.
+- **Fails open.** The tier is an accelerator and an archive, never the
+  authority. An outage, a 5xx, a 401 or a verification failure falls through to
+  the upstream. A 401 also disables the tier until the next probe (every 60 s).
+
+What goes in the bucket, under your prefix. The retention class (`content`,
+`index`) comes **before** the tenant, so a prefix-only lifecycle rule (B2 has no
+other kind) can target one without the other:
+
+```
+<prefix>/v1/content/hf/<hf-host>/<repo_type>s/<org>/<name>/sha256/<etag>
+<prefix>/v1/content/oci/<upstream>/blobs/sha256/<ab>/<hex>
+<prefix>/v1/content/oci/<upstream>/manifests/sha256/<ab>/<hex>      verbatim bytes; media type as Content-Type
+<prefix>/v1/index/hf/<hf-host>/<repo_type>s/<org>/<name>/commits/<commit>/<quoted-path>.json   {etag,size,sig}
+<prefix>/v1/index/hf/<hf-host>/<repo_type>s/<org>/<name>/refs/<quoted-ref>/<observed_at>-<commit>
+<prefix>/v1/index/oci/<upstream>/tags/<repo>/<tag>/<observed_at>-<digest>
+<prefix>/v1/_probe/<hostname>
+```
+
+Hugging Face content is keyed per repo, so one repo can be deleted by deleting
+one prefix. OCI content is keyed per upstream, because layers are shared
+heavily across repos.
+
+### Trust: content versus mappings
+
+- **Content is verified on every read from the tier, unconditionally.** A blob
+  is named by its own hash, and the value it is checked against comes from the
+  request: the Hub's `HEAD`, or the digest in the URL. It never comes from the
+  bucket. So a bucket can withhold content but cannot forge it. This does not
+  depend on `XHC_HF_VERIFY`, which is a choice about bytes from the Hub.
+- **Mappings are not content.** A revision → commit → file → ETag chain, or a
+  tag → digest, is only as trustworthy as whoever can write the bucket, and on
+  R2 a token scopes to a whole bucket, never to a prefix. So index objects are
+  signed with `XHC_TIER2_INDEX_KEY`, an HMAC key from **your configuration**,
+  never stored in the bucket. The signature also covers the observation time,
+  so an old signed observation cannot be replayed under a newer name. With no
+  key, **no index is written at all.**
+- **On a mismatch** the bytes are discarded and nothing is linked;
+  `muninn_tier_verify_total{result="mismatch"}` counts it and the key is logged
+  and listed under `tier.bad_keys` on `/_cache/status`. That key is not read
+  again by this process, so the request (or its retry) goes to the upstream.
+  The object is **not** deleted from the bucket. Go and look at it.
+
+### Read modes: `verify-first` (default) and `stream`
+
+A Hugging Face client in cache mode does not hash what it receives. A wrong
+object of the right length, streamed to it, would be accepted in full, because
+the mismatch is only knowable after the last byte.
+
+- **`verify-first`** hashes the bytes as they land, in a file no reader follows,
+  and renames them into place only on a match. Clients wait for that, as they
+  do under `XHC_MISS_POLICY=wait`. Their first byte arrives after the object's
+  last. The response says `x-xhc-cache: TIER-HIT`. If the tier's bytes failed
+  verification and the job fell through to the upstream, it says `MISS-WAIT`
+  (Hugging Face) or `MISS` (OCI).
+- **`stream`** serves tier bytes as they arrive, **before they are verified**,
+  and says `x-xhc-cache: TIER-STREAM`. A mismatch ends the ingest in error, and
+  a client that has already read every byte keeps them. Defensible for OCI,
+  whose clients check the digest themselves. Not defensible for Hugging Face.
+
+There is **one hash pass** in each direction. A tier read never fetches and then
+re-reads the file to hash it. A tier-verified Hugging Face blob is not hashed
+again by `XHC_HF_VERIFY`, because that would be a second full read of a file
+already checked. A write-back reads each byte of the local file once. It hashes
+that byte in the same pass and sends it.
+
+### Write-back details
+
+- **Every upload re-verifies what it sends.** If the local bytes no longer hash
+  to their name (disk rot, a stray write), the upload is refused and counted as
+  `verify_mismatch`. So a blob reaches the tier only if its bytes hash to its
+  name, whatever `XHC_HF_VERIFY` is set to.
+- **Single PUT** (object ≤ `XHC_TIER2_PART_SIZE`). The file is read once into
+  memory and hashed once. The name is sent as SigV4's `x-amz-content-sha256`,
+  so a store that checks it refuses a body that does not match. The
+  `x-amz-checksum-sha256` header is also sent when `XHC_TIER2_CHECKSUM_HEADER`
+  is on.
+- **Multipart** (larger objects). Each part is read once, folded into the
+  whole-object hash, and sent from memory. A part that fails in transit is
+  re-sent from that buffer rather than re-read. `CompleteMultipartUpload` is
+  called only after the whole-object hash has matched. On a mismatch or failure
+  the upload is aborted and no object appears. Memory per upload is one part.
+- **HEAD before PUT.** An object already in the bucket, from another instance
+  or an earlier run, is skipped (`skipped_exists`).
+- **The queue is in memory, and the bucket is the durable record.** A
+  reconciler runs at startup and every `XHC_TIER2_RECONCILE_INTERVAL`. It LISTs
+  the content prefix, compares it with what is on local disk, and enqueues the
+  difference. With an index key it also backfills the index for local
+  snapshots and refs. A restart therefore loses nothing but time. Overflow past
+  `XHC_TIER2_QUEUE_MAX` is dropped, counted as `dropped_queue_full`, and picked
+  up by the next reconcile.
+- **Evicted before upload:** the item is dropped (`skipped_evicted`). Eviction
+  never waits for uploads, and local eviction and GC never touch the tier.
+- **Add an abort-incomplete-multipart lifecycle rule.** An interrupted
+  multipart upload leaves parts that are billed. That rule is **not** a
+  retention rule and deletes no object.
+
+### Retention: read this before adding a lifecycle rule
+
+1. **The tier grows without bound.** Muninn never deletes from it.
+2. Its size is `muninn_tier_objects` / `muninn_tier_bytes` (LIST-derived, at
+   each reconcile).
+3. **A lifecycle rule on `v1/content/` expires by upload age, not by use.**
+   Write-back skips objects that already exist, so a model pulled every day
+   ages out exactly like one never read again.
+4. A rule whose prefix covers `v1/index/` removes the mappings, and the content
+   they point to then cannot be restored once the upstream has deleted it.
+
+### What phase 1 does, and does not do
+
+| does | does not |
+|---|---|
+| read-through for OCI blobs, OCI manifests by digest, and HF files with a sha256 ETag | serve anything from the tier when the **upstream is unreachable for metadata**. A Hugging Face miss still needs the Hub's `HEAD`, and a tag still needs the registry |
+| write-back after `done`, with the upload-time hash | read or restore from the **index**, which is written but never read. A model deleted upstream does **not** survive through the tier yet |
+| write the signed index (with `XHC_TIER2_INDEX_KEY`) | tier small, non-LFS Hugging Face files (`config.json`, tokenizers), which are keyed by git blob id. A model restored without its `config.json` is not a model, so that is the next phase's first job |
+| verify every tier read | read from the tier during a **prewarm** (`snapshot_download` fetches from the Hub). Prewarmed files are written back like any other |
+| static keys, and a GKE metadata-server token for GCS | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
+| | parallel ranged reads from the tier: one stream per object |
+| | delete anything from the tier, ever |
+
+Nothing here is a claim about speed. Whether the tier is faster than the Hub for
+your bucket, region and object sizes has not been measured. Measure a
+single-stream GET from your bucket against a Hub fetch before relying on it.
+It pays for itself mainly as survival (in a later phase) and as relief from
+upstream rate limits. Cross-region or cross-cloud buckets also pay egress per
+byte.
+
+### Stores and credentials
+
+The client is a small SigV4 client on `httpx`, with no new dependency. It
+**never makes a bucket-level call** (no CreateBucket, HeadBucket or
+ListBuckets). A token scoped to one bucket fails those by design. Required
+permissions under the prefix: get, put, list (`s3:ListBucket`), and the
+multipart calls, including abort. It needs no delete permission.
+
+- **Static keys** (`XHC_TIER2_CREDENTIALS=static`, the default for `s3://`):
+  AWS, Cloudflare R2, MinIO, Backblaze B2, and GCS through HMAC interop keys.
+  Keys come from `XHC_TIER2_ACCESS_KEY_ID` / `XHC_TIER2_SECRET_ACCESS_KEY`, or
+  from `XHC_TIER2_ACCESS_KEY_ID_FILE` / `XHC_TIER2_SECRET_ACCESS_KEY_FILE` for a
+  mounted Kubernetes Secret. Setting both forms of one is refused. **The
+  standard `AWS_*` variables are never read**, so an ambient credential meant
+  for something else cannot silently become the tier's.
+- **GKE Workload Identity** (`XHC_TIER2_CREDENTIALS=gcp-metadata`, the default
+  for `gs://`): a bearer token from the metadata server, refreshed before it
+  expires, against the GCS XML API at `storage.googleapis.com`.
+
+**The startup probe** PUTs and GETs `v1/_probe/<hostname>` and compares the
+bytes. It then GETs a key that must be absent and **refuses to call the tier
+healthy unless that returns 404**. Without list permission S3 answers 403 for a
+missing key, and every tier miss would then read as an auth failure. The probe
+runs in the background, so a bucket that is down at boot delays nothing. The
+result is in the `tier` block of `/_cache/status`, which also shows the last
+error, the queue depth, the keys marked bad and the last reconcile.
+
+**What has been tested against a real server:** MinIO only (`pytest -m minio`,
+and a CI job). That covers SigV4, the payload hash, `x-amz-checksum-sha256`,
+multipart, ListObjectsV2 pagination and the probe's 404. It verifies **nothing**
+about R2, GCS, B2 or AWS themselves. **Not yet verified on the real services:**
+
+- GCS XML API accepting the metadata server's bearer token.
+- GCS answering ListObjectsV2 and the multipart calls.
+- `x-amz-checksum-sha256` on R2. It is off by default for `gs://`. If the probe
+  reports a 400 on its PUT, set `XHC_TIER2_CHECKSUM_HEADER=false`.
+- R2's single-PUT size limit.
+- 403-versus-404 for a missing key on R2 and GCS. The probe checks this against
+  your bucket at every start, so a wrong assumption shows up as an unhealthy
+  tier and not as silent misbehaviour.
+
+### Several instances, one bucket
+
+Supported, with the same `XHC_TIER2` prefix. Content is immutable and
+content-addressed, so concurrent PUTs write identical bytes. Index objects are
+immutable (commits) or append-only (one object per ref or tag observation), so
+nothing needs a lock. The cost of sharing: one instance's credential can write
+mappings that every instance would trust in a later phase. It cannot poison
+content. That is why the index is signed with a key the bucket does not hold.
+
+### Tier configuration
+
+| variable | default | meaning |
+|---|---|---|
+| `XHC_TIER2` | *(unset: off)* | `s3://bucket/prefix` or `gs://bucket/prefix` |
+| `XHC_TIER2_ENDPOINT` | derived | `scheme://host[:port]` for R2 (`https://<account>.r2.cloudflarestorage.com`), MinIO, B2 and similar. Path-style addressing when set. Unset: AWS (virtual-hosted) for `s3://`, `https://storage.googleapis.com` for `gs://` |
+| `XHC_TIER2_REGION` | `auto` | SigV4 signing region. With the AWS default endpoint, `auto` signs as `us-east-1`; set the bucket's region for AWS |
+| `XHC_TIER2_CREDENTIALS` | `static` (s3), `gcp-metadata` (gs) | `static` \| `gcp-metadata` |
+| `XHC_TIER2_ACCESS_KEY_ID[_FILE]` | — | static key id, or a file holding it |
+| `XHC_TIER2_SECRET_ACCESS_KEY[_FILE]` | — | static secret, or a file holding it |
+| `XHC_TIER2_READ` / `XHC_TIER2_WRITE` | `true` / `true` | a read-only replica, or a write-only seeding instance |
+| `XHC_TIER2_READ_MODE` | `verify-first` | `verify-first` \| `stream`. `stream` serves unverified bytes; see above |
+| `XHC_TIER2_MIN_SIZE` | `0` | skip the tier for smaller Hugging Face files, and don't write back OCI blobs smaller than this. OCI blob reads cannot apply it, because their size is unknown before the request. Manifests are exempt |
+| `XHC_TIER2_PART_SIZE` | `64M` | single PUT up to this size, multipart above it. Minimum `5M` (S3's floor). Also the memory one upload holds |
+| `XHC_TIER2_UPLOAD_CONCURRENCY` | `2` | concurrent uploads |
+| `XHC_TIER2_QUEUE_MAX` | `10000` | in-memory upload queue bound; the reconciler covers overflow |
+| `XHC_TIER2_RECONCILE_INTERVAL` | `21600` | seconds between reconciles (and one at startup); `0` disables, and the queue is then best-effort |
+| `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects. Unset: **no index is written** |
+| `XHC_TIER2_CHECKSUM_HEADER` | `true` (s3), `false` (gs) | also send `x-amz-checksum-sha256` on single PUTs |
+
+Tier metrics: `muninn_tier_requests_total{proto,kind,result=hit|miss|error|refused}`,
+`muninn_tier_verify_total{result=verified|mismatch}`,
+`muninn_tier_upload_total{result=ok|failed|skipped_exists|skipped_evicted|verify_mismatch|dropped_queue_full}`,
+`muninn_tier_index_writes_total{result=ok|failed|skipped_exists}`,
+`muninn_tier_bytes_read_total` and `muninn_tier_bytes_written_total` (body
+bytes only; a HEAD is never counted), and the gauges `muninn_tier_healthy`,
+`muninn_tier_upload_queue_depth`, `muninn_tier_objects`, `muninn_tier_bytes`
+and `muninn_tier_last_reconcile_timestamp`. Tier bytes are never added to
+`muninn_bytes_ingested_total` or the docker ingest counter.
+
 ## Management API
 
 > **Deleting a tag frees exactly its own layers.** Eviction is top-down: dropping the tag
@@ -2184,6 +2413,7 @@ choosing it.
 | `XHC_SYNTHESIZE_REPO_INFO` | `1` | rebuild repo/tree listings from cache when upstream 404s |
 | `XHC_REF_TTL` | `300` | seconds a ref→commit mapping is trusted; `0` never revalidates |
 | `XHC_UPSTREAM` | `https://huggingface.co` | the Hub this cache fetches from |
+| `XHC_TIER2` | *(unset)* | an S3-compatible bucket as a second tier. Its own settings are in [Tier configuration](#tier-configuration). **Muninn never deletes from it** |
 | `XHC_HOST` | `0.0.0.0` | bind address |
 | `XHC_PORT` | `8080` | bind port |
 | `XHC_REQUEST_TIMEOUT` | `60` | seconds before an upstream request is abandoned |

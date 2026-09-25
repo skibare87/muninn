@@ -51,6 +51,8 @@ def test_enumerated_settings_document_their_accepted_values():
         "XHC_DOCKER_POLICY": ["open", "allowlist"],
         "XHC_ORPHAN_POLICY": ["retain", "evict"],
         "XHC_HF_RULES": ["enforce", "off"],
+        "XHC_TIER2_READ_MODE": ["verify-first", "stream"],
+        "XHC_TIER2_CREDENTIALS": ["static", "gcp-metadata"],
     }.items():
         assert knob in readme, f"{knob} is not in the README at all"
         for v in values:

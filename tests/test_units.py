@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("HF_HUB_CACHE", "/tmp/xhc-test-cache")
 
 from app.cachefs import repo_folder_name, repo_key
-from app.config import parse_size
+from app.config import TierSettings, parse_size
 from app.hfcompat import is_xet_token_path, parse_resolve
 from app.jwtconfig import IssuerConfig
 from app.serving import parse_range
@@ -724,6 +724,19 @@ ENV_GROUPS = [
         },
         {"jwt_issuers": (IssuerConfig(issuer="https://k8s.example", audiences=("muninn",),
                                       subject_template="k8s:{sub}"),)},
+    ),
+    (
+        {
+            "XHC_TIER2": "s3://bucket/some/prefix/",
+            "XHC_TIER2_ENDPOINT": "https://objects.example",
+            "XHC_TIER2_ACCESS_KEY_ID": "id",
+            "XHC_TIER2_SECRET_ACCESS_KEY": "secret",
+        },
+        {"tier": TierSettings(
+            scheme="s3", bucket="bucket", prefix="some/prefix",
+            endpoint="https://objects.example", region="auto", path_style=True,
+            credentials="static", access_key_id="id", secret_access_key="secret",
+        )},
     ),
 ]
 
