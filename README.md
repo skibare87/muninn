@@ -35,17 +35,21 @@ re-pull is a LAN-speed stream from the array.
 ## Quick start
 
 A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published, so the
-NAS does not need a toolchain:
+NAS does not need a toolchain. `<version>` below is a placeholder, not a
+typo: take the newest `X.Y.Z` from [CHANGELOG.md](CHANGELOG.md) or the
+[tags](https://github.com/skibare87/muninn/tags). This README deliberately names
+no current release, because a number written here goes stale with the next one
+and nothing would tell you.
 
 ```bash
-docker pull ghcr.io/skibare87/muninn:0.6.0
+docker pull ghcr.io/skibare87/muninn:<version>
 
 docker run -d --name muninn -p 8080:8080 \
   -v /mnt/nvme/hf-cache:/cache \
   -v /var/lib/muninn/xet:/xet \
   -e HF_TOKEN=hf_xxx \
   -e XHC_CACHE_MAX_SIZE=70T \
-  ghcr.io/skibare87/muninn:0.6.0
+  ghcr.io/skibare87/muninn:<version>
 ```
 
 Or from source, which is also how you get the compose file's full env set:
@@ -58,7 +62,7 @@ curl -s localhost:8080/_cache/status | jq
 
 To run the published image under compose instead of building, replace the
 `build: .` line in `docker-compose.yml` with
-`image: ghcr.io/skibare87/muninn:0.6.0`.
+`image: ghcr.io/skibare87/muninn:<version>`.
 
 Release notes for every version are in [CHANGELOG.md](CHANGELOG.md) and on the
 [Releases page](https://github.com/skibare87/muninn/releases). Both are rendered
@@ -70,8 +74,8 @@ GitHub Actions on every version tag:
 
 | tag | meaning |
 |---|---|
-| `0.6.0` | immutable — **pin this on a fleet** |
-| `0.6` | latest patch in the 0.6 line; **moves** |
+| `X.Y.Z` | immutable — **pin this on a fleet** |
+| `X.Y` | latest patch in that minor line; **moves** |
 | `latest` | most recent tagged release; **moves** |
 | `edge` | tracks `main`; expect breakage |
 
@@ -80,8 +84,9 @@ patch re-points it, as `v0.5.1` did to `0.5` and `v0.5.2` did again an hour
 later. `latest`, `X.Y` and `edge` all give every node whatever was pushed last,
 with nothing to roll back to when a push goes wrong.
 
-For a deployment you genuinely cannot have move under you, pin the **manifest
-digest of the image you actually deployed**:
+For a deployment you genuinely cannot have move under you, pull the `X.Y.Z` you
+chose once, then pin the **manifest digest of the image you actually
+deployed**:
 
 ```
 ghcr.io/skibare87/muninn@sha256:<digest you pulled>

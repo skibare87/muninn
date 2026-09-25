@@ -243,3 +243,15 @@ def test_every_shipped_page_is_named_in_the_readme():
         urls.add("/" if rel == "." else f"/{rel}")
     missing = sorted(u for u in urls if u != "/" and u not in readme)
     assert not missing, f"pages shipped but never named in the README: {missing}"
+
+
+def test_the_readme_pins_no_concrete_release_of_this_image():
+    """A version written into install instructions is a pin nothing validates.
+
+    The quick start named one release for three minor versions after it stopped
+    being current, and nothing went red. Show the FORM (`muninn:<version>`) and
+    send the reader to the changelog or the tags for the value.
+    """
+    readme = (ROOT / "README.md").read_text()
+    pinned = re.findall(r"muninn:\d+\.\d+(?:\.\d+)?\b", readme)
+    assert not pinned, f"the README hard-codes a release of the image: {pinned}"
