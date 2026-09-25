@@ -174,3 +174,67 @@ def decide(key: Key | None, operation: Operation, reference: str) -> tuple[bool,
         return False, (f"key {key.key_id} is scoped away from {operation} on "
                        f"{reference}, which its holder is otherwise allowed")
     return False, f"key {key.key_id} has no rule granting {operation} on {reference}"
+
+
+# ---------------------------------------------------------------------------
+# RULE TEXT. One rule per line: `<pattern> [pull|push|pull+push]`, verbs
+# defaulting to pull. This is the syntax the console's allowlist and scope
+# fields accept, and until headless provisioning existed it was parsed ONLY in
+# the browser -- the server took structured JSON. The CLI and /_cache/authz
+# both need text, so the grammar lives here, once, and both call it.
+# ---------------------------------------------------------------------------
+
+_VERBS = {
+    "": (True, False),
+    "pull": (True, False),
+    "push": (False, True),
+    "pull+push": (True, True),
+    "push+pull": (True, True),
+}
+MAX_PATTERN_LEN = 512
+
+
+class RuleSyntaxError(ValueError):
+    """A rule line that does not parse. The message names the line."""
+
+
+def parse_rule(line: str) -> Rule:
+    """Parse one rule line. Raises RuleSyntaxError rather than defaulting.
+
+    A typo that quietly narrows a grant is a support ticket; one that quietly
+    WIDENS it is an incident, and defaulting an unknown verb is how you get the
+    second. Same refusal the console makes, for the same reason.
+    """
+    parts = line.split()
+    if not parts:
+        raise RuleSyntaxError(f"empty rule {line!r}")
+    verbs = parts[1].lower() if len(parts) > 1 else ""
+    if len(parts) > 2 or verbs not in _VERBS:
+        raise RuleSyntaxError(
+            f"could not parse rule {line!r}: use '<pattern> pull|push|pull+push'"
+        )
+    if len(parts[0]) > MAX_PATTERN_LEN:
+        raise RuleSyntaxError(f"rule pattern longer than {MAX_PATTERN_LEN} characters")
+    pull, push = _VERBS[verbs]
+    return Rule(parts[0], pull=pull, push=push)
+
+
+def parse_rules(lines: list[str]) -> list[Rule]:
+    """Parse every line, skipping blank ones, or raise on the first bad one.
+
+    All-or-nothing: the caller gets a complete list or an exception, never a
+    prefix -- a partially applied allowlist is neither the old grant nor the
+    new one.
+    """
+    return [parse_rule(line) for line in lines if line.strip()]
+
+
+def normalise_scope(rules: list[Rule]) -> list[Rule]:
+    """A key scope containing `*` is NO LIMIT, and is stored as no limit.
+
+    That is what everyone reads it as. It is not an escalation: a key is
+    bounded by its holder's allowlist regardless, so the widest a scope can
+    reach is what that holder already has. An earlier version refused it,
+    which stopped a legitimate edit and protected nothing.
+    """
+    return [] if any(r.pattern == "*" for r in rules) else rules
