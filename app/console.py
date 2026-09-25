@@ -218,6 +218,15 @@ async def set_user_admin(
     request: Request, subject: str, is_admin: bool = Body(..., embed=True)
 ) -> dict:
     webauth.require_admin(request)
+    if webauth.admin_from_idp():
+        # Refused rather than accepted: the target's next login recomputes
+        # admin from the provider and would silently undo this -- a 200 that
+        # reverts itself is worse than a refusal that says where to go.
+        raise HTTPException(
+            status_code=409,
+            detail="admin is decided by the identity provider "
+            "(XHC_OIDC_ADMIN_CLAIM); grant or revoke the role there",
+        )
     try:
         # The store refuses to remove the last admin. That check lives there
         # rather than here because it is a property of the data, and a second

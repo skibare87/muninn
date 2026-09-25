@@ -149,6 +149,23 @@ def delete_principal(store: AuthzStore, subject: str) -> None:
         raise Conflict(str(exc)) from exc
 
 
+def set_admin(store: AuthzStore, subject: str, is_admin: bool) -> dict:
+    """Grant or revoke admin. Revoking the last admin is refused by the store.
+
+    The recovery path when an instance has no admin, and it needs no login and
+    no restart: the server re-reads the principal on every console request.
+    With XHC_OIDC_ADMIN_CLAIM set, the principal's next login recomputes the
+    flag from the provider, so this lasts until then.
+    """
+    try:
+        store.set_admin(subject, is_admin)
+    except KeyError as exc:
+        raise NotFound(f"no such principal: {subject}") from exc
+    except ValueError as exc:  # the last-admin refusal, worded by the store
+        raise Conflict(str(exc)) from exc
+    return principal_out(store, _require_principal(store, subject))
+
+
 def set_rules(store: AuthzStore, subject: str, lines: list[str]) -> list[dict]:
     """Replace a principal's grant. Parsed in full before anything is written."""
     rules = _parse(lines)

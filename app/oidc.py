@@ -42,7 +42,8 @@ import hashlib
 import logging
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 import jwt
@@ -69,6 +70,52 @@ class Identity:
     subject: str
     email: str = ""
     name: str = ""
+    # The verified id_token's full claim set, for XHC_OIDC_ADMIN_CLAIM. Kept
+    # out of repr and equality: it can carry personal data, and an Identity is
+    # the kind of object that ends up in a log line.
+    claims: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+# Sentinel for "the claim is not there", distinct from a claim that is present
+# and null -- the second is the provider saying something, the first is the
+# provider (or a claim-name typo) saying nothing, and only the first is worth
+# a diagnostic.
+ABSENT: Any = object()
+
+
+def claim_at(claims: dict[str, Any], path: str) -> Any:
+    """The value of `path` in `claims`, or ABSENT.
+
+    The WHOLE name is tried first as a top-level key, and only then as a dotted
+    path. Namespaced custom claims are URLs (`https://example.com/roles`), so
+    they contain dots, and splitting one would look for a claim that was never
+    issued. If a token carries both a top-level `a.b` and a nested a -> b, the
+    top-level one wins: it is the one whose name the operator typed verbatim.
+    """
+    if path in claims:
+        return claims[path]
+    node: Any = claims
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return ABSENT
+        node = node[part]
+    return node
+
+
+def claim_grants(value: Any, wanted: str) -> bool:
+    """Exact match against a string claim, or against one element of a list.
+
+    Exact: no prefix, no substring, no case-folding. `admins-readonly` is not
+    `admins`, and a match that treated it as one would grant admin to a group
+    whose name was chosen precisely to say it is not. Any other type -- a
+    boolean, a number, an object -- grants nothing, rather than being coerced
+    to a string that happens to equal the configured value.
+    """
+    if isinstance(value, str):
+        return value == wanted
+    if isinstance(value, list):
+        return any(isinstance(v, str) and v == wanted for v in value)
+    return False
 
 
 class OIDCError(Exception):
@@ -301,4 +348,5 @@ class OIDCClient:
             subject=subject,
             email=claims.get("email", "") or "",
             name=claims.get("name", "") or "",
+            claims=dict(claims),
         )

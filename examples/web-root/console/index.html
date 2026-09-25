@@ -380,10 +380,14 @@
       card.appendChild(el('p', u.key_count + ' key(s) · ' + u.subject, 'muted'));
       card.appendChild(ruleEditor(u));
       var row = el('div', null, 'row');
-      row.appendChild(btn(u.is_admin ? 'Revoke admin' : 'Make admin', 'ghost', function () {
-        api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/admin',
-            { is_admin: !u.is_admin }).then(loadUsers).then(loadMe).catch(showError);
-      }));
+      // Not offered when the identity provider decides admin: the server
+      // refuses it, because the user's next login would undo it.
+      if (!(me && me.admin_from_idp)) {
+        row.appendChild(btn(u.is_admin ? 'Revoke admin' : 'Make admin', 'ghost', function () {
+          api('POST', '/_console/users/' + encodeURIComponent(u.subject) + '/admin',
+              { is_admin: !u.is_admin }).then(loadUsers).then(loadMe).catch(showError);
+        }));
+      }
       row.appendChild(btn('Delete user', 'danger', function () {
         if (!confirm('Delete ' + (u.email || u.subject) +
             '?\n\nTheir keys and allowlist go with them. This cannot be undone.')) return;
