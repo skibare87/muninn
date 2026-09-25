@@ -195,14 +195,15 @@ These are measurements from one deployment, not guarantees. They were taken with
   60% of the throughput in one measurement. The README calls disabling Xet on the cache the
   single-stream failure mode, so treat this as a trade-off to measure, not a default.
 
-Hence the memory limit is **>= 2.5 GiB × `XHC_INGEST_CONCURRENCY`, plus headroom**. The
-example uses 2 × 2.5 + 1 = 6 GiB, with the request equal to the limit.
+**The figure is per file in flight, and it climbs across a snapshot.** A four-file 15 GB
+snapshot peaked at about 3.0 GiB with one file in flight and 4.4 GiB with eight.
+`XHC_INGEST_CONCURRENCY` bounds jobs; `XHC_SNAPSHOT_MAX_WORKERS` (default 1) bounds files
+within one snapshot job, and the two multiply.
 
-**`XHC_INGEST_CONCURRENCY` counts jobs, not files.** A prewarm is one job, but it downloads
-up to 8 files at once (`snapshot_download(max_workers=8)` in `app/jobs.py`). No one has
-measured whether the figure above is per file or per job. If it is per file, a single
-prewarm of a many-shard repo can use several times the limit. Watch `kubectl top pod`
-during the first large prewarm before you trust the limit.
+Hence the memory limit is **>= 3 GiB × `XHC_INGEST_CONCURRENCY` at one file in flight,
+plus headroom**. The example uses 2 × 3 + 1 = 7 GiB, with the request equal to the limit.
+Muninn logs a warning at startup when the cgroup limit looks too small for its settings.
+See "Sizing memory for ingest" in the top-level README for every measurement.
 
 ### Probes
 

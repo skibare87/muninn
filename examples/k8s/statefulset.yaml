@@ -236,20 +236,18 @@ spec:
           #   - with HF_HUB_DISABLE_XET=1 on the cache: about 50 MiB, at roughly
           #     60% of the throughput in one measurement -- and see the warning
           #     in `env` about what disabling Xet on the cache costs.
-          # Hence: limit >= 2.5 GiB x XHC_INGEST_CONCURRENCY, plus headroom for
-          # the server and page cache. 2 x 2.5 GiB + 1 GiB = 6 GiB here.
-          #
-          # CAVEAT, from the code rather than a measurement: XHC_INGEST_CONCURRENCY
-          # bounds JOBS. A prewarm is one job, but it downloads up to 8 files at
-          # once (snapshot_download max_workers=8). Whether the peak above is per
-          # file or per job was not measured; if it is per file, one prewarm of a
-          # many-shard repo can need several times this. Watch the first large
-          # prewarm (kubectl top pod) before trusting the limit.
+          # The figure is per FILE IN FLIGHT and climbs across a snapshot: a
+          # four-file 15 GB snapshot peaked ~3.0 GiB with one file in flight,
+          # ~4.4 GiB with eight. XHC_INGEST_CONCURRENCY bounds jobs;
+          # XHC_SNAPSHOT_MAX_WORKERS (default 1) bounds files within a job, and
+          # they multiply. Hence: limit >= 3 GiB x XHC_INGEST_CONCURRENCY at one
+          # file in flight, plus headroom. 2 x 3 GiB + 1 GiB = 7 GiB here.
+          # Muninn warns at startup if the cgroup limit looks too small.
           # Request = limit for memory, so the scheduler reserves what an ingest
           # will actually use and an OOM-kill is a limit, not node pressure.
           resources:
-            requests: { cpu: "2", memory: 6Gi }
-            limits: { memory: 6Gi }
+            requests: { cpu: "2", memory: 7Gi }
+            limits: { memory: 7Gi }
 
           securityContext:
             allowPrivilegeEscalation: false

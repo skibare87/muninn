@@ -119,7 +119,7 @@ def verify_ingested(path: Path) -> str:
 #                     \-------+-------> error
 #   pending | running | verifying  --(process restart)-->  interrupted
 #
-# `verifying` is entered only when XHC_HF_VERIFY_INGEST is on: the bytes have
+# `verifying` is entered only when XHC_HF_VERIFY is on: the bytes have
 # landed and are being hashed against their ETags. `done` is set ONLY after
 # verification passes, and in the same step as finished_at, so a client gating
 # on done never sees a file whose check is still running -- or a done job with
