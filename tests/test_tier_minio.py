@@ -292,3 +292,32 @@ def test_list_follows_continuation_tokens_and_reconcile_sizes_the_tier(live):
     assert paged == [f"{tier._base()}/content/x/{i}" for i in range(5)]
     assert summary["ok"], summary
     assert summary["tier_objects"] == 5 and summary["tier_bytes"] == sum(range(5))
+
+
+def test_index_entries_keep_their_auth_marker_on_a_real_server(live, monkeypatch):
+    """The signed/unsigned marker lives in the object: a JSON field for a commit
+    entry, user metadata for a ref. Read both back from MinIO."""
+    from dataclasses import replace
+
+    async def scenario():
+        out = {}
+        for key_set in (True, False):
+            monkeypatch.setattr(settings, "tier",
+                                replace(settings.tier, index_key=b"i" * 32 if key_set else None))
+            ref = tier._hf_ref_index("model", "acme/w", "main", "d" * 40, time.time())
+            commit = tier._hf_commit_index("model", "acme/w", "d" * 40,
+                                           f"f-{key_set}.json", "e" * 64, 3)
+            await tier.process(ref)
+            await tier.process(commit)
+            head = await tier._s.client.head(ref.key)
+            body = (await tier._s.client.get_bytes(commit.key)).json()
+            out[key_set] = (head.headers.get("x-amz-meta-auth"),
+                            head.headers.get("x-amz-meta-sig"), body)
+        return out
+
+    out = _run(scenario())
+    auth, sig, body = out[True]
+    assert auth == tier.AUTH_SIGNED and sig and body["auth"] == tier.AUTH_SIGNED and body["sig"]
+    auth, sig, body = out[False]
+    assert auth == tier.AUTH_UNSIGNED and sig is None
+    assert body["auth"] == tier.AUTH_UNSIGNED and "sig" not in body
