@@ -50,6 +50,19 @@ class ScopeIn(BaseModel):
     rules: list[RuleIn]
 
 
+def _checked(rules: list[RuleIn]) -> list[authz.Rule]:
+    """Structured rules, refused on the same grounds as rule text.
+
+    The console submits rules already split into fields, so it never reaches
+    authz.parse_rule. Without this, `hf/... push` would be refused by the CLI and
+    the API and silently stored by the console.
+    """
+    try:
+        return [authz.check_rule(authz.Rule(r.pattern, r.pull, r.push)) for r in rules]
+    except authz.RuleSyntaxError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _store():
     st = dockerauth.store()
     if st is None:
@@ -146,9 +159,7 @@ async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
     key = _owned_key(request, key_id)
     # "*" means NO LIMIT and is stored as no limit; the reasoning lives with
     # normalise_scope, which the headless provisioning path shares.
-    parsed = authz.normalise_scope(
-        [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
-    )
+    parsed = authz.normalise_scope(_checked(body.rules))
     _store().set_key_scope(key.key_id, parsed)
     log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))
     return {"key_id": key.key_id, "scope": [_rule_out(r) for r in parsed]}
@@ -193,7 +204,7 @@ async def set_user_allowlist(
     spelled out rather than implied, so nobody reaches it by leaving a field
     blank."""
     webauth.require_admin(request)
-    parsed = [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
+    parsed = _checked(body.rules)
     try:
         _store().set_principal_rules(subject, parsed)
     except KeyError as exc:

@@ -639,6 +639,7 @@ ENV_TO_SETTING = [
     # `key` needs XHC_AUTHZ_DB, so only `none` is valid alone here;
     # the gated case is exercised in test_hf_auth.py.
     ("XHC_HF_AUTH", "none", "hf_auth", "none"),
+    ("XHC_HF_RULES", "off", "hf_rules", "off"),
     ("XHC_DOCS", "0", "docs_enabled", False),
     # --- docker / OCI (0.5.0) ---
     ("XHC_DOCKER_ENABLED", "0", "docker_enabled", False),

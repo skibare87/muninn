@@ -177,8 +177,52 @@ def decide(key: Key | None, operation: Operation, reference: str) -> tuple[bool,
 
 
 # ---------------------------------------------------------------------------
+# THE HUGGING FACE NAMESPACE. Rules match HF repositories as
+#
+#     hf/models/<org>/<name>     hf/datasets/<org>/<name>     hf/spaces/<org>/<name>
+#
+# (or `hf/models/<name>` for a canonical id with no org, such as `gpt2`).
+#
+# WHY A PREFIX, AND WHY THIS ONE. A rule is one flat pattern space shared by
+# both surfaces, so an HF reference must be something no registry reference can
+# ever be. A registry reference always begins with a HOST -- a segment with a dot
+# or a port, `localhost`, or the default upstream -- and `hf` is none of those,
+# so `docker.io/*` can never match an HF repo and `hf/*` can never match an
+# image. XHC_ALLOW_REPOS's bare `models/...` form would also be unambiguous
+# today, but `hf/` says which surface it is about to someone reading an
+# allowlist, and the README had already told people `hf/...` was the form that
+# did NOT work -- so it is the form they will reach for.
+#
+# Matching is exactly the registry's: `*` spans `/`, case-insensitive, allow-only.
+# So a bare `*` still covers everything, HF included, and `hf/*` is the whole HF
+# surface.
+#
+# Two references that name no single repository, used by hfauthz for paths that
+# do not name one:
+#
+#   hf/<type>s/   a listing or search over a whole repo type. Matched by `*`,
+#                 `hf/*` and `hf/models/*`, and by nothing narrower.
+#   hf/           a path naming no repository at all (whoami, collections, ...).
+#                 Matched by `*` and `hf/*` only.
+#
+# Both work because `*` matches the empty string; neither needs a special case
+# in the matcher, which is the point.
+# ---------------------------------------------------------------------------
+
+HF_PREFIX = "hf/"
+HF_REPO_TYPES = ("model", "dataset", "space")
+
+
+def hf_reference(repo_type: str, repo_id: str = "") -> str:
+    """The rule reference for an HF repo, or for its whole type when repo_id is ''."""
+    if repo_type not in HF_REPO_TYPES:
+        raise ValueError(f"unknown Hugging Face repo type {repo_type!r}")
+    return f"{HF_PREFIX}{repo_type}s/{repo_id}"
+
+
+# ---------------------------------------------------------------------------
 # RULE TEXT. One rule per line: `<pattern> [pull|push|pull+push]`, verbs
-# defaulting to pull. This is the syntax the console's allowlist and scope
+# defaulting to pull. An `hf/` pattern takes `pull` only. This is the syntax the console's allowlist and scope
 # fields accept, and until headless provisioning existed it was parsed ONLY in
 # the browser -- the server took structured JSON. The CLI and /_cache/authz
 # both need text, so the grammar lives here, once, and both call it.
@@ -216,7 +260,26 @@ def parse_rule(line: str) -> Rule:
     if len(parts[0]) > MAX_PATTERN_LEN:
         raise RuleSyntaxError(f"rule pattern longer than {MAX_PATTERN_LEN} characters")
     pull, push = _VERBS[verbs]
-    return Rule(parts[0], pull=pull, push=push)
+    return check_rule(Rule(parts[0], pull=pull, push=push))
+
+
+def check_rule(rule: Rule) -> Rule:
+    """Refuse a rule that could never do what it says. Returns it unchanged.
+
+    Separate from parse_rule because the console submits STRUCTURED rules and
+    never reaches the text parser; both paths have to refuse the same things.
+
+    `push` over an `hf/` pattern is refused: Muninn never pushes to the Hub, so
+    that grant could never be exercised, and the person who typed it would
+    believe it did something. A bare `*` with push stays valid -- it covers the
+    registry, where push exists.
+    """
+    if rule.push and rule.pattern.strip().lower().startswith(HF_PREFIX):
+        raise RuleSyntaxError(
+            f"rule {rule.pattern!r} grants push on the Hugging Face surface, which is "
+            "pull-only: write it as '<pattern> pull'"
+        )
+    return rule
 
 
 def parse_rules(lines: list[str]) -> list[Rule]:

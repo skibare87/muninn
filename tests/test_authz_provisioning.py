@@ -306,17 +306,38 @@ def test_the_minted_secret_authenticates_on_v2_and_the_hf_surface(env):
     assert r.status_code != 401, r.text
 
 
-def test_the_hf_surface_is_a_gate_and_does_not_consult_rules(env):
-    """Pins the README's statement that rules are enforced on /v2 only. A key
-    whose holder has an EMPTY allowlist -- which grants nothing on /v2 --
-    still passes the HF gate. If per-reference HF authorisation is ever added,
-    this fails, and the README sentence has to change with it."""
+def test_the_hf_surface_consults_rules(env, monkeypatch):
+    """Pins the README's statement that rules are enforced on the Hugging Face
+    surface too (XHC_HF_RULES=enforce, the default). This test used to pin the
+    opposite -- an empty allowlist passing the HF gate -- and its assertion was
+    `!= 401`, which a 403 ALSO satisfies: it kept passing after the behaviour it
+    described had gone. Every assertion here names the exact status, so it
+    cannot outlive what it claims.
+
+    An empty allowlist grants nothing on either surface; `hf/...` grants the HF
+    repo and nothing on /v2; XHC_HF_RULES=off restores the gate-only behaviour."""
+    from app.config import settings
+
     client, _ = env
-    key_id, secret = _provision(client, rules=[])
-    local = {"x-muninn-local-only": "1", "authorization": f"Bearer {key_id}:{secret}"}
-    assert client.get("/gpt2/resolve/main/config.json", headers=local).status_code != 401
-    assert client.get("/v2/docker.io/library/alpine/tags/list",
-                      auth=(key_id, secret)).status_code == 403
+    commit = "a" * 40
+    snap = Path(settings.cache_dir) / "models--org--model" / "snapshots" / commit
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    path = f"/org/model/resolve/{commit}/config.json"
+    tags = "/v2/docker.io/library/alpine/tags/list"
+
+    empty_id, empty_secret = _provision(client, subject="svc:empty", rules=[])
+    empty = {"authorization": f"Bearer {empty_id}:{empty_secret}"}
+    assert client.get(path, headers=empty).status_code == 403
+    assert client.get(tags, auth=(empty_id, empty_secret)).status_code == 403
+
+    hf_id, hf_secret = _provision(client, subject="svc:hf", rules=["hf/models/org/* pull"])
+    hf = {"authorization": f"Bearer {hf_id}:{hf_secret}"}
+    assert client.get(path, headers=hf).status_code == 200
+    assert client.get(tags, auth=(hf_id, hf_secret)).status_code == 403
+
+    monkeypatch.setattr(settings, "hf_rules", "off")
+    assert client.get(path, headers=empty).status_code == 200
 
 
 def test_the_minted_key_is_authorised_by_the_rules_it_was_given(env):

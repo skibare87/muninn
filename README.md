@@ -416,8 +416,10 @@ symlink pointing out of the root fails the same check as `../../etc/passwd`. A
 configured-but-missing root logs a warning and serves nothing rather than raising
 — a typo in one setting should not take down a cache whose main job is unrelated.
 
-**It is unauthenticated by design.** The client-auth gate is on `/v2` only. A
-homepage is public; do not put anything there that is not.
+**It is unauthenticated by design.** Neither client-auth gate covers it — not
+`XHC_DOCKER_AUTH` on `/v2`, and not `XHC_HF_AUTH` on the Hugging Face surface, which is
+checked only after the web root has had its chance. A homepage is public; do not put
+anything there that is not.
 
 ## Two request headers: prewarm, and local-only
 
@@ -1039,12 +1041,15 @@ Set it and a Basic credential becomes **key id as the username, key secret as th
 password**. It *replaces* the htpasswd gate rather than layering on it — two credential
 stores answering the same question is how one of them silently stops being consulted.
 
-Rules are patterns over `<upstream>/<repository>`, each granting pull, push or both:
+Rules are patterns over `<upstream>/<repository>`, each granting pull, push or both — and,
+with `XHC_HF_AUTH=key`, over Hugging Face repositories as `hf/<type>s/<repo>`:
 
 ```
 docker.io/library/*   pull
 ghcr.io/myorg/*       pull+push
-*                     pull+push        # anything, anywhere
+hf/models/myorg/*     pull             # one organisation's models
+hf/datasets/*         pull             # every dataset
+*                     pull+push        # anything, anywhere, Hugging Face included
 ```
 
 `*` spans `/`. Patterns match the repository and **never the tag**, so
@@ -1066,13 +1071,80 @@ implementation is not honest: a check performed only when fetching from upstream
 enforced on the miss and silently absent on every hit after it — false from the first cache
 fill. Here the decision is coupled to `_resolve_or_error` in the same call that parses the
 reference, so a route cannot serve a repository it did not authorise without also failing
-to work out which repository it is.
+to work out which repository it is. The Hugging Face surface is built the same way; see
+*Rules on the Hugging Face surface* below.
+
+#### Rules on the Hugging Face surface (`XHC_HF_RULES`)
+
+With `XHC_HF_AUTH=key`, the same rules decide which Hugging Face repositories a key may pull.
+This matters more here than on `/v2`: the cache fetches from the Hub **with its own token**,
+and that token has accepted gated licences and can see private repositories. Without rules,
+every live key borrows all of it.
+
+| repository | rule reference |
+|---|---|
+| model `myorg/llama-ft` | `hf/models/myorg/llama-ft` |
+| canonical model `gpt2` (no org) | `hf/models/gpt2` |
+| dataset `myorg/corpus` | `hf/datasets/myorg/corpus` |
+| space `myorg/demo` | `hf/spaces/myorg/demo` |
+
+- **Wildcards behave exactly as on `/v2`**: `*` spans `/`, matching is case-insensitive, and
+  the list is allow-only. `hf/models/myorg/*` is one organisation's models; `hf/*` is all of
+  Hugging Face; a bare `*` is still everything, Hugging Face included.
+- **The `hf/` prefix cannot collide with an image.** A registry reference always starts with a
+  host (`docker.io`, `ghcr.io`, `localhost:5000`), so `docker.io/*` never matches a model and
+  `hf/*` never matches an image.
+- **Pull only.** Muninn never pushes to the Hub, so `push` on an `hf/` pattern is refused when
+  the rule is saved — from the console, `/_cache/authz` and `authzctl` alike — rather than
+  stored as a grant that could never work.
+- **A key scope narrows it the same way.** A key scoped to `docker.io/library/*` cannot pull
+  models, even if its holder can.
+
+**Enforced on every request, on hits as well as misses.** The decision is taken from the path
+alone at the top of the Hugging Face catch-all, before the cache is consulted, and every
+handler that serves a repository re-checks that the repository it is about to serve is the
+one that was authorised — so a path the two parsers read differently is refused rather than
+served. Every path gets a decision; none is waved through for not looking like a repository:
+
+| path | needs a rule matching |
+|---|---|
+| anything naming a repo: `/<repo>/resolve/…`, `/datasets/<repo>/…`, `/api/models/<repo>[/…]` (info, `revision`, `tree`, `refs`, `paths-info`, `xet-read-token`, …), `/api/datasets/<repo>/parquet`, `/datasets-server/…?dataset=<repo>`, web views like `/<repo>/raw/…` | `hf/<type>s/<repo>` |
+| a listing or search over one type: `/api/models`, `/api/datasets?search=…` | `hf/<type>s/` — i.e. `hf/models/*`, `hf/*` or `*` |
+| everything else: `/api/whoami-v2`, collections, papers, endpoints the Hub adds later | `hf/` — i.e. `hf/*` or `*` |
+
+Listings need a type-wide grant because they answer with the **cache's** Hub identity and can
+name private repositories it can see. `whoami-v2` needs a surface-wide grant because it
+answers with the cache's own account — name, email, organisations — not the caller's; no
+download calls it. Where a path could name two repositories — `/api/models/org/refs` is
+either `org/refs`'s info or canonical `org`'s refs, and Muninn cannot know which the Hub will
+choose — **both** must be allowed. That includes a sub-resource Muninn has never heard of, so
+a narrow key is refused a brand-new Hub endpoint rather than having it guessed at. Paths with
+`.`, `..` or empty segments are refused with 400: the upstream client normalises them, so
+`org/allowed/../secret` would otherwise be authorised as one repository and fetched as another.
+
+**A refusal is `403` with `X-Error-Code: GatedRepo`** and an `X-Error-Message` naming the key
+and the repository, e.g. `refused by this cache's rules: key 3f2a… has no rule granting pull
+on hf/models/myorg/secret`. Not 404, which would send the user looking for a typo in a
+correct repo id. `GatedRepo` because that is the situation — the repository exists and this
+credential is not on its list — and because `huggingface_hub` re-raises it as
+`GatedRepoError` from the `HEAD` every download starts with, where a plain 403 is swallowed
+into *"check your connection"*. Unlike `/v2`, whose client prints only the status, the
+reason is sent to the caller; it describes only their own key and never lists rules.
+
+> **Upgrading with `XHC_HF_AUTH=key` already on: this changes who can pull.** Enforcement is
+> the default. A principal whose allowlist is `*` is unaffected. A principal with only
+> registry rules — `docker.io/*` and nothing else — is now **refused every Hugging Face
+> repository**, and so is any key scoped to registry patterns only, even one held by a `*`
+> principal. Before upgrading, add `hf/…` rules for those principals, or set
+> `XHC_HF_RULES=off` to keep the previous behaviour (any live key pulls anything) while you
+> do. With `XHC_HF_AUTH=none` — the default — nothing changes at all.
 
 **What it still does not do, and these are limits rather than bugs:**
 
-- **It does not cover the Hugging Face path.** `XHC_AUTHZ_DB` authorises `/v2/*` only.
-  Model and dataset traffic is gated by `XHC_INGEST_POLICY` / `XHC_ALLOW_REPOS`, which are
-  **server-wide**, not per-credential.
+- **It covers the Hugging Face path only with `XHC_HF_AUTH=key`.** Without it there is no
+  credential on that surface, so there is nobody to hold a rule, and model and dataset
+  traffic is gated only by `XHC_INGEST_POLICY` / `XHC_ALLOW_REPOS`, which are
+  **server-wide**. With it, rules apply per key unless `XHC_HF_RULES=off`.
 - **Allowing a path grants whatever is already cached there.** The cache is shared storage
   and holds no per-tenant copies. If one tenant pulls a private image, a second tenant whose
   rules cover that path is served it from disk — Muninn does not re-check their entitlement
@@ -1082,8 +1154,8 @@ to work out which repository it is.
 - **The blast radius of the cache's own upstream credentials is unchanged.** Anything
   `XHC_REGISTRY_AUTH_FILE` can reach, any key allowed that path can reach through the cache.
 
-**It gates `/v2/*` and nothing else.** `/healthz` and `/metrics` stay unauthenticated by
-design, and `/_cache` keeps its own separate `XHC_MANAGE_TOKEN` — a pull credential does not
+**It gates `/v2/*`, and the Hugging Face surface when `XHC_HF_AUTH=key`, and nothing
+else.** `/healthz` and `/metrics` stay unauthenticated by design, and `/_cache` keeps its own separate `XHC_MANAGE_TOKEN` — a pull credential does not
 open the management API. This is the main advantage over a blanket reverse-proxy rule, which
 swallows the health and metrics endpoints unless you carve them out by hand.
 
@@ -1278,7 +1350,8 @@ H="Authorization: Bearer $XHC_MANAGE_TOKEN"
 curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals \
      -d '{"subject": "svc:ci"}' -H 'content-type: application/json'
 curl -fsS -H "$H" -X PUT https://cache.example.com/_cache/authz/principals/svc:ci/rules \
-     -d '{"rules": ["docker.io/library/* pull", "ghcr.io/myorg/* pull+push"]}' \
+     -d '{"rules": ["docker.io/library/* pull", "ghcr.io/myorg/* pull+push",
+                    "hf/models/myorg/* pull"]}' \
      -H 'content-type: application/json'
 curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals/svc:ci/keys \
      -d '{"label": "ci runner"}' -H 'content-type: application/json'
@@ -1289,7 +1362,8 @@ Or the same from an init container, straight into a file a Secret can be built f
 
 ```bash
 python -m app.authzctl create-principal svc:ci --exist-ok
-python -m app.authzctl set-rules svc:ci 'docker.io/library/* pull' 'ghcr.io/myorg/* pull+push'
+python -m app.authzctl set-rules svc:ci 'docker.io/library/* pull' 'ghcr.io/myorg/* pull+push' \
+    'hf/models/myorg/* pull'
 python -m app.authzctl mint svc:ci --label 'ci runner' \
     --secret-file /secrets/muninn-token --secret-file-format token
 ```
@@ -1302,12 +1376,14 @@ docker pull cache.example.com/docker.io/library/alpine:3.20
 
 export HF_ENDPOINT=https://cache.example.com
 export HF_TOKEN="$KEY_ID:$SECRET"          # with XHC_HF_AUTH=key
+hf download myorg/llama-ft                 # allowed by 'hf/models/myorg/* pull'
+hf download otherorg/model                 # 403, GatedRepoError naming the key and repo
 ```
 
-**Rules are enforced on `/v2` only.** On the Hugging Face surface, `XHC_HF_AUTH=key` is a
-gate: any live key passes, whatever its rules, and what may be fetched is decided by the
-server-wide `XHC_INGEST_POLICY` / `XHC_ALLOW_REPOS`. There is no rule syntax for model
-repositories, so do not write `hf/…` patterns expecting them to restrict anything.
+**Rules are enforced on both surfaces.** With `XHC_HF_AUTH=key` and the default
+`XHC_HF_RULES=enforce`, this key pulls `myorg`'s models and nothing else from Hugging Face,
+on a cache hit as on a miss. `hf/…` patterns are pull-only; see
+*Rules on the Hugging Face surface* above.
 
 ### Private registries: the cache authenticates as itself
 
@@ -1632,6 +1708,7 @@ experiments age out.
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |
 | `XHC_HF_AUTH` | `none` | `key` requires a credential from `XHC_AUTHZ_DB` on the **Hugging Face surface** — the catch-all serving everything not claimed by another router. Accepts Basic **or** `Bearer <key_id>:<secret>`, so a user can set `HF_TOKEN` to that and Hugging Face's own tooling works unchanged. The web root stays public, so a homepage still renders logged out |
+| `XHC_HF_RULES` | `enforce` | with `XHC_HF_AUTH=key`: `enforce` lets a key pull only the Hugging Face repos its rules cover (`hf/models/org/*` and so on), on hits as well as misses; `off` lets any live key pull anything, the behaviour before this setting existed. **Upgrading with `XHC_HF_AUTH=key` on changes behaviour** for principals with only registry rules. See [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules). No effect when `XHC_HF_AUTH=none` |
 | `XHC_DOCS` | `1` | FastAPI's `/docs`, `/redoc` and `/openapi.json`. They describe the management API and are unauthenticated by construction; set `0` on a public deployment |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |

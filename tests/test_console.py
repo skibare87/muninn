@@ -404,3 +404,41 @@ def test_an_empty_scope_is_still_allowed(console):
     assert r.status_code == 200
     key = next(k for k in store.list_keys() if k.key_id == kid)
     assert key.scope == []
+
+
+# ---------------- Hugging Face rules ----------------
+
+
+def test_the_console_accepts_an_hf_rule(console):
+    client, store, as_user = console
+    r = as_user("sub-admin").put(
+        "/_console/users/sub-user/allowlist",
+        json={"rules": [{"pattern": "hf/models/myorg/*", "pull": True, "push": False},
+                        {"pattern": "docker.io/*", "pull": True, "push": True}]},
+    )
+    assert r.status_code == 200, r.text
+    assert [x.pattern for x in store.get_principal_rules("sub-user")] == [
+        "hf/models/myorg/*", "docker.io/*"]
+
+
+def test_the_console_refuses_push_on_an_hf_rule_and_changes_nothing(console):
+    """The console sends structured rules and never reaches the text parser, so
+    it must refuse what the CLI and the API refuse -- otherwise the one surface
+    a human uses is the one that stores a grant that can never work."""
+    from app.authz import Rule
+
+    client, store, as_user = console
+    store.set_principal_rules("sub-user", [Rule("docker.io/*")])
+    c = as_user("sub-admin")
+    r = c.put("/_console/users/sub-user/allowlist",
+              json={"rules": [{"pattern": "hf/models/*", "pull": True, "push": True}]})
+    assert r.status_code == 400
+    assert "pull-only" in r.json()["detail"]
+    assert [x.pattern for x in store.get_principal_rules("sub-user")] == ["docker.io/*"]
+
+    store.set_principal_rules("sub-user", [Rule("*", pull=True, push=True)])
+    kid = as_user("sub-user").post("/_console/keys", json={"label": "x"}).json()["key_id"]
+    r = as_user("sub-user").put(f"/_console/keys/{kid}/scope",
+                                json={"rules": [{"pattern": "hf/*", "pull": False,
+                                                 "push": True}]})
+    assert r.status_code == 400

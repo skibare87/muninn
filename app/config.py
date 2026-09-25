@@ -165,6 +165,23 @@ class Settings:
     # THE WEB ROOT STAYS PUBLIC. A homepage nobody can load is not a homepage,
     # and the login button has to render before anyone has a credential.
     hf_auth: str = "none"
+    # Whether XHC_AUTHZ_DB RULES apply on the Hugging Face surface, once
+    # XHC_HF_AUTH=key has established who is asking. Meaningless otherwise: with
+    # no credential there is nobody to hold a rule.
+    #
+    #   enforce  a key pulls only HF repos its rules cover, `hf/models/org/*`
+    #            and so on (default)
+    #   off      any live key pulls anything, as before this setting existed
+    #
+    # WHY ENFORCE IS THE DEFAULT, given it changes behaviour for a deployment that
+    # already runs XHC_HF_AUTH=key: every principal whose allowlist is `*` keeps
+    # working, because `*` spans the HF namespace. Who changes is exactly the set
+    # whose rules never mentioned HF -- and an operator who wrote `docker.io/*`
+    # for someone did not write "and every model". A default of `off` would make
+    # every `hf/...` rule anyone writes decorative until they found a second
+    # switch, which is the failure a rule system exists to prevent. The refusal
+    # is loud (a 403 naming the key and the repo), and `off` is one variable.
+    hf_rules: str = "enforce"
     # FastAPI's interactive docs. They describe the management API and exist to
     # be read by a developer, not by the internet. Default unchanged; turn off
     # on a public deployment.
@@ -467,6 +484,9 @@ class Settings:
         hf_auth = (os.environ.get("XHC_HF_AUTH") or cls.hf_auth).strip().lower()
         if hf_auth not in ("none", "key"):
             raise ValueError(f"XHC_HF_AUTH must be none|key, got {hf_auth!r}")
+        hf_rules = (os.environ.get("XHC_HF_RULES") or cls.hf_rules).strip().lower()
+        if hf_rules not in ("enforce", "off"):
+            raise ValueError(f"XHC_HF_RULES must be enforce|off, got {hf_rules!r}")
         # Fails on the ARGUMENTS: asking for key auth with no key store would
         # start a server whose HF surface refuses everyone, which is a worse
         # outcome than the one being guarded against.
@@ -500,6 +520,7 @@ class Settings:
             web_root=os.environ.get("XHC_WEB_ROOT") or None,
             authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
             hf_auth=hf_auth,
+            hf_rules=hf_rules,
             docs_enabled=_env_bool("XHC_DOCS", cls.docs_enabled),
             oidc_issuer=oidc_issuer,
             oidc_client_id=os.environ.get("XHC_OIDC_CLIENT_ID") or None,

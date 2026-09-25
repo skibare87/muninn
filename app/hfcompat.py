@@ -32,7 +32,7 @@ from fastapi.responses import (
 from huggingface_hub import errors as hf_errors
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
-from . import cachefs, dockerauth, metrics, policy, refs, serving, viewer, webauth
+from . import cachefs, dockerauth, hfauthz, metrics, policy, refs, serving, viewer, webauth
 from .config import settings
 from .jobs import manager
 
@@ -594,6 +594,14 @@ async def catch_all(full_path: str, request: Request) -> Response:
     if not dockerauth.authenticate_hf(request, request.headers.get("authorization")):
         return dockerauth.hf_unauthorized()
 
+    # 0b. PER-KEY RULES (XHC_HF_RULES), decided from the path alone and before
+    #     any branch below, so a cached hit is refused exactly as a miss is.
+    #     Every path gets a decision -- see hfauthz. The handlers re-check the
+    #     repo they actually serve against what was authorised here.
+    denied = hfauthz.authorize(request, full_path)
+    if denied is not None:
+        return denied
+
     # 1. Stop clients from negotiating Xet through us. If they got a real
     #    casUrl they would pull bytes straight from HF and the cache would
     #    never see them -- a silent, and very expensive, bypass.
@@ -739,6 +747,8 @@ async def serve_repo_info(
     repo_type: str, repo_id: str, revision: str | None, full_path: str, request: Request
 ) -> Response:
     """Proxy repo info, falling back to the cached snapshot on an upstream 404."""
+    if (denied := hfauthz.require(request, repo_type, repo_id)) is not None:
+        return denied
     upstream = await _proxy_get(full_path, request)
     if upstream.status_code != 404:
         return _passthrough(upstream)
@@ -772,6 +782,8 @@ async def serve_tree(
     request: Request,
 ) -> Response:
     """Proxy a tree listing, falling back to the cached snapshot on a 404."""
+    if (denied := hfauthz.require(request, repo_type, repo_id)) is not None:
+        return denied
     upstream = await _proxy_get(full_path, request)
     if upstream.status_code != 404:
         return _passthrough(upstream)
@@ -822,6 +834,8 @@ async def serve_datasets_server(endpoint: str, upstream_path: str, request: Requ
     Nothing routes here unless a caller deliberately uses the /datasets-server/
     prefix, so this cannot affect a node that does not know about it.
     """
+    if (denied := hfauthz.require_path(request, f"{viewer.DS_SERVER_PREFIX}{upstream_path}")):
+        return denied
     url = f"{settings.datasets_server}/{quote(upstream_path)}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -880,6 +894,8 @@ async def serve_viewer(
 ) -> Response:
     """Serve small dataset metadata from cache, and keep serving it if the
     dataset is deleted upstream."""
+    if (denied := hfauthz.require(request, "dataset", repo_id)) is not None:
+        return denied
     entry = viewer.load(repo_id, key_suffix)
     if entry is not None and viewer.is_fresh(entry):
         metrics.record_request("VIEWER-HIT", request.headers.get("x-muninn-client"))
@@ -974,6 +990,8 @@ async def _hit_response(
 async def serve_file(
     repo_type: str, repo_id: str, revision: str, filename: str, request: Request
 ) -> Response:
+    if (denied := hfauthz.require(request, repo_type, repo_id)) is not None:
+        return denied
     range_header = request.headers.get("range")
 
     # Policy gates ingest by default, so a repo already cached keeps serving
@@ -1183,6 +1201,8 @@ async def serve_file(
 
 async def proxy_upstream(full_path: str, request: Request) -> Response:
     """Transparent pass-through for everything that is not file bytes."""
+    if (denied := hfauthz.require_path(request, full_path)) is not None:
+        return denied
     url = f"{settings.upstream}/{quote(full_path)}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
