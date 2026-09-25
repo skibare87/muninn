@@ -55,6 +55,10 @@ from .config import settings
 
 log = logging.getLogger("xhc.tier")
 
+# Phase 1 reads back sha256-named content only. Files keyed by a git blob id
+# (40 hex) are the next phase; when they are added, verify them with the rule
+# jobs.verify_ingested already applies -- sha1(b"blob <size>\0" + content), in
+# the same single pass -- rather than with a second copy of it.
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 CHUNK = 4 * 1024 * 1024
