@@ -157,8 +157,10 @@ def test_datasets_server_disabled_is_a_local_404(build):
 ])
 def test_unmatched_muninn_paths_never_reach_the_hub(build, method, path):
     """An always-on surface has the same hole: a method its router does not
-    define reaches the catch-all, which accepts every method."""
-    client, upstream = build()
+    define reaches the catch-all, which accepts every method. The management
+    token is set: without one, /_cache is OFF and its unrouted paths name the
+    setting instead (tests/test_manage_gate.py)."""
+    client, upstream = build(manage_token="reserved-test-token")
     r = client.request(method, path)
     assert upstream.calls == [], upstream.calls
     assert r.status_code == 404, (r.status_code, r.text[:200])
@@ -211,7 +213,8 @@ def test_datasets_server_enabled_still_proxies(build):
 
 
 def test_enabled_surfaces_behave_as_before(build):
-    client, upstream = build(docker_enabled=True, docs_enabled=True, docker_auth="none")
+    client, upstream = build(docker_enabled=True, docs_enabled=True, docker_auth="none",
+                             manage_token="reserved-test-token")
     r = client.get("/v2/")
     assert r.status_code == 200
     assert r.headers.get("docker-distribution-api-version") == "registry/2.0"
@@ -220,7 +223,10 @@ def test_enabled_surfaces_behave_as_before(build):
     assert client.get("/healthz").json()["ok"] is True
     assert client.get("/metrics").status_code == 200
     status = client.get("/_cache/status")  # answered by its own router
-    assert status.status_code in (200, 401) and "Muninn endpoint" not in status.text
+    assert status.status_code == 401 and "Muninn endpoint" not in status.text
+    status = client.get("/_cache/status",
+                        headers={"authorization": "Bearer reserved-test-token"})
+    assert status.status_code == 200, status.text
     assert upstream.calls == []
 
 

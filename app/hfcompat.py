@@ -37,6 +37,7 @@ from . import (
     cachefs,
     dockerauth,
     hfauthz,
+    managegate,
     metrics,
     policy,
     refs,
@@ -467,7 +468,10 @@ _RESERVED: tuple[_Reserved, ...] = (
               "the OCI registry surface is disabled (XHC_DOCKER_ENABLED=0)"),
     _Reserved("_cache/docker", True, lambda: settings.docker_enabled,
               "the docker management API is disabled (XHC_DOCKER_ENABLED=0)"),
-    _Reserved("_cache", True, lambda: True, ""),
+    # Off when XHC_MANAGE_TOKEN is unset, so /_cache/typo on a deployment with
+    # no token names the setting rather than calling it a typo. The routed
+    # /_cache paths refuse in managegate.ManageRoute with the same text.
+    _Reserved("_cache", True, managegate.enabled, managegate.DISABLED_REASON),
     _Reserved("_auth", True, webauth.enabled,
               "the browser login is disabled (XHC_OIDC_ISSUER is unset)"),
     _Reserved("_console", True, webauth.enabled,

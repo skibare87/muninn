@@ -20,17 +20,18 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from . import metrics, ocicompat, ocigc, ocipush, ocistore, policy, registry
 from .cachefs import StateUnavailable
 from .config import settings
-from .manage import require_manage_token
+from .managegate import ManageRoute
 
 log = logging.getLogger("xhc.ocimanage")
 
-router = APIRouter(prefix="/_cache/docker", tags=["docker"])
+# Gated as a whole by ManageRoute (managegate.py), like every /_cache router.
+router = APIRouter(prefix="/_cache/docker", tags=["docker"], route_class=ManageRoute)
 
 _jobs: dict = {}  # id -> PrewarmJob, defined below
 _tasks: set[asyncio.Task] = set()
@@ -154,7 +155,7 @@ async def _run_prewarm(job: PrewarmJob, ref: registry.Ref, reference: str, pin: 
         job.done.set()
 
 
-@router.post("/prewarm", dependencies=[Depends(require_manage_token)])
+@router.post("/prewarm")
 async def prewarm(req: PrewarmRequest) -> dict:
     """Pull an image and its whole closure ahead of a rollout.
 
@@ -178,7 +179,7 @@ async def prewarm(req: PrewarmRequest) -> dict:
     return {"job": job.as_dict()}
 
 
-@router.get("/prewarm/{job_id}", dependencies=[Depends(require_manage_token)])
+@router.get("/prewarm/{job_id}")
 async def prewarm_status(job_id: str) -> dict:
     job = _jobs.get(job_id)
     if not job:
@@ -186,7 +187,7 @@ async def prewarm_status(job_id: str) -> dict:
     return {"job": job.as_dict()}
 
 
-@router.get("/images", dependencies=[Depends(require_manage_token)])
+@router.get("/images")
 async def list_images() -> dict:
     """Cached tags with their pin and orphan state."""
     try:
@@ -205,7 +206,7 @@ async def list_images() -> dict:
     return {"images": sorted(out, key=lambda x: x["image"]), "stats": stats}
 
 
-@router.get("/pins", dependencies=[Depends(require_manage_token)])
+@router.get("/pins")
 async def get_pins() -> dict:
     try:
         return {"pins": sorted(ocigc.load_pins(strict=True))}
@@ -213,7 +214,7 @@ async def get_pins() -> dict:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/pins", dependencies=[Depends(require_manage_token)])
+@router.post("/pins")
 async def add_pin(req: PinRequest) -> dict:
     """Pin an image. The pin covers its whole blob closure -- a pin that kept
     the manifest but let its layers go would look intact until someone pulled."""
@@ -226,7 +227,7 @@ async def add_pin(req: PinRequest) -> dict:
     return {"pins": sorted(pins)}
 
 
-@router.delete("/pins", dependencies=[Depends(require_manage_token)])
+@router.delete("/pins")
 async def remove_pin(req: PinRequest) -> dict:
     try:
         pins = ocigc.load_pins(strict=True)
@@ -237,7 +238,7 @@ async def remove_pin(req: PinRequest) -> dict:
     return {"pins": sorted(pins)}
 
 
-@router.delete("/images", dependencies=[Depends(require_manage_token)])
+@router.delete("/images")
 async def evict_image(req: EvictRequest, sweep: bool = False) -> dict:
     """Drop a tag, freeing every layer no other tag still references.
 
@@ -295,7 +296,7 @@ async def evict_image(req: EvictRequest, sweep: bool = False) -> dict:
     return out
 
 
-@router.get("/pending", dependencies=[Depends(require_manage_token)])
+@router.get("/pending")
 async def list_pending() -> dict:
     """Pushes accepted but not yet confirmed upstream (store-forward only).
 
@@ -308,7 +309,7 @@ async def list_pending() -> dict:
     return {"pending": ocipush.pending()}
 
 
-@router.delete("/pending", dependencies=[Depends(require_manage_token)])
+@router.delete("/pending")
 async def abandon_pending(req: AbandonRequest) -> dict:
     """Give up on a forward that will not succeed and release its pin.
 
@@ -322,7 +323,7 @@ async def abandon_pending(req: AbandonRequest) -> dict:
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
 
 
-@router.post("/gc", dependencies=[Depends(require_manage_token)])
+@router.post("/gc")
 async def run_gc(dry_run: bool = False) -> dict:
     """Run mark-and-sweep now rather than waiting for the interval."""
     return await asyncio.to_thread(ocigc.collect, 0, dry_run)

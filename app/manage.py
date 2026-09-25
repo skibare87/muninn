@@ -9,30 +9,23 @@ set in advance, edge nodes should only ever see cache hits.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import platform
 import time
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from . import build, cachefs, orphans, policy, refs, tier, viewer
 from .config import XET_ENV_KEYS, settings
 from .jobs import ACTIVE_STATES, manager
+from .managegate import ManageRoute
 
-router = APIRouter(prefix="/_cache", tags=["manage"])
+# Every route here is gated by ManageRoute: no XHC_MANAGE_TOKEN -> 404, wrong
+# token -> 401. See managegate.py; do not add per-route auth.
+router = APIRouter(prefix="/_cache", tags=["manage"], route_class=ManageRoute)
 
 RepoType = Literal["model", "dataset", "space"]
-
-
-async def require_manage_token(authorization: str | None = Header(default=None)) -> None:
-    if not settings.manage_token:
-        return
-    # compare_digest so the comparison does not leak the token's prefix
-    expected = f"Bearer {settings.manage_token}"
-    if authorization is None or not hmac.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail="invalid or missing management token")
 
 
 class PrewarmRequest(BaseModel):
@@ -77,7 +70,7 @@ class DeleteRequest(BaseModel):
     )
 
 
-@router.get("/status", dependencies=[Depends(require_manage_token)])
+@router.get("/status")
 async def status() -> dict:
     view = await cachefs.get_view()
     disk = cachefs.disk_stats()
@@ -136,7 +129,7 @@ async def status() -> dict:
     }
 
 
-@router.get("/repos", dependencies=[Depends(require_manage_token)])
+@router.get("/repos")
 async def list_repos(refresh: bool = False) -> dict:
     view = await cachefs.get_view(force=refresh)
     return {
@@ -163,7 +156,7 @@ async def list_repos(refresh: bool = False) -> dict:
     }
 
 
-@router.post("/prewarm", dependencies=[Depends(require_manage_token)])
+@router.post("/prewarm")
 async def prewarm(req: PrewarmRequest) -> dict:
     decision = policy.check(req.repo_type, req.repo_id)
     if not decision.allowed and not req.force:
@@ -181,12 +174,12 @@ async def prewarm(req: PrewarmRequest) -> dict:
     return {"job": job.to_dict(), "pinned": req.pin}
 
 
-@router.get("/jobs", dependencies=[Depends(require_manage_token)])
+@router.get("/jobs")
 async def list_jobs() -> dict:
     return {"jobs": [j.to_dict() for j in manager.list()]}
 
 
-@router.get("/jobs/{job_id}", dependencies=[Depends(require_manage_token)])
+@router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> dict:
     job = manager.get(job_id)
     if job is None:
@@ -203,12 +196,12 @@ async def get_job(job_id: str) -> dict:
     return job.to_dict()
 
 
-@router.get("/pins", dependencies=[Depends(require_manage_token)])
+@router.get("/pins")
 async def list_pins() -> dict:
     return {"pins": sorted(cachefs.load_pins())}
 
 
-@router.post("/pins", dependencies=[Depends(require_manage_token)])
+@router.post("/pins")
 async def add_pin(req: RepoRef) -> dict:
     pins = cachefs.load_pins()
     pins.add(cachefs.repo_key(req.repo_type, req.repo_id))
@@ -216,7 +209,7 @@ async def add_pin(req: RepoRef) -> dict:
     return {"pins": sorted(pins)}
 
 
-@router.delete("/pins", dependencies=[Depends(require_manage_token)])
+@router.delete("/pins")
 async def remove_pin(req: RepoRef) -> dict:
     pins = cachefs.load_pins()
     pins.discard(cachefs.repo_key(req.repo_type, req.repo_id))
@@ -224,7 +217,7 @@ async def remove_pin(req: RepoRef) -> dict:
     return {"pins": sorted(pins)}
 
 
-@router.get("/orphans", dependencies=[Depends(require_manage_token)])
+@router.get("/orphans")
 async def list_orphans() -> dict:
     """Cached repos whose upstream has gone away.
 
@@ -251,13 +244,13 @@ async def list_orphans() -> dict:
     }
 
 
-@router.post("/orphans/check", dependencies=[Depends(require_manage_token)])
+@router.post("/orphans/check")
 async def check_orphans() -> dict:
     """Run an upstream liveness sweep now instead of waiting for the timer."""
     return await orphans.check_all(force_rescan=True)
 
 
-@router.delete("/orphans", dependencies=[Depends(require_manage_token)])
+@router.delete("/orphans")
 async def forget_orphan(req: RepoRef) -> dict:
     """Drop a repo's orphan mark, making it evictable again.
 
@@ -271,12 +264,12 @@ async def forget_orphan(req: RepoRef) -> dict:
     return {"forgotten": existed, "key": key, "remaining": len(o)}
 
 
-@router.get("/policy", dependencies=[Depends(require_manage_token)])
+@router.get("/policy")
 async def get_policy() -> dict:
     return policy.load()
 
 
-@router.put("/policy", dependencies=[Depends(require_manage_token)])
+@router.put("/policy")
 async def put_policy(req: PolicyRequest) -> dict:
     """Persist policy to policy.json in the HF state dir (.xhc/ or $XHC_STATE_DIR/hf/). Env seeds it; the file then wins."""
     try:
@@ -285,18 +278,18 @@ async def put_policy(req: PolicyRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.delete("/viewer", dependencies=[Depends(require_manage_token)])
+@router.delete("/viewer")
 async def clear_viewer_cache() -> dict:
     """Drop cached dataset metadata. Bytes stay; only the metadata copies go."""
     return {"cleared": viewer.clear()}
 
 
-@router.post("/evict", dependencies=[Depends(require_manage_token)])
+@router.post("/evict")
 async def run_evict(req: EvictRequest) -> dict:
     return await cachefs.evict(req.target_free_bytes)
 
 
-@router.delete("/repos", dependencies=[Depends(require_manage_token)])
+@router.delete("/repos")
 async def delete_repo(req: DeleteRequest) -> dict:
     """Forcibly drop a cached repo, or one revision of it.
 

@@ -4,15 +4,14 @@ For CI and cluster deployments with no identity provider, where the browser
 console cannot be reached because there is no login to put in front of it.
 The operations themselves live in authzadmin.py and are shared with the CLI.
 
-THIS SURFACE MINTS CREDENTIALS, SO ITS GATE IS STRICTER THAN ITS NEIGHBOURS'.
-The other /_cache routes treat an UNSET manage token as "no auth asked for" and
-serve anyone -- a long-standing default for a LAN cache. Inheriting that here
-would make every deployment that never set the variable an unauthenticated
-key-minting endpoint. So:
+The token gate is the one every /_cache router uses (managegate.ManageRoute),
+so this surface cannot drift from its neighbours. This surface was the first to
+read an unset token as CLOSED; the rest of /_cache now does too. On top of the
+shared gate it needs a store:
 
+    XHC_MANAGE_TOKEN unset  404  naming the setting (the shared gate)
+    token wrong or absent   401  (the shared gate)
     XHC_AUTHZ_DB unset      404  there is no store to provision
-    XHC_MANAGE_TOKEN unset  404  unset NEVER means open on this surface
-    token wrong or absent   401
 
 404 rather than 503 for the unconfigured cases because that is this project's
 convention for a surface that is off: the console and /_auth are not mounted
@@ -20,42 +19,33 @@ at all without a login. It is nonetheless ALWAYS mounted (see main.py): an
 unmounted path here falls to the Hugging Face catch-all and is proxied to the
 Hub, so the 404 has to come from a route that exists and refuses.
 
-The token is compared in constant time.
+The token is compared in constant time, by the shared gate.
 """
 
 from __future__ import annotations
 
-import hmac
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from . import authzadmin, dockerauth
+from . import authzadmin, dockerauth, managegate
 from .config import settings
 
 log = logging.getLogger("xhc.authzmanage")
 
 
-def configured() -> bool:
-    token = settings.manage_token
-    return bool(token and token.strip()) and bool(settings.authz_db)
-
-
-async def require_authz_manage(authorization: str | None = Header(default=None)) -> None:
-    if not configured() or dockerauth.store() is None:
+async def require_authz_store() -> None:
+    """Runs only after the shared token gate has let the request through."""
+    if not settings.authz_db or dockerauth.store() is None:
         raise HTTPException(status_code=404, detail="Not Found")
-    expected = f"Bearer {settings.manage_token}"
-    if authorization is None or not hmac.compare_digest(
-        authorization.encode(), expected.encode()
-    ):
-        raise HTTPException(status_code=401, detail="invalid or missing management token")
 
 
 router = APIRouter(
     prefix="/_cache/authz",
     tags=["authz"],
-    dependencies=[Depends(require_authz_manage)],
+    route_class=managegate.ManageRoute,
+    dependencies=[Depends(require_authz_store)],
 )
 
 
@@ -95,7 +85,7 @@ class DisabledIn(BaseModel):
 
 def _store():
     st = dockerauth.store()
-    assert st is not None  # guaranteed by require_authz_manage
+    assert st is not None  # guaranteed by require_authz_store
     return st
 
 

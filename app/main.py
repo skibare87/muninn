@@ -19,6 +19,7 @@ from . import (
     hfcompat,
     jwtauth,
     manage,
+    managegate,
     memcheck,
     metrics,
     ocicompat,
@@ -77,6 +78,11 @@ async def lifespan(app: FastAPI):
         )
     if not settings.hf_token:
         log.warning("no HF_TOKEN set; gated repos and higher rate limits unavailable")
+    if not managegate.enabled():
+        log.warning(
+            "management API is disabled: XHC_MANAGE_TOKEN is unset, so every /_cache "
+            "route answers 404. Set XHC_MANAGE_TOKEN to enable it."
+        )
 
     log.info(
         "muninn up | cache=%s capacity=%s miss_policy=%s",
@@ -317,11 +323,12 @@ async def prometheus_metrics(
     return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+# Every /_cache router is gated by managegate.ManageRoute, its route class: no
+# XHC_MANAGE_TOKEN -> 404 naming the setting, wrong token -> 401. A new /_cache
+# router must use it; tests/test_manage_gate.py enumerates app.routes to check.
 app.include_router(manage.router)
-# Headless provisioning. MOUNTED ALWAYS, and refuses with 404 unless there is a
-# store to provision AND a manage token to guard it -- unlike the rest of
-# /_cache, an unset token does not mean open here, because this surface mints
-# credentials.
+# Headless provisioning. MOUNTED ALWAYS, and additionally refuses with 404
+# unless there is a store to provision.
 #
 # Always mounted, which is the opposite of how the console is treated, because
 # in THIS app an unmounted path is not a 404: it falls to the Hugging Face

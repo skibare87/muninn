@@ -220,12 +220,15 @@ def test_capacity_pressure_drops_lru_tags_but_never_pinned_or_orphaned(store, mo
 
 
 @pytest.fixture
-def api(store):
+def api(store, monkeypatch):
     from fastapi.testclient import TestClient
 
+    from app.config import settings
     from app.main import app
 
-    return TestClient(app)
+    # /_cache is off without a management token; these tests exercise it on.
+    monkeypatch.setattr(settings, "manage_token", "ocigc-test-token")
+    return TestClient(app, headers={"authorization": "Bearer ocigc-test-token"})
 
 
 def test_pin_roundtrip_and_listing(api, store):

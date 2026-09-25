@@ -162,11 +162,13 @@ def test_a_corrupt_ledger_does_not_stop_the_service_serving(state, monkeypatch):
     blob.write_bytes(b"cached bytes")
     (repo / "snapshots" / commit / "config.json").symlink_to(blob)
 
+    monkeypatch.setattr(settings, "manage_token", "ledger-test-token")
     with TestClient(app) as client:
         r = client.get(f"/org/m/resolve/{commit}/config.json")
         assert r.status_code == 200
         assert r.content == b"cached bytes"
-        assert client.get("/_cache/jobs").status_code == 200
+        jobs_r = client.get("/_cache/jobs", headers={"authorization": "Bearer ledger-test-token"})
+        assert jobs_r.status_code == 200
     assert list(ledger.parent.glob("jobs.json.corrupt*"))
 
 

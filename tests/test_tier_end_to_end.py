@@ -113,14 +113,18 @@ def world(tmp_path, monkeypatch):
         store.server_close()
 
 
-def test_a_cold_disk_is_refilled_from_the_bucket_not_the_hub(world):
+def test_a_cold_disk_is_refilled_from_the_bucket_not_the_hub(world, monkeypatch):
+    from app.config import settings
     from app.main import app
 
+    # /_cache/status is off without a management token.
+    monkeypatch.setattr(settings, "manage_token", "tier-test-token")
+    auth = {"authorization": "Bearer tier-test-token"}
     with TestClient(app) as client:
         # The probe runs in the background at boot; wait for it to report.
         deadline = time.time() + 10
         while time.time() < deadline:
-            st = client.get("/_cache/status").json()
+            st = client.get("/_cache/status", headers=auth).json()
             if (st.get("tier") or {}).get("healthy"):
                 break
             time.sleep(0.05)
