@@ -12,6 +12,9 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from .jwtconfig import IssuerConfig
+from .jwtconfig import parse as parse_jwt_issuers
+
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)i?B?\s*$", re.IGNORECASE)
 _MULT = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
 
@@ -182,6 +185,14 @@ class Settings:
     # switch, which is the failure a rule system exists to prevent. The refusal
     # is loud (a 403 naming the key and the repo), and `off` is one variable.
     hf_rules: str = "enforce"
+    # Workload identity: signed JWTs from these OIDC issuers authenticate as a
+    # principal in XHC_AUTHZ_DB, on /v2 and (with XHC_HF_AUTH=key) on the
+    # Hugging Face surface. JSON; see app/jwtconfig.py for the shape and
+    # app/jwtauth.py for verification. EMPTY MEANS OFF, and off is the default.
+    jwt_issuers: tuple[IssuerConfig, ...] = ()
+    # How long one verified token is remembered, so a pod pulling 400 files does
+    # 1 signature verification rather than 400. Never past the token's own exp.
+    jwt_cache_ttl_s: float = 60.0
     # FastAPI's interactive docs. They describe the management API and exist to
     # be read by a developer, not by the internet. Default unchanged; turn off
     # on a public deployment.
@@ -495,6 +506,20 @@ class Settings:
                 "XHC_HF_AUTH=key needs XHC_AUTHZ_DB: there are no keys to check without it."
             )
 
+        # Fails on the ARGUMENTS: every malformed issuer declaration is a named
+        # startup error, never a silently narrower (or wider) trust set.
+        jwt_issuers = parse_jwt_issuers(os.environ.get("XHC_JWT_ISSUERS"))
+        if jwt_issuers and not (os.environ.get("XHC_AUTHZ_DB") or "").strip():
+            raise ValueError(
+                "XHC_JWT_ISSUERS needs XHC_AUTHZ_DB: a token authenticates as a "
+                "principal there, and its rules are what it may pull."
+            )
+        jwt_cache_ttl_s = _env_float("XHC_JWT_CACHE_TTL", cls.jwt_cache_ttl_s)
+        if not 0 <= jwt_cache_ttl_s <= 600:
+            raise ValueError(
+                f"XHC_JWT_CACHE_TTL must be between 0 and 600 seconds, got {jwt_cache_ttl_s}"
+            )
+
         # Fails on the ARGUMENT: a relative path resolves against whatever the
         # working directory happens to be, which is exactly the kind of
         # accidental, disposable location this setting exists to get away from.
@@ -521,6 +546,8 @@ class Settings:
             authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
             hf_auth=hf_auth,
             hf_rules=hf_rules,
+            jwt_issuers=jwt_issuers,
+            jwt_cache_ttl_s=jwt_cache_ttl_s,
             docs_enabled=_env_bool("XHC_DOCS", cls.docs_enabled),
             oidc_issuer=oidc_issuer,
             oidc_client_id=os.environ.get("XHC_OIDC_CLIENT_ID") or None,
