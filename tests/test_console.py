@@ -413,12 +413,12 @@ def test_the_console_accepts_an_hf_rule(console):
     client, store, as_user = console
     r = as_user("sub-admin").put(
         "/_console/users/sub-user/allowlist",
-        json={"rules": [{"pattern": "hf/models/myorg/*", "pull": True, "push": False},
+        json={"rules": [{"pattern": "models/myorg/*", "pull": True, "push": False},
                         {"pattern": "docker.io/*", "pull": True, "push": True}]},
     )
     assert r.status_code == 200, r.text
     assert [x.pattern for x in store.get_principal_rules("sub-user")] == [
-        "hf/models/myorg/*", "docker.io/*"]
+        "models/myorg/*", "docker.io/*"]
 
 
 def test_the_console_refuses_push_on_an_hf_rule_and_changes_nothing(console):
@@ -431,7 +431,7 @@ def test_the_console_refuses_push_on_an_hf_rule_and_changes_nothing(console):
     store.set_principal_rules("sub-user", [Rule("docker.io/*")])
     c = as_user("sub-admin")
     r = c.put("/_console/users/sub-user/allowlist",
-              json={"rules": [{"pattern": "hf/models/*", "pull": True, "push": True}]})
+              json={"rules": [{"pattern": "models/*", "pull": True, "push": True}]})
     assert r.status_code == 400
     assert "pull-only" in r.json()["detail"]
     assert [x.pattern for x in store.get_principal_rules("sub-user")] == ["docker.io/*"]
@@ -439,6 +439,20 @@ def test_the_console_refuses_push_on_an_hf_rule_and_changes_nothing(console):
     store.set_principal_rules("sub-user", [Rule("*", pull=True, push=True)])
     kid = as_user("sub-user").post("/_console/keys", json={"label": "x"}).json()["key_id"]
     r = as_user("sub-user").put(f"/_console/keys/{kid}/scope",
-                                json={"rules": [{"pattern": "hf/*", "pull": False,
+                                json={"rules": [{"pattern": "datasets/*", "pull": False,
                                                  "push": True}]})
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("pattern,reason", [
+    ("hf/models/org/x", "'hf/' is not a rule prefix"),
+    ("model/org/x", "unknown type prefix"),
+    ("google/gemma", "neither a registry host nor a Hugging Face type"),
+])
+def test_the_console_refuses_an_hf_shape_it_cannot_enforce(console, pattern, reason):
+    client, store, as_user = console
+    r = as_user("sub-admin").put(
+        "/_console/users/sub-user/allowlist",
+        json={"rules": [{"pattern": pattern, "pull": True, "push": False}]})
+    assert r.status_code == 400
+    assert reason in r.json()["detail"]

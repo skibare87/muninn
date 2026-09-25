@@ -54,7 +54,7 @@ def _checked(rules: list[RuleIn]) -> list[authz.Rule]:
     """Structured rules, refused on the same grounds as rule text.
 
     The console submits rules already split into fields, so it never reaches
-    authz.parse_rule. Without this, `hf/... push` would be refused by the CLI and
+    authz.parse_rule. Without this, `models/... push` would be refused by the CLI and
     the API and silently stored by the console.
     """
     try:

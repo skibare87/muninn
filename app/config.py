@@ -169,7 +169,7 @@ class Settings:
     # XHC_HF_AUTH=key has established who is asking. Meaningless otherwise: with
     # no credential there is nobody to hold a rule.
     #
-    #   enforce  a key pulls only HF repos its rules cover, `hf/models/org/*`
+    #   enforce  a key pulls only HF repos its rules cover, `models/org/*`
     #            and so on (default)
     #   off      any live key pulls anything, as before this setting existed
     #
@@ -178,7 +178,7 @@ class Settings:
     # working, because `*` spans the HF namespace. Who changes is exactly the set
     # whose rules never mentioned HF -- and an operator who wrote `docker.io/*`
     # for someone did not write "and every model". A default of `off` would make
-    # every `hf/...` rule anyone writes decorative until they found a second
+    # every `models/...` rule anyone writes decorative until they found a second
     # switch, which is the failure a rule system exists to prevent. The refusal
     # is loud (a 403 naming the key and the repo), and `off` is one variable.
     hf_rules: str = "enforce"

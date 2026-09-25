@@ -137,7 +137,7 @@
 
     <div id="admin" hidden>
       <h2>Users</h2>
-      <p class="muted">An allowlist is one rule per line: a pattern, then <code>pull</code>, <code>push</code> or <code>pull+push</code>. <code>*</code> matches anything including slashes, so <code>* pull+push</code> is unrestricted. Patterns match <code>upstream/repository</code> and never the tag. Hugging Face repositories are <code>hf/models/org/name</code>, <code>hf/datasets/org/name</code> or <code>hf/spaces/org/name</code>, pull only, so <code>hf/models/myorg/* pull</code> grants one organisation's models and <code>hf/* pull</code> all of Hugging Face.</p>
+      <p class="muted">An allowlist is one rule per line: a pattern, then <code>pull</code>, <code>push</code> or <code>pull+push</code>. <code>*</code> matches anything including slashes, so <code>* pull+push</code> is unrestricted. Patterns match <code>upstream/repository</code> and never the tag. Hugging Face repositories are <code>models/org/name</code>, <code>datasets/org/name</code> or <code>spaces/org/name</code> (the same shape as <code>XHC_ALLOW_REPOS</code>), pull only, so <code>models/myorg/* pull</code> grants one organisation's models. Only a bare <code>*</code> grants on both surfaces.</p>
       <div id="users"></div>
     </div>
 
@@ -336,7 +336,7 @@
     ta.className = 'txt';
     ta.rows = Math.max(3, user.allowlist.length + 1);
     ta.value = user.allowlist.map(ruleLine).join('\n');
-    ta.placeholder = 'docker.io/library/* pull\nghcr.io/myorg/* pull+push\nhf/models/myorg/* pull\n* pull+push';
+    ta.placeholder = 'docker.io/library/* pull\nghcr.io/myorg/* pull+push\nmodels/myorg/* pull\n* pull+push';
     wrap.appendChild(ta);
     var row = el('div', null, 'row');
     row.appendChild(btn('Save allowlist', null, function () {

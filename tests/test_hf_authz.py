@@ -122,12 +122,12 @@ LOCAL = {"x-muninn-local-only": "1"}
 
 
 def test_an_hf_rule_parses_with_the_existing_grammar():
-    assert parse_rule("hf/models/org/model-* pull") == Rule("hf/models/org/model-*", True, False)
-    assert parse_rule("hf/datasets/org/*") == Rule("hf/datasets/org/*", True, False)
+    assert parse_rule("models/org/model-* pull") == Rule("models/org/model-*", True, False)
+    assert parse_rule("datasets/org/*") == Rule("datasets/org/*", True, False)
 
 
-@pytest.mark.parametrize("line", ["hf/models/org/* push", "hf/models/org/* pull+push",
-                                  "HF/datasets/* push+pull"])
+@pytest.mark.parametrize("line", ["models/org/* push", "models/org/* pull+push",
+                                  "Datasets/* push+pull", "spaces/org/x push"])
 def test_push_on_an_hf_pattern_is_refused_because_nothing_could_ever_use_it(line):
     """Muninn never pushes to the Hub. A grant that can never be exercised is a
     rule that misdescribes itself, and the person who typed it believes it
@@ -140,6 +140,115 @@ def test_a_bare_star_with_push_is_still_valid():
     assert parse_rule("* pull+push") == Rule("*", True, True)
 
 
+# Every case the parser distinguishes, with the verdict. A rule that is stored
+# but can never grant is believed by whoever typed it, so each refusal has to
+# name why.
+@pytest.mark.parametrize("line,refusal", [
+    ("*", None),
+    ("* pull+push", None),
+    ("models/google/gemma-4-* pull", None),
+    ("models/gpt2 pull", None),
+    ("models/* pull", None),
+    ("datasets/org/data pull", None),
+    ("spaces/org/demo", None),
+    ("docker.io/library/* pull+push", None),
+    ("ghcr.io/myorg/* push", None),
+    ("localhost/app pull", None),
+    ("registry.local:5000/x pull", None),
+    ("*/library/* pull", None),              # leading wildcard: registry-only
+    ("hf/models/org/x pull", "'hf/' is not a rule prefix"),
+    ("hf/* pull", "'hf/' is not a rule prefix"),
+    ("models/org/x push", "pull-only"),
+    ("models pull", "names no repository"),
+    ("datasets/ pull", "names no repository"),
+    ("model/org/x pull", "unknown type prefix"),
+    ("dataset/org/x pull", "unknown type prefix"),
+    ("google/gemma pull", "neither a registry host nor a Hugging Face type"),
+    ("library/* pull", "neither a registry host nor a Hugging Face type"),
+])
+def test_the_parser_verdict_on_every_rule_shape(line, refusal):
+    if refusal is None:
+        parse_rule(line)
+        return
+    with pytest.raises(RuleSyntaxError, match=refusal):
+        parse_rule(line)
+
+
+def test_a_dotless_default_upstream_is_a_registry_host(monkeypatch):
+    """registry.resolve puts the default upstream first when a name has no host,
+    so a rule starting with it is a real registry rule, not an unknown prefix."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "docker_default_upstream", "mirror")
+    assert parse_rule("mirror/library/* pull") == Rule("mirror/library/*", True, False)
+
+
+# ---------------- the two surfaces never cross ----------------
+
+
+def test_an_hf_rule_never_grants_a_registry_reference():
+    """Even where the TEXT matches: a registry whose dotless default upstream
+    were named `models` would produce `models/...` references. The first
+    segment decides the surface, not the string comparison."""
+    from app.authz import Key, decide
+
+    k = Key("k", "", "p", rules=[Rule("models/*"), Rule("datasets/*"), Rule("spaces/*")])
+    for ref in ("models/org/x", "datasets/org/x", "docker.io/library/alpine"):
+        assert not decide(k, "pull", ref, "registry")[0], ref
+    assert decide(k, "pull", "models/org/x", "hf")[0], "positive control"
+
+
+@pytest.mark.parametrize("pattern", ["docker.io/*", "*/library/*", "*/*", "*/org/*",
+                                     "m*", "?odels/*", "[m]odels/*"])
+def test_no_registry_pattern_grants_an_hf_reference(pattern):
+    """`*/org/*` matches the TEXT `models/org/x`. Only a bare `*` crosses."""
+    from app.authz import Key, decide
+
+    k = Key("k", "", "p", rules=[Rule(pattern, pull=True, push=True)])
+    for ref in ("models/org/x", "datasets/org/x", "spaces/org/x", "models/"):
+        assert not decide(k, "pull", ref, "hf")[0], (pattern, ref)
+
+
+def test_a_bare_star_grants_on_both_surfaces():
+    from app.authz import HF_ANY_ENDPOINT, Key, decide
+
+    k = Key("k", "", "p", rules=[Rule("*", pull=True, push=True)])
+    assert decide(k, "pull", "models/org/x", "hf")[0]
+    assert decide(k, "pull", HF_ANY_ENDPOINT, "hf")[0]
+    assert decide(k, "push", "docker.io/library/alpine")[0]
+
+
+def test_the_misc_endpoint_reference_is_matched_by_nothing_narrower_than_star():
+    """Not by the whole-HF grant, and not by any pattern that spells it, since
+    check_rule refuses such a pattern before it can be stored."""
+    from app.authz import HF_ANY_ENDPOINT, Key, decide
+
+    whole = Key("k", "", "p", rules=[Rule("models/*"), Rule("datasets/*"), Rule("spaces/*")])
+    assert not decide(whole, "pull", HF_ANY_ENDPOINT, "hf")[0]
+    spelled = Key("k", "", "p", rules=[Rule(HF_ANY_ENDPOINT)])
+    assert not decide(spelled, "pull", HF_ANY_ENDPOINT, "hf")[0]
+    with pytest.raises(RuleSyntaxError):
+        parse_rule(HF_ANY_ENDPOINT.replace(" ", "_"))
+
+
+def test_a_rule_stored_before_this_change_is_enforced_without_migration(hf):
+    """Rules recorded in the XHC_ALLOW_REPOS shape before HF enforcement existed
+    are rows in the store, never re-parsed. They take effect as they are."""
+    client, key, _, store, cache = hf
+    from app.authz import Rule as R
+
+    store.claim_or_get_principal("legacy")
+    store.set_principal_rules("legacy", [R("models/org/model-*", pull=True, push=False)])
+    from app.authz import new_secret as ns
+
+    kid, secret = ns()
+    store.add_key(kid, secret, "legacy", [])
+    _seed(cache, "model", "org/model-a")
+    h = {"authorization": f"Bearer {kid}:{secret}"}
+    assert client.get(f"/org/model-a/resolve/{COMMIT}/config.json", headers=h).status_code == 200
+    assert client.get(f"/org/other/resolve/{COMMIT}/config.json", headers=h).status_code == 403
+
+
 # ---------------- miss, then hit ----------------
 
 
@@ -147,9 +256,9 @@ def test_a_matching_key_pulls_and_a_non_matching_one_is_refused_on_miss_and_on_h
     """THE TEST THIS FEATURE EXISTS FOR. Refused before the repo is cached, and
     STILL refused after it is -- including by a key that did not cause the fill."""
     client, key, upstream, _, cache = hf
-    ok, _ = key(["hf/models/org/model-* pull"])
-    other, _ = key(["hf/models/org/model-* pull"])  # a second key, same grant
-    no, _ = key(["hf/models/elsewhere/* pull"])
+    ok, _ = key(["models/org/model-* pull"])
+    other, _ = key(["models/org/model-* pull"])  # a second key, same grant
+    no, _ = key(["models/elsewhere/* pull"])
 
     path = f"/org/model-a/resolve/{COMMIT}/config.json"
 
@@ -174,7 +283,7 @@ def test_a_matching_key_pulls_and_a_non_matching_one_is_refused_on_miss_and_on_h
 
 def test_a_non_matching_repo_in_the_same_org_is_refused(hf):
     client, key, upstream, _, cache = hf
-    ok, _ = key(["hf/models/org/model-* pull"])
+    ok, _ = key(["models/org/model-* pull"])
     _seed(cache, "model", "org/secret")
     r = client.get(f"/org/secret/resolve/{COMMIT}/config.json", headers=ok)
     assert r.status_code == 403
@@ -183,11 +292,11 @@ def test_a_non_matching_repo_in_the_same_org_is_refused(hf):
 
 def test_datasets_and_models_are_separate_namespaces(hf):
     client, key, _, _, cache = hf
-    models_only, _ = key(["hf/models/org/* pull"])
+    models_only, _ = key(["models/org/* pull"])
     _seed(cache, "dataset", "org/data")
     r = client.get(f"/datasets/org/data/resolve/{COMMIT}/config.json", headers=models_only)
     assert r.status_code == 403
-    both, _ = key(["hf/models/org/* pull", "hf/datasets/org/* pull"])
+    both, _ = key(["models/org/* pull", "datasets/org/* pull"])
     r = client.get(f"/datasets/org/data/resolve/{COMMIT}/config.json", headers=both)
     assert r.status_code == 200 and r.content == BODY
 
@@ -199,7 +308,7 @@ def test_a_key_scope_narrows_hf_access_as_it_narrows_registry_access(hf):
     client, key, _, _, cache = hf
     _seed(cache, "model", "org/model-a")
     _seed(cache, "model", "org/model-b")
-    scoped, key_id = key(["hf/models/org/* pull"], scope=["hf/models/org/model-a pull"])
+    scoped, key_id = key(["models/org/* pull"], scope=["models/org/model-a pull"])
     assert client.get(f"/org/model-a/resolve/{COMMIT}/config.json",
                       headers=scoped).status_code == 200
     r = client.get(f"/org/model-b/resolve/{COMMIT}/config.json", headers=scoped)
@@ -211,7 +320,7 @@ def test_a_key_scope_narrows_hf_access_as_it_narrows_registry_access(hf):
 def test_a_scope_cannot_widen_past_the_holders_rules(hf):
     client, key, _, _, cache = hf
     _seed(cache, "model", "org/model-b")
-    scoped, _ = key(["hf/models/org/model-a pull"], scope=["hf/models/* pull"])
+    scoped, _ = key(["models/org/model-a pull"], scope=["models/* pull"])
     assert client.get(f"/org/model-b/resolve/{COMMIT}/config.json",
                       headers=scoped).status_code == 403
 
@@ -239,9 +348,9 @@ def test_star_still_grants_everything_on_every_route(hf):
         assert r.status_code != 403, f"{method} {path} -> {r.status_code} {r.text}"
 
 
-def test_hf_star_grants_the_whole_hf_surface_and_nothing_on_the_registry(hf):
+def test_every_type_grants_every_repo_route_and_nothing_on_the_registry(hf):
     client, key, _, store, _ = hf
-    hf_all, key_id = key(["hf/* pull"])
+    hf_all, key_id = key(["models/* pull", "datasets/* pull", "spaces/* pull"])
     for method, template in ROUTES:
         path = template.format(repo="org/model-a", rev=COMMIT)
         r = client.request(method, path, headers=hf_all)
@@ -299,7 +408,7 @@ def test_nothing_changes_when_hf_auth_is_off(hf, monkeypatch):
 def test_a_disabled_key_is_refused_even_on_a_hit(hf):
     client, key, _, store, cache = hf
     _seed(cache, "model", "org/model-a")
-    ok, key_id = key(["hf/models/org/* pull"])
+    ok, key_id = key(["models/org/* pull"])
     path = f"/org/model-a/resolve/{COMMIT}/config.json"
     assert client.get(path, headers=ok).status_code == 200
     store.set_key_disabled(key_id, True)
@@ -357,8 +466,8 @@ def test_every_repo_route_refuses_a_repo_the_key_may_not_pull(hf, method, path):
     client, key, upstream, _, cache = hf
     # Grants a sibling in every namespace, so a refusal cannot be "this key has
     # no HF rules at all" -- it has to be the repo that was refused.
-    k, _ = key(["hf/models/org/model-a pull", "hf/datasets/org/model-a pull",
-                "hf/spaces/org/model-a pull"])
+    k, _ = key(["models/org/model-a pull", "datasets/org/model-a pull",
+                "spaces/org/model-a pull"])
     for rtype in ("model", "dataset", "space"):
         _seed(cache, rtype, "org/secret")
     r = client.request(method, path.format(repo="org/secret", rev=COMMIT), headers=k)
@@ -373,8 +482,8 @@ def test_every_repo_route_admits_the_repo_the_key_may_pull(hf, method, path):
     repo, and none of them is refused. Without it, a route that refused
     EVERYTHING would pass the refusal test."""
     client, key, _, _, cache = hf
-    k, _ = key(["hf/models/org/model-a pull", "hf/datasets/org/model-a pull",
-                "hf/spaces/org/model-a pull"])
+    k, _ = key(["models/org/model-a pull", "datasets/org/model-a pull",
+                "spaces/org/model-a pull"])
     for rtype in ("model", "dataset", "space"):
         _seed(cache, rtype, "org/model-a")
     r = client.request(method, path.format(repo="org/model-a", rev=COMMIT), headers=k)
@@ -391,23 +500,24 @@ def test_a_listing_needs_a_grant_over_the_whole_type(hf, path):
     repos that identity can see. A key allowed one org must not enumerate the
     rest; a key allowed every model may."""
     client, key, upstream, _, _ = hf
-    narrow, _ = key(["hf/models/org/* pull", "hf/datasets/org/* pull", "hf/spaces/org/* pull"])
+    narrow, _ = key(["models/org/* pull", "datasets/org/* pull", "spaces/org/* pull"])
     assert client.get(path, headers=narrow).status_code == 403
     assert not upstream.calls
-    wide, _ = key(["hf/models/* pull", "hf/datasets/* pull", "hf/spaces/* pull"])
+    wide, _ = key(["models/* pull", "datasets/* pull", "spaces/* pull"])
     assert client.get(path, headers=wide).status_code != 403
 
 
 @pytest.mark.parametrize("path", ["/api/whoami-v2", "/api/collections", "/api/papers/x",
                                   "/api/organizations/org/members"])
-def test_a_path_naming_no_repo_needs_a_grant_over_the_whole_surface(hf, path):
+def test_a_path_naming_no_repo_needs_a_bare_star(hf, path):
     """whoami-v2 answers with the CACHE's Hub account -- its name, email and org
-    memberships -- not the caller's. Downloads never call it."""
+    memberships -- not the caller's. Downloads never call it. A grant over every
+    repo type is not enough: these are not repositories."""
     client, key, upstream, _, _ = hf
-    narrow, _ = key(["hf/models/* pull", "hf/datasets/* pull"])
+    narrow, _ = key(["models/* pull", "datasets/* pull", "spaces/* pull"])
     assert client.get(path, headers=narrow).status_code == 403
     assert not upstream.calls
-    surface, _ = key(["hf/* pull"])
+    surface, _ = key(["* pull"])
     assert client.get(path, headers=surface).status_code != 403
 
 
@@ -415,11 +525,11 @@ def test_a_path_naming_no_repo_needs_a_grant_over_the_whole_surface(hf, path):
 
 
 def test_a_canonical_repo_id_is_authorised_as_itself(hf):
-    """`gpt2` has no org. Its rule is `hf/models/gpt2`, and the paths
+    """`gpt2` has no org. Its rule is `models/gpt2`, and the paths
     huggingface_hub builds for it all authorise against exactly that."""
     client, key, _, _, cache = hf
     _seed(cache, "model", "gpt2")
-    k, _ = key(["hf/models/gpt2 pull"])
+    k, _ = key(["models/gpt2 pull"])
     for path in (f"/gpt2/resolve/{COMMIT}/config.json", "/api/models/gpt2",
                  "/api/models/gpt2/revision/main", "/api/models/gpt2/tree/main"):
         assert client.get(path, headers=k).status_code != 403, path
@@ -428,15 +538,15 @@ def test_a_canonical_repo_id_is_authorised_as_itself(hf):
 def test_an_unknown_sub_resource_is_refused_to_a_narrow_key_rather_than_guessed(hf):
     """A Hub endpoint Muninn has never heard of could be `<org>/<name>/<new>` or
     canonical `<org>`'s `<name>`. Guessing wrong would authorise one repo and
-    fetch another, so both readings are required -- and a `*` or `hf/*` holder,
+    fetch another, so both readings are required -- and a `models/*` holder,
     who has both, is unaffected."""
     client, key, upstream, _, _ = hf
-    narrow, _ = key(["hf/models/org/model-a pull"])
+    narrow, _ = key(["models/org/model-a pull"])
     r = client.get("/api/models/org/model-a/some-future-endpoint", headers=narrow)
     assert r.status_code == 403
-    assert "hf/models/org" in r.headers["x-error-message"]
+    assert "models/org" in r.headers["x-error-message"]
     assert not upstream.calls
-    surface, _ = key(["hf/* pull"])
+    surface, _ = key(["models/* pull"])
     assert client.get("/api/models/org/model-a/some-future-endpoint",
                       headers=surface).status_code != 403
 
@@ -445,10 +555,10 @@ def test_an_ambiguous_path_needs_both_readings_granted(hf):
     """`api/models/org/refs` is repo `org/refs`'s info, or canonical `org`'s
     refs. Muninn cannot know which the Hub will choose, so both must be allowed."""
     client, key, upstream, _, _ = hf
-    k, _ = key(["hf/models/org/* pull"])
+    k, _ = key(["models/org/* pull"])
     assert client.get("/api/models/org/refs", headers=k).status_code == 403
     assert not upstream.calls
-    both, _ = key(["hf/models/org pull", "hf/models/org/* pull"])
+    both, _ = key(["models/org pull", "models/org/* pull"])
     assert client.get("/api/models/org/refs", headers=both).status_code != 403
 
 
@@ -462,7 +572,7 @@ def test_dot_segments_cannot_walk_out_of_an_authorised_repo(hf, path):
     """The upstream client normalises `..` before sending, so a path that names
     an authorised repo can be walked into one that is not."""
     client, key, upstream, _, _ = hf
-    k, _ = key(["hf/models/org/model-a* pull"])
+    k, _ = key(["models/org/model-a* pull"])
     r = client.get(path, headers=k)
     assert r.status_code == 400, f"{path} -> {r.status_code} {r.text}"
     assert not upstream.calls
@@ -478,13 +588,13 @@ def test_the_refusal_is_a_gated_repo_error_naming_the_reason(hf):
     code huggingface_hub re-raises from a HEAD. A bare 403 there is swallowed
     into "check your connection"."""
     client, key, _, _, _ = hf
-    k, key_id = key(["hf/models/org/model-a pull"])
+    k, key_id = key(["models/org/model-a pull"])
     r = client.get("/org/secret/resolve/main/config.json", headers=k)
     assert r.status_code == 403
     assert r.headers["x-error-code"] == "GatedRepo"
     msg = r.headers["x-error-message"]
-    assert key_id in msg and "hf/models/org/secret" in msg
-    assert "hf/models/org/secret" in r.json()["error"]
+    assert key_id in msg and "models/org/secret" in msg
+    assert "models/org/secret" in r.json()["error"]
 
 
 def test_huggingface_hub_raises_gated_repo_error_on_the_refusal(hf):
@@ -494,7 +604,7 @@ def test_huggingface_hub_raises_gated_repo_error_on_the_refusal(hf):
     from huggingface_hub.utils import hf_raise_for_status
 
     client, key, _, _, _ = hf
-    k, _ = key(["hf/models/org/model-a pull"])
+    k, _ = key(["models/org/model-a pull"])
     r = client.head("/org/secret/resolve/main/config.json", headers=k)
 
     import requests
@@ -506,7 +616,7 @@ def test_huggingface_hub_raises_gated_repo_error_on_the_refusal(hf):
     resp._content = b""
     with pytest.raises(GatedRepoError) as exc:
         hf_raise_for_status(resp)
-    assert "hf/models/org/secret" in str(exc.value)
+    assert "models/org/secret" in str(exc.value)
 
 
 def test_hf_rules_default_is_enforce(monkeypatch):
@@ -540,7 +650,7 @@ def test_hf_hub_download_surfaces_the_refusal_as_gated_repo_error(hf, tmp_path):
     client, key, _, _, cache = hf
     _seed(cache, "model", "org/model-a")
     _seed(cache, "model", "org/secret")
-    ok, _ = key(["hf/models/org/model-a pull"])
+    ok, _ = key(["models/org/model-a pull"])
 
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -562,7 +672,7 @@ def test_hf_hub_download_surfaces_the_refusal_as_gated_repo_error(hf, tmp_path):
         with pytest.raises(GatedRepoError) as exc:
             hf_hub_download("org/secret", "config.json", revision=COMMIT,
                             endpoint=endpoint, token=token, cache_dir=tmp_path / "c2")
-        assert "hf/models/org/secret" in str(exc.value)
+        assert "models/org/secret" in str(exc.value)
     finally:
         server.should_exit = True
         thread.join(timeout=5)

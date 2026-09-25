@@ -40,6 +40,10 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 Operation = Literal["pull", "push"]
+# Which surface a reference belongs to. A rule is written in one flat pattern
+# space, but it grants on exactly one surface -- see "THE HUGGING FACE
+# NAMESPACE" below -- except a bare `*`, which grants on both.
+Surface = Literal["registry", "hf"]
 
 # A key id is shown in UIs and logs; the secret never is. Split so that a log line
 # can name WHICH key acted without the log becoming a credential store.
@@ -60,10 +64,20 @@ class Rule:
     pull: bool = True
     push: bool = False
 
-    def grants(self, operation: Operation, reference: str) -> bool:
+    def grants(
+        self, operation: Operation, reference: str, surface: Surface = "registry"
+    ) -> bool:
         if operation == "pull" and not self.pull:
             return False
         if operation == "push" and not self.push:
+            return False
+        # The surface decides which patterns may even be tried. Without this, a
+        # registry whose default upstream were named `models` would produce
+        # references `models/...` that a Hugging Face rule matched as text.
+        if surface == "hf":
+            if not (is_hf_pattern(self.pattern) or self.pattern.strip() == "*"):
+                return False
+        elif is_hf_pattern(self.pattern):
             return False
         return _matches(self.pattern, reference)
 
@@ -89,7 +103,9 @@ class Key:
     label: str = ""
     disabled: bool = False
 
-    def allows(self, operation: Operation, reference: str) -> bool:
+    def allows(
+        self, operation: Operation, reference: str, surface: Surface = "registry"
+    ) -> bool:
         """Both lists must permit it. NARROWING, not widening.
 
         The earlier model unioned the two, so a key could only ever be granted
@@ -104,11 +120,11 @@ class Key:
         """
         if self.disabled:
             return False
-        if not any(r.grants(operation, reference) for r in self.rules):
+        if not any(r.grants(operation, reference, surface) for r in self.rules):
             return False
         if not self.scope:
             return True
-        return any(r.grants(operation, reference) for r in self.scope)
+        return any(r.grants(operation, reference, surface) for r in self.scope)
 
 
 @dataclass
@@ -153,7 +169,9 @@ def new_secret() -> tuple[str, str]:
     return secrets.token_hex(_KEY_ID_BYTES), secrets.token_urlsafe(_KEY_SECRET_BYTES)
 
 
-def decide(key: Key | None, operation: Operation, reference: str) -> tuple[bool, str]:
+def decide(
+    key: Key | None, operation: Operation, reference: str, surface: Surface = "registry"
+) -> tuple[bool, str]:
     """Authorise one operation. Returns (allowed, reason).
 
     The reason is for the LOG, not for the client: telling an unauthorised caller
@@ -166,63 +184,81 @@ def decide(key: Key | None, operation: Operation, reference: str) -> tuple[bool,
         return False, f"key {key.key_id} is disabled"
     if not key.rules:
         return False, f"key {key.key_id} has no rules"
-    if key.allows(operation, reference):
+    if key.allows(operation, reference, surface):
         return True, f"key {key.key_id} allows {operation} on {reference}"
     # Two ways to be refused, and an operator chasing a 403 needs to know which:
     # the holder was never granted it, or this key was scoped away from it.
-    if key.scope and any(r.grants(operation, reference) for r in key.rules):
+    if key.scope and any(r.grants(operation, reference, surface) for r in key.rules):
         return False, (f"key {key.key_id} is scoped away from {operation} on "
                        f"{reference}, which its holder is otherwise allowed")
     return False, f"key {key.key_id} has no rule granting {operation} on {reference}"
 
 
 # ---------------------------------------------------------------------------
-# THE HUGGING FACE NAMESPACE. Rules match HF repositories as
+# THE HUGGING FACE NAMESPACE. Rules match HF repositories in the same shape as
+# XHC_ALLOW_REPOS:
 #
-#     hf/models/<org>/<name>     hf/datasets/<org>/<name>     hf/spaces/<org>/<name>
+#     models/<org>/<name>     datasets/<org>/<name>     spaces/<org>/<name>
 #
-# (or `hf/models/<name>` for a canonical id with no org, such as `gpt2`).
+# (or `models/<name>` for a canonical id with no org, such as `gpt2`), verb
+# `pull`. One shape across the ingest allowlist and the per-key rules.
 #
-# WHY A PREFIX, AND WHY THIS ONE. A rule is one flat pattern space shared by
-# both surfaces, so an HF reference must be something no registry reference can
-# ever be. A registry reference always begins with a HOST -- a segment with a dot
-# or a port, `localhost`, or the default upstream -- and `hf` is none of those,
-# so `docker.io/*` can never match an HF repo and `hf/*` can never match an
-# image. XHC_ALLOW_REPOS's bare `models/...` form would also be unambiguous
-# today, but `hf/` says which surface it is about to someone reading an
-# allowlist, and the README had already told people `hf/...` was the form that
-# did NOT work -- so it is the form they will reach for.
+# WHY IT CANNOT BE CONFUSED WITH A REGISTRY REFERENCE. A registry reference
+# always begins with a HOST: a segment with a dot or a port, `localhost`, or the
+# default upstream. `models`, `datasets` and `spaces` are none of those. That
+# argument alone would leave one hole -- a dotless default upstream named, say,
+# `models` -- so it is not relied on: a rule's first segment decides its
+# SURFACE, and Rule.grants refuses to try a pattern on the other surface.
 #
-# Matching is exactly the registry's: `*` spans `/`, case-insensitive, allow-only.
-# So a bare `*` still covers everything, HF included, and `hf/*` is the whole HF
-# surface.
+#   first segment models|datasets|spaces   Hugging Face only, never an image
+#   anything else, including `*/x/*`       registry only, never a model
+#   exactly `*`                            both surfaces
 #
-# Two references that name no single repository, used by hfauthz for paths that
-# do not name one:
+# Matching within a surface is the registry's: `*` spans `/`, case-insensitive,
+# allow-only. XHC_ALLOW_REPOS uses fnmatch.fnmatch, where `*` also spans `/`,
+# but which is CASE-SENSITIVE on Linux. So `models/Org/*` in the allowlist does
+# not match `models/org/x`, while the same rule here does.
 #
-#   hf/<type>s/   a listing or search over a whole repo type. Matched by `*`,
-#                 `hf/*` and `hf/models/*`, and by nothing narrower.
-#   hf/           a path naming no repository at all (whoami, collections, ...).
-#                 Matched by `*` and `hf/*` only.
+# References that name no single repository, used by hfauthz:
 #
-# Both work because `*` matches the empty string; neither needs a special case
-# in the matcher, which is the point.
+#   models/  datasets/  spaces/   a listing or search over one whole type.
+#                                 Matched by `models/*` or `*`: `*` matches the
+#                                 empty string, so no special case is needed.
+#   HF_ANY_ENDPOINT               a path naming no repository (whoami,
+#                                 collections, papers, anything unknown). Its
+#                                 first segment is not a type, so no HF-surface
+#                                 pattern can match it, and the surface check
+#                                 above admits no other pattern except `*`. It is
+#                                 not expressible as anything narrower, and
+#                                 check_rule refuses it as a pattern anyway.
 # ---------------------------------------------------------------------------
 
-HF_PREFIX = "hf/"
-HF_REPO_TYPES = ("model", "dataset", "space")
+HF_TYPES = {"models": "model", "datasets": "dataset", "spaces": "space"}
+HF_REPO_TYPES = tuple(HF_TYPES.values())
+HF_ANY_ENDPOINT = "(any other Hugging Face endpoint)"
+_WILDCARD = re.compile(r"[*?\[]")
+
+
+def _first_segment(pattern: str) -> str:
+    return pattern.strip().split("/", 1)[0].lower()
+
+
+def is_hf_pattern(pattern: str) -> bool:
+    """True when a pattern's first segment is a Hugging Face repo type."""
+    return _first_segment(pattern) in HF_TYPES
 
 
 def hf_reference(repo_type: str, repo_id: str = "") -> str:
     """The rule reference for an HF repo, or for its whole type when repo_id is ''."""
     if repo_type not in HF_REPO_TYPES:
         raise ValueError(f"unknown Hugging Face repo type {repo_type!r}")
-    return f"{HF_PREFIX}{repo_type}s/{repo_id}"
+    return f"{repo_type}s/{repo_id}"
 
 
 # ---------------------------------------------------------------------------
 # RULE TEXT. One rule per line: `<pattern> [pull|push|pull+push]`, verbs
-# defaulting to pull. An `hf/` pattern takes `pull` only. This is the syntax the console's allowlist and scope
+# defaulting to pull. A Hugging Face pattern takes `pull` only. This is the
+# syntax the console's allowlist and scope
 # fields accept, and until headless provisioning existed it was parsed ONLY in
 # the browser -- the server took structured JSON. The CLI and /_cache/authz
 # both need text, so the grammar lives here, once, and both call it.
@@ -267,19 +303,71 @@ def check_rule(rule: Rule) -> Rule:
     """Refuse a rule that could never do what it says. Returns it unchanged.
 
     Separate from parse_rule because the console submits STRUCTURED rules and
-    never reaches the text parser; both paths have to refuse the same things.
+    never reaches the text parser; the console, /_cache/authz and authzctl all
+    have to refuse the same things. NO SILENT NEVER-MATCH: a rule that is
+    stored but can never grant is believed by whoever typed it.
 
-    `push` over an `hf/` pattern is refused: Muninn never pushes to the Hub, so
-    that grant could never be exercised, and the person who typed it would
-    believe it did something. A bare `*` with push stays valid -- it covers the
-    registry, where push exists.
+      `*`                          valid, both surfaces
+      models|datasets|spaces/...   valid, pull only; `push` refused (Muninn never
+                                   pushes to the Hub); a bare type with no repo
+                                   part refused
+      hf/...                       refused, pointing at models/...
+      first segment is a host      valid registry rule (dot, port, localhost,
+                                   a Docker Hub alias, or the default upstream)
+      first segment has a wildcard valid registry rule (`*/library/*`); it
+                                   never grants on Hugging Face
+      anything else                refused: `org/name`, `model/...`, `library/*`
+                                   -- no registry reference starts with it and
+                                   it is not a Hugging Face type, so it could
+                                   never match either surface
     """
-    if rule.push and rule.pattern.strip().lower().startswith(HF_PREFIX):
+    pattern = rule.pattern.strip()
+    if pattern == "*":
+        return rule
+    first = _first_segment(pattern)
+    if first in HF_TYPES:
+        if rule.push:
+            raise RuleSyntaxError(
+                f"rule {rule.pattern!r} grants push on the Hugging Face surface, which "
+                "is pull-only: write it as '<pattern> pull'"
+            )
+        rest = pattern.split("/", 1)[1] if "/" in pattern else ""
+        if not rest:
+            raise RuleSyntaxError(
+                f"rule {rule.pattern!r} names no repository: write "
+                f"'{first}/<org>/<name>', or '{first}/*' for every {HF_TYPES[first]}"
+            )
+        return rule
+    if first == "hf":
         raise RuleSyntaxError(
-            f"rule {rule.pattern!r} grants push on the Hugging Face surface, which is "
-            "pull-only: write it as '<pattern> pull'"
+            f"rule {rule.pattern!r}: 'hf/' is not a rule prefix. Hugging Face rules "
+            "are written 'models/<org>/<name>', 'datasets/<org>/<name>' or "
+            "'spaces/<org>/<name>', the same shape as XHC_ALLOW_REPOS"
         )
-    return rule
+    if _WILDCARD.search(first) or _is_registry_host(first):
+        return rule
+    if first.rstrip("s") in ("model", "dataset", "space"):
+        hint = f"unknown type prefix '{first}/': use models/, datasets/ or spaces/"
+    else:
+        hint = (f"'{first}' is neither a registry host nor a Hugging Face type, so "
+                "the rule could never match. Registry rules start with a host "
+                "('docker.io/library/*'); Hugging Face rules with a type "
+                "('models/<org>/<name>')")
+    raise RuleSyntaxError(f"rule {rule.pattern!r}: {hint}")
+
+
+def _is_registry_host(segment: str) -> bool:
+    """Whether a first segment could begin a registry reference.
+
+    Mirrors registry.resolve: a dot or a port marks a host, as does
+    `localhost`; otherwise the reference begins with the default upstream,
+    canonicalised to docker.io for the Hub's aliases.
+    """
+    if "." in segment or ":" in segment or segment == "localhost":
+        return True
+    from .config import settings
+
+    return segment == (settings.docker_default_upstream or "").strip().lower()
 
 
 def parse_rules(lines: list[str]) -> list[Rule]:

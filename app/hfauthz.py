@@ -2,7 +2,8 @@
 
 XHC_HF_AUTH=key answers WHO is asking. This answers whether they may have the
 repository they asked for, using the same XHC_AUTHZ_DB rules as /v2 over the
-`hf/<type>s/<repo>` namespace described in authz.py.
+`models/<repo>`, `datasets/<repo>` and `spaces/<repo>` namespace described in
+authz.py -- the same shape as XHC_ALLOW_REPOS.
 
 WHY IT MATTERS MORE HERE THAN ON /v2. The cache fetches from the Hub as itself,
 with its own token, and that token has accepted gated licences and can see
@@ -16,12 +17,14 @@ EVERY PATH GETS A DECISION. There is no "not a repo path, let it through":
 
   * a path that names a repository is authorised against that repository;
   * a listing or search over one repo type (`api/models?search=`) needs a grant
-    covering the whole type, `hf/models/`, because it answers with the cache's
+    covering the whole type, `models/*`, because it answers with the cache's
     Hub identity and can name private repos that identity can see;
   * anything else -- whoami, collections, papers, an endpoint added to the Hub
-    next month -- needs a grant covering the whole surface, `hf/`.
+    next month -- needs a bare `*`. It is matched against an internal
+    reference no narrower pattern can express (authz.HF_ANY_ENDPOINT).
 
-`*` covers all three, so a `*` holder sees no change.
+`*` covers all three, so a `*` holder sees no change. `models/*`, `datasets/*`
+and `spaces/*` together cover every repository but not the miscellany.
 
 COUPLED TO THE HANDLERS, as /v2 couples authorisation to `_resolve_or_error`.
 The catch-all's own parsers (parse_resolve, parse_repo_info_path, ...) decide
@@ -131,7 +134,7 @@ def _listing(repo_type: str) -> Target:
     return Target(references=(authz.hf_reference(repo_type),))
 
 
-_SURFACE = Target(references=(authz.HF_PREFIX,))
+_SURFACE = Target(references=(authz.HF_ANY_ENDPOINT,))
 
 
 def classify(full_path: str, dataset_params: list[str]) -> Target:
@@ -195,7 +198,7 @@ def refusal(reason: str, reference: str) -> Response:
     return JSONResponse(
         {"error": message,
          "hint": f"an administrator can grant it with a rule matching '{reference}', "
-                 "e.g. 'hf/models/<org>/* pull'"},
+                 "e.g. 'models/<org>/* pull'"},
         status_code=403,
         headers={"x-error-code": "GatedRepo", "x-error-message": message,
                  "x-xhc-authz": "denied"},
@@ -217,7 +220,7 @@ def authorize(request: Request, full_path: str) -> Response | None:
         log.info("hf authz: refusing %r: %s", full_path, exc)
         return JSONResponse({"error": _header_safe(str(exc))}, status_code=400)
     for reference in target.references:
-        allowed, reason = authz.decide(key, "pull", reference)
+        allowed, reason = authz.decide(key, "pull", reference, "hf")
         if not allowed:
             log.info("hf authz deny: %s", reason)
             return refusal(reason, reference)
@@ -252,4 +255,4 @@ def require_path(request: Request, full_path: str) -> Response | None:
     if authorised is not None and authorised.strip("/") == full_path.strip("/"):
         return None
     log.error("hf authz: %r forwarded without being authorised", full_path)
-    return refusal("this request was not authorised", authz.HF_PREFIX)
+    return refusal("this request was not authorised", authz.HF_ANY_ENDPOINT)

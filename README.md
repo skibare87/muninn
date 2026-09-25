@@ -1042,14 +1042,15 @@ password**. It *replaces* the htpasswd gate rather than layering on it — two c
 stores answering the same question is how one of them silently stops being consulted.
 
 Rules are patterns over `<upstream>/<repository>`, each granting pull, push or both — and,
-with `XHC_HF_AUTH=key`, over Hugging Face repositories as `hf/<type>s/<repo>`:
+with `XHC_HF_AUTH=key`, over Hugging Face repositories as `models/<repo>`, `datasets/<repo>`
+or `spaces/<repo>`, the same shape as `XHC_ALLOW_REPOS`:
 
 ```
-docker.io/library/*   pull
-ghcr.io/myorg/*       pull+push
-hf/models/myorg/*     pull             # one organisation's models
-hf/datasets/*         pull             # every dataset
-*                     pull+push        # anything, anywhere, Hugging Face included
+docker.io/library/*          pull
+ghcr.io/myorg/*              pull+push
+models/google/gemma-4-*      pull      # some of one organisation's models
+datasets/*                   pull      # every dataset
+*                            pull+push # anything, anywhere, Hugging Face included
 ```
 
 `*` spans `/`. Patterns match the repository and **never the tag**, so
@@ -1083,22 +1084,48 @@ every live key borrows all of it.
 
 | repository | rule reference |
 |---|---|
-| model `myorg/llama-ft` | `hf/models/myorg/llama-ft` |
-| canonical model `gpt2` (no org) | `hf/models/gpt2` |
-| dataset `myorg/corpus` | `hf/datasets/myorg/corpus` |
-| space `myorg/demo` | `hf/spaces/myorg/demo` |
+| model `myorg/llama-ft` | `models/myorg/llama-ft` |
+| canonical model `gpt2` (no org) | `models/gpt2` |
+| dataset `myorg/corpus` | `datasets/myorg/corpus` |
+| space `myorg/demo` | `spaces/myorg/demo` |
 
-- **Wildcards behave exactly as on `/v2`**: `*` spans `/`, matching is case-insensitive, and
-  the list is allow-only. `hf/models/myorg/*` is one organisation's models; `hf/*` is all of
-  Hugging Face; a bare `*` is still everything, Hugging Face included.
-- **The `hf/` prefix cannot collide with an image.** A registry reference always starts with a
-  host (`docker.io`, `ghcr.io`, `localhost:5000`), so `docker.io/*` never matches a model and
-  `hf/*` never matches an image.
-- **Pull only.** Muninn never pushes to the Hub, so `push` on an `hf/` pattern is refused when
-  the rule is saved — from the console, `/_cache/authz` and `authzctl` alike — rather than
-  stored as a grant that could never work.
+- **The same shape as `XHC_ALLOW_REPOS`.** A rule recorded as `models/<org>/<name> pull`
+  before rules reached this surface is enforced as it stands; nothing needs migrating.
+- **The first segment decides the surface.** A rule starting `models/`, `datasets/` or
+  `spaces/` grants only Hugging Face repositories and never an image; every other rule grants
+  only images and never a repository. A registry reference always starts with a host
+  (`docker.io`, `ghcr.io`, `localhost:5000`), so the text could not collide anyway, but the
+  surface check does not rely on that: a registry pattern such as `*/org/*`, which *would*
+  match the text `models/org/x`, grants nothing here. **Only a bare `*` grants on both.**
+- **Wildcards.** `*` spans `/` and `?` is one character, on both surfaces. Rule matching is
+  **case-insensitive**. `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` use Python's `fnmatch`, where `*`
+  also spans `/` but matching is **case-sensitive** on Linux: `models/Org/*` in the ingest
+  allowlist does not match `models/org/x`, while the same rule here does.
+- **All of Hugging Face** is `models/*`, `datasets/*` and `spaces/*` together. That covers
+  every repository and every listing, but **not** endpoints that name no repository
+  (`whoami-v2`, collections, papers, anything the Hub adds later): those need a bare `*`.
+- **Pull only.** Muninn never pushes to the Hub.
 - **A key scope narrows it the same way.** A key scoped to `docker.io/library/*` cannot pull
   models, even if its holder can.
+
+**No rule is stored that could never match.** Saving rules — from the console,
+`/_cache/authz` and `authzctl` alike — refuses with 400 and a named reason:
+
+| rule | result |
+|---|---|
+| `*`, `* pull+push` | accepted; both surfaces |
+| `models/google/gemma-4-* pull`, `models/gpt2`, `datasets/*`, `spaces/org/demo` | accepted; Hugging Face |
+| `docker.io/library/*`, `localhost/app`, `registry.local:5000/x`, `<default upstream>/…` | accepted; registry |
+| `*/library/*` (wildcard first segment) | accepted; registry only |
+| `models/org/x push` | refused: the Hugging Face surface is pull-only |
+| `models`, `datasets/` | refused: names no repository |
+| `hf/models/org/x` | refused: `hf/` is not a prefix; use `models/…` |
+| `model/org/x`, `dataset/…` | refused: unknown type prefix |
+| `google/gemma`, `library/*` | refused: neither a registry host nor a Hugging Face type |
+
+The last row is also a change on `/v2`: a registry rule without a host, such as
+`library/*`, never matched anything, because references always carry their host. It is now
+refused instead of being stored.
 
 **Enforced on every request, on hits as well as misses.** The decision is taken from the path
 alone at the top of the Hugging Face catch-all, before the cache is consulted, and every
@@ -1108,12 +1135,12 @@ served. Every path gets a decision; none is waved through for not looking like a
 
 | path | needs a rule matching |
 |---|---|
-| anything naming a repo: `/<repo>/resolve/…`, `/datasets/<repo>/…`, `/api/models/<repo>[/…]` (info, `revision`, `tree`, `refs`, `paths-info`, `xet-read-token`, …), `/api/datasets/<repo>/parquet`, `/datasets-server/…?dataset=<repo>`, web views like `/<repo>/raw/…` | `hf/<type>s/<repo>` |
-| a listing or search over one type: `/api/models`, `/api/datasets?search=…` | `hf/<type>s/` — i.e. `hf/models/*`, `hf/*` or `*` |
-| everything else: `/api/whoami-v2`, collections, papers, endpoints the Hub adds later | `hf/` — i.e. `hf/*` or `*` |
+| anything naming a repo: `/<repo>/resolve/…`, `/datasets/<repo>/…`, `/api/models/<repo>[/…]` (info, `revision`, `tree`, `refs`, `paths-info`, `xet-read-token`, …), `/api/datasets/<repo>/parquet`, `/datasets-server/…?dataset=<repo>`, web views like `/<repo>/raw/…` | `<type>s/<repo>` |
+| a listing or search over one type: `/api/models`, `/api/datasets?search=…` | `<type>s/` — i.e. `models/*` or `*` |
+| everything else: `/api/whoami-v2`, collections, papers, endpoints the Hub adds later | a bare `*` only |
 
 Listings need a type-wide grant because they answer with the **cache's** Hub identity and can
-name private repositories it can see. `whoami-v2` needs a surface-wide grant because it
+name private repositories it can see. `whoami-v2` needs `*` because it
 answers with the cache's own account — name, email, organisations — not the caller's; no
 download calls it. Where a path could name two repositories — `/api/models/org/refs` is
 either `org/refs`'s info or canonical `org`'s refs, and Muninn cannot know which the Hub will
@@ -1124,7 +1151,7 @@ a narrow key is refused a brand-new Hub endpoint rather than having it guessed a
 
 **A refusal is `403` with `X-Error-Code: GatedRepo`** and an `X-Error-Message` naming the key
 and the repository, e.g. `refused by this cache's rules: key 3f2a… has no rule granting pull
-on hf/models/myorg/secret`. Not 404, which would send the user looking for a typo in a
+on models/myorg/secret`. Not 404, which would send the user looking for a typo in a
 correct repo id. `GatedRepo` because that is the situation — the repository exists and this
 credential is not on its list — and because `huggingface_hub` re-raises it as
 `GatedRepoError` from the `HEAD` every download starts with, where a plain 403 is swallowed
@@ -1135,7 +1162,7 @@ reason is sent to the caller; it describes only their own key and never lists ru
 > the default. A principal whose allowlist is `*` is unaffected. A principal with only
 > registry rules — `docker.io/*` and nothing else — is now **refused every Hugging Face
 > repository**, and so is any key scoped to registry patterns only, even one held by a `*`
-> principal. Before upgrading, add `hf/…` rules for those principals, or set
+> principal. Before upgrading, add `models/…` / `datasets/…` rules for those principals, or set
 > `XHC_HF_RULES=off` to keep the previous behaviour (any live key pulls anything) while you
 > do. With `XHC_HF_AUTH=none` — the default — nothing changes at all.
 
@@ -1351,7 +1378,7 @@ curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals \
      -d '{"subject": "svc:ci"}' -H 'content-type: application/json'
 curl -fsS -H "$H" -X PUT https://cache.example.com/_cache/authz/principals/svc:ci/rules \
      -d '{"rules": ["docker.io/library/* pull", "ghcr.io/myorg/* pull+push",
-                    "hf/models/myorg/* pull"]}' \
+                    "models/myorg/* pull"]}' \
      -H 'content-type: application/json'
 curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals/svc:ci/keys \
      -d '{"label": "ci runner"}' -H 'content-type: application/json'
@@ -1363,7 +1390,7 @@ Or the same from an init container, straight into a file a Secret can be built f
 ```bash
 python -m app.authzctl create-principal svc:ci --exist-ok
 python -m app.authzctl set-rules svc:ci 'docker.io/library/* pull' 'ghcr.io/myorg/* pull+push' \
-    'hf/models/myorg/* pull'
+    'models/myorg/* pull'
 python -m app.authzctl mint svc:ci --label 'ci runner' \
     --secret-file /secrets/muninn-token --secret-file-format token
 ```
@@ -1376,13 +1403,13 @@ docker pull cache.example.com/docker.io/library/alpine:3.20
 
 export HF_ENDPOINT=https://cache.example.com
 export HF_TOKEN="$KEY_ID:$SECRET"          # with XHC_HF_AUTH=key
-hf download myorg/llama-ft                 # allowed by 'hf/models/myorg/* pull'
+hf download myorg/llama-ft                 # allowed by 'models/myorg/* pull'
 hf download otherorg/model                 # 403, GatedRepoError naming the key and repo
 ```
 
 **Rules are enforced on both surfaces.** With `XHC_HF_AUTH=key` and the default
 `XHC_HF_RULES=enforce`, this key pulls `myorg`'s models and nothing else from Hugging Face,
-on a cache hit as on a miss. `hf/…` patterns are pull-only; see
+on a cache hit as on a miss. `models/…` patterns are pull-only; see
 *Rules on the Hugging Face surface* above.
 
 ### Private registries: the cache authenticates as itself
@@ -1708,7 +1735,7 @@ experiments age out.
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h) |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |
 | `XHC_HF_AUTH` | `none` | `key` requires a credential from `XHC_AUTHZ_DB` on the **Hugging Face surface** — the catch-all serving everything not claimed by another router. Accepts Basic **or** `Bearer <key_id>:<secret>`, so a user can set `HF_TOKEN` to that and Hugging Face's own tooling works unchanged. The web root stays public, so a homepage still renders logged out |
-| `XHC_HF_RULES` | `enforce` | with `XHC_HF_AUTH=key`: `enforce` lets a key pull only the Hugging Face repos its rules cover (`hf/models/org/*` and so on), on hits as well as misses; `off` lets any live key pull anything, the behaviour before this setting existed. **Upgrading with `XHC_HF_AUTH=key` on changes behaviour** for principals with only registry rules. See [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules). No effect when `XHC_HF_AUTH=none` |
+| `XHC_HF_RULES` | `enforce` | with `XHC_HF_AUTH=key`: `enforce` lets a key pull only the Hugging Face repos its rules cover (`models/org/*` and so on), on hits as well as misses; `off` lets any live key pull anything, the behaviour before this setting existed. **Upgrading with `XHC_HF_AUTH=key` on changes behaviour** for principals with only registry rules. See [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules). No effect when `XHC_HF_AUTH=none` |
 | `XHC_DOCS` | `1` | FastAPI's `/docs`, `/redoc` and `/openapi.json`. They describe the management API and are unauthenticated by construction; set `0` on a public deployment |
 | `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
@@ -1723,7 +1750,7 @@ experiments age out.
 | `XHC_STREAM_START_TIMEOUT` | `120` | seconds a `stream` miss waits for the first bytes to land |
 | `XHC_STREAM_POLL_INTERVAL` | `0.25` | seconds between checks for new bytes while streaming a miss |
 | `XHC_INGEST_POLICY` | `open` | `open` \| `allowlist` |
-| `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins. Matched against `models/<org>/<name>`, `datasets/<org>/<name>` or `spaces/<org>/<name>`, so the type prefix is required: `models/org/name-*,datasets/my-org/*`. A bare `org/name-*` matches nothing. Case-sensitive, and `*` also matches `/` |
+| `XHC_ALLOW_REPOS` / `XHC_DENY_REPOS` | unset | comma-separated globs; deny wins. Matched against `models/<org>/<name>`, `datasets/<org>/<name>` or `spaces/<org>/<name>`, so the type prefix is required: `models/org/name-*,datasets/my-org/*`. A bare `org/name-*` matches nothing. Case-sensitive, and `*` also matches `/`. Per-key rules use the same shape but match case-insensitively; see [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules) |
 | `XHC_POLICY_SCOPE` | `ingest` | `ingest` \| `all` — whether policy also gates cache hits |
 | `XHC_MAX_FILE_BYTES` | unset | refuse to ingest a file larger than this |
 | `XHC_VIEWER_ENDPOINTS` | `parquet,croissant` | dataset metadata endpoints to cache |

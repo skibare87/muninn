@@ -250,23 +250,23 @@ def test_a_rejected_rule_set_changes_nothing(env):
     grant nor the new one, and a 400 that reads as "nothing happened"."""
     client, _ = env
     _call(client, "POST", "/_cache/authz/principals", {"subject": "svc:ci"}, AUTH)
-    _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules", {"rules": ["a/* pull"]}, AUTH)
+    _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules", {"rules": ["a.io/* pull"]}, AUTH)
     _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules",
-          {"rules": ["b/* pull", "c/* nonsense"]}, AUTH)
+          {"rules": ["b.io/* pull", "c.io/* nonsense"]}, AUTH)
     users = _call(client, "GET", "/_cache/authz/principals", None, AUTH).json()["principals"]
-    assert users[0]["rules"] == [{"pattern": "a/*", "pull": True, "push": False}]
+    assert users[0]["rules"] == [{"pattern": "a.io/*", "pull": True, "push": False}]
 
 
 def test_rule_text_matches_the_console_syntax(env):
     client, _ = env
     _call(client, "POST", "/_cache/authz/principals", {"subject": "svc:ci"}, AUTH)
     r = _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules",
-              {"rules": ["docker.io/library/*", "ghcr.io/me/* pull+push", "x/* push"]}, AUTH)
+              {"rules": ["docker.io/library/*", "ghcr.io/me/* pull+push", "x.io/* push"]}, AUTH)
     assert r.status_code == 200, r.text
     assert r.json()["rules"] == [
         {"pattern": "docker.io/library/*", "pull": True, "push": False},
         {"pattern": "ghcr.io/me/*", "pull": True, "push": True},
-        {"pattern": "x/*", "pull": False, "push": True},
+        {"pattern": "x.io/*", "pull": False, "push": True},
     ]
 
 
@@ -314,7 +314,7 @@ def test_the_hf_surface_consults_rules(env, monkeypatch):
     described had gone. Every assertion here names the exact status, so it
     cannot outlive what it claims.
 
-    An empty allowlist grants nothing on either surface; `hf/...` grants the HF
+    An empty allowlist grants nothing on either surface; `models/...` grants the HF
     repo and nothing on /v2; XHC_HF_RULES=off restores the gate-only behaviour."""
     from app.config import settings
 
@@ -331,7 +331,7 @@ def test_the_hf_surface_consults_rules(env, monkeypatch):
     assert client.get(path, headers=empty).status_code == 403
     assert client.get(tags, auth=(empty_id, empty_secret)).status_code == 403
 
-    hf_id, hf_secret = _provision(client, subject="svc:hf", rules=["hf/models/org/* pull"])
+    hf_id, hf_secret = _provision(client, subject="svc:hf", rules=["models/org/* pull"])
     hf = {"authorization": f"Bearer {hf_id}:{hf_secret}"}
     assert client.get(path, headers=hf).status_code == 200
     assert client.get(tags, auth=(hf_id, hf_secret)).status_code == 403
@@ -606,3 +606,41 @@ def test_every_provisioning_route_is_named_in_the_readme():
                       if r.path.split("{")[0].rstrip("/") not in readme})
     assert not missing, missing
     assert "python -m app.authzctl" in readme
+
+
+# ---------------- Hugging Face rule shapes, on every surface that saves rules ----
+
+
+HF_REFUSALS = [
+    ("hf/models/org/x pull", "'hf/' is not a rule prefix"),
+    ("models/org/x push", "pull-only"),
+    ("model/org/x pull", "unknown type prefix"),
+    ("google/gemma pull", "neither a registry host nor a Hugging Face type"),
+]
+
+
+@pytest.mark.parametrize("line,reason", HF_REFUSALS)
+def test_the_api_refuses_an_hf_rule_it_cannot_enforce_with_the_reason(env, line, reason):
+    client, _ = env
+    _call(client, "POST", "/_cache/authz/principals", {"subject": "svc:ci"}, AUTH)
+    r = _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules", {"rules": [line]}, AUTH)
+    assert r.status_code == 400
+    assert reason in r.text
+
+
+@pytest.mark.parametrize("line,reason", HF_REFUSALS)
+def test_the_cli_refuses_an_hf_rule_it_cannot_enforce_with_the_reason(env, line, reason):
+    _, db = env
+    assert _ctl(db, "create-principal", "svc:ci").returncode == 0
+    r = _ctl(db, "set-rules", "svc:ci", line)
+    assert r.returncode != 0
+    assert reason in r.stderr + r.stdout
+
+
+def test_the_api_and_cli_accept_the_allowlist_shape(env):
+    client, db = env
+    _call(client, "POST", "/_cache/authz/principals", {"subject": "svc:ci"}, AUTH)
+    r = _call(client, "PUT", "/_cache/authz/principals/svc:ci/rules",
+              {"rules": ["models/google/gemma-4-* pull"]}, AUTH)
+    assert r.status_code == 200, r.text
+    assert _ctl(db, "set-rules", "svc:ci", "datasets/org/* pull").returncode == 0
