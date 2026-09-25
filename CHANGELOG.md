@@ -9,6 +9,24 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.23 — 2026-09-25
+
+v0.9.23 -- tier status totals count uploads; GCS verified in a real deployment
+
+/_cache/status tier.reconcile.tier_objects and tier_bytes came only from the
+bucket listing taken at each reconcile, so a first backfill into an empty bucket
+read 0 objects and 0 bytes for its whole run. They now grow with each upload,
+and uploaded_since_listing says how much of the figure is not from a listing.
+
+The README records what a real GCS deployment exercised: metadata-server token
+auth on the XML API, the probe's 404, ListObjectsV2, multipart including a
+single 49.9 GB file (181 GB in all, with no errors), and a verified refill from
+the tier at about 3.6x that day's Hub rate. That is one bucket in one region.
+
+CI now runs the tier suite against a MinIO image pinned by digest.
+minio/minio no longer pulls from Docker Hub.
+
+
 ## v0.9.22 — 2026-09-25
 
 v0.9.22 -- an optional object-store second tier (phase 1), and small files verified
