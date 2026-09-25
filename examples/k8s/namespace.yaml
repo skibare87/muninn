@@ -1,0 +1,12 @@
+# Optional. Drop it from kustomization.yaml to deploy into an existing namespace;
+# the `namespace:` line there decides where everything else lands.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: muninn
+  labels:
+    app.kubernetes.io/name: muninn
+    # The pod runs non-root, read-only, with no capabilities, so it fits the
+    # restricted Pod Security Standard. Enforcing it here makes a later edit
+    # that loosens that fail at admission instead of shipping quietly.
+    pod-security.kubernetes.io/enforce: restricted

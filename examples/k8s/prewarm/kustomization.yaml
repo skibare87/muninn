@@ -1,0 +1,22 @@
+# kubectl apply -k examples/k8s/prewarm
+#
+# Separate from the parent kustomization on purpose: a Job's pod template is
+# immutable, so listing it there would make every later `apply -k` of the cache
+# fail as soon as the prewarm changed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: muninn
+
+resources:
+  - job.yaml
+
+configMapGenerator:
+  - name: muninn-prewarm
+    files:
+      - prewarm.py
+
+images:
+  # Keep in step with ../kustomization.yaml.
+  - name: ghcr.io/skibare87/muninn
+    newTag: SET-ME-X.Y.Z

@@ -1,0 +1,13 @@
+# What the model pods' key may pull, one rule per line, in the syntax of
+# `python -m app.authzctl set-rules`: `<pattern> pull`. The Hugging Face
+# surface is pull-only. Patterns are over models/<repo>, datasets/<repo> and
+# spaces/<repo>; `*` spans `/`; matching is case-INsensitive.
+#
+# The provisioning init container REPLACES the principal's rules with this list
+# on every pod start, so this file is the source of truth: a rule added through
+# the API or the console is removed at the next restart. An empty list is
+# refused rather than applied, because it would revoke everything.
+#
+# Keep XHC_ALLOW_REPOS in statefulset.yaml covering the same repositories;
+# see the comment there for why the two lists are matched differently.
+models/Qwen/Qwen2.5-0.5B-Instruct pull

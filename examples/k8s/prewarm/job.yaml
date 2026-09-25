@@ -1,0 +1,91 @@
+# Prewarm one repository at a pinned commit, and succeed only when Muninn says
+# the job is `done` -- which means the files landed AND passed verification
+# (XHC_HF_VERIFY, on by default; with it off, `done` means landed only).
+#
+# Run it after the StatefulSet is up, and gate a rollout on it:
+#
+#   kubectl apply -k examples/k8s/prewarm
+#   kubectl -n muninn wait --for=condition=complete job/muninn-prewarm --timeout=6h
+#
+# To prewarm something else, edit the env below, then
+#   kubectl -n muninn delete job muninn-prewarm && kubectl apply -k examples/k8s/prewarm
+# (a Job's pod template cannot be changed in place).
+#
+# It holds XHC_MANAGE_TOKEN, which with XHC_AUTHZ_DB set is a KEY-MINTING
+# credential, not just a prewarm credential: Muninn has one management token for
+# the whole /_cache surface. Run it in the Muninn namespace only.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: muninn-prewarm
+  labels:
+    app.kubernetes.io/name: muninn-prewarm
+spec:
+  # A retry re-submits the same prewarm. That is how an `interrupted` job (the
+  # Muninn pod restarted mid-ingest) is resumed: files already cached are
+  # skipped without a request to the Hub, a partial file resumes by Range.
+  backoffLimit: 3
+  # Wall-clock ceiling for all attempts together. Size it to the repo and your
+  # WAN: this example's model is about 1 GB, a 70B model is ~140 GB.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: muninn-prewarm
+        # Admitted by networkpolicy.yaml.
+        muninn-client: "true"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prewarm
+          # Same image as the cache: prewarm.py needs only Python's standard
+          # library, so there is no second image to pin and patch.
+          image: ghcr.io/skibare87/muninn
+          command: ["python", "/opt/muninn-prewarm/prewarm.py"]
+          env:
+            - name: MUNINN_URL
+              value: http://muninn:8080
+            - name: XHC_MANAGE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: muninn-upstream, key: XHC_MANAGE_TOKEN }
+            - name: PREWARM_REPO
+              value: Qwen/Qwen2.5-0.5B-Instruct
+            - name: PREWARM_REPO_TYPE
+              value: model
+            # A 40-hex COMMIT, never a branch: the Job's success then means
+            # these exact bytes are on disk. prewarm.py refuses anything else.
+            - name: PREWARM_REVISION
+              value: 7ae557604adf67be50417f59c2c2f167def9a775
+            # Comma-separated. Many repos ship .safetensors AND .bin copies of
+            # the same weights; without patterns you cache both.
+            - name: PREWARM_ALLOW_PATTERNS
+              value: "*.safetensors,*.json,tokenizer*,merges.txt,vocab.json"
+            # Pinned repos are never evicted. Unpin with DELETE /_cache/pins.
+            - name: PREWARM_PIN
+              value: "1"
+            - name: PREWARM_POLL_SECONDS
+              value: "15"
+            - name: PREWARM_TIMEOUT_SECONDS
+              value: "21600"
+          volumeMounts:
+            - { name: script, mountPath: /opt/muninn-prewarm, readOnly: true }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: script
+          configMap:
+            name: muninn-prewarm

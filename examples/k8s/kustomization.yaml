@@ -1,0 +1,34 @@
+# kubectl apply -k examples/k8s     (after creating the muninn-upstream Secret;
+#                                    see README.md for the order)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: muninn
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - statefulset.yaml
+  - service.yaml
+  - networkpolicy.yaml
+  # NOT secret-template.yaml: it holds placeholders, and applying it would
+  # install a manage token printed in a public repository. Create the Secret
+  # from real values; see README.md.
+  # NOT prewarm/ or model-pod-example.yaml: a Job's pod template is immutable,
+  # so a prewarm listed here would break every later apply that changes it.
+
+configMapGenerator:
+  # The provisioning script and the model pods' rules. The generated name
+  # carries a content hash, so editing either rolls the StatefulSet and the
+  # init container re-applies the rules.
+  - name: muninn-provision
+    files:
+      - provision.py
+      - rules=provision-rules.txt
+
+images:
+  # Pin the release you have tested. Take X.Y.Z from CHANGELOG.md or the
+  # repository's tags; for a pin that cannot move, use `digest:` with the digest
+  # you actually pulled. The placeholder below fails to pull, on purpose.
+  - name: ghcr.io/skibare87/muninn
+    newTag: SET-ME-X.Y.Z

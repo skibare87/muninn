@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: ruff check app scripts tests
+      - run: ruff check app scripts tests examples
       - run: pytest -q
 
   # The unit tests are offline by design. This proves the image still builds on

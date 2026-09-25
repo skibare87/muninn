@@ -1,0 +1,21 @@
+# In-cluster only. Model pods reach it as http://muninn.<namespace>.svc:8080.
+#
+# Plain HTTP, which is fine inside a cluster network you trust and is what the
+# edge side of Muninn is built for. It is NOT fine across an untrusted network:
+# the model pods' key travels on every request, as a Bearer token. Put TLS in
+# front (a service mesh, or an Ingress that terminates it) before exposing this
+# beyond the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: muninn
+  labels:
+    app.kubernetes.io/name: muninn
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: muninn
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

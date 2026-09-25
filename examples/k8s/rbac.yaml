@@ -1,0 +1,47 @@
+# What the provisioning init container needs to publish the model pods' key as
+# a Secret, and nothing more. See README.md, "Why an init container".
+#
+# WHO GETS IT: only the `provision` init container. The pod sets
+# automountServiceAccountToken: false, and the token is projected into a volume
+# mounted by the init container alone -- the serving container, which answers
+# every request from the cluster, holds no Kubernetes credential at all.
+#
+# WHAT IT ALLOWS, and the one part that cannot be narrowed:
+#   get, update  on the ONE Secret named muninn-pod-key
+#   create       on Secrets in this namespace. Kubernetes RBAC cannot restrict
+#                `create` by name (the name is not known until the object is
+#                submitted), so this is namespace-wide. It can create a Secret;
+#                it cannot read, list, change or delete any other.
+# Keep this namespace for Muninn alone so that residual grant touches nothing
+# else. If the model pods live in another namespace, see README.md for moving
+# the Secret there.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: muninn
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: muninn-provision
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["muninn-pod-key"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: muninn-provision
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: muninn-provision
+subjects:
+  - kind: ServiceAccount
+    name: muninn

@@ -1,0 +1,54 @@
+# ============================================================================
+# THIS FILE IS DECORATIVE UNLESS YOUR CLUSTER'S CNI ENFORCES NetworkPolicy.
+#
+# The API server accepts a NetworkPolicy on every cluster and reports success.
+# Whether any packet is ever dropped depends entirely on the network plugin: a
+# CNI without policy support (plain flannel, several managed defaults) stores
+# this object and does nothing with it. Nothing warns you. Test it -- from a pod
+# WITHOUT the label below, `curl http://muninn.<ns>.svc:8080/healthz` must time
+# out -- before you count on it.
+#
+# The control that works regardless of the CNI is XHC_HF_AUTH=key with per-key
+# rules (statefulset.yaml, provision-rules.txt): a request without a live key is
+# refused with 401, and a key can pull only the repositories its rules name, on
+# cache hits as well as misses. This policy narrows WHO CAN CONNECT; the key
+# decides WHAT THEY GET. Keep both.
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: muninn
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: muninn
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Pods that opt in with the label `muninn-client: "true"`, in ANY namespace
+    # (model pods, and the prewarm Job). Narrow namespaceSelector to your model
+    # namespaces if you can. Add your Prometheus here if it scrapes /metrics.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              muninn-client: "true"
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The Hub and its CDNs over HTTPS. Their addresses are neither stable nor
+    # published as a list, so this cannot be narrowed by IP.
+    #
+    # The same rule carries the provisioning init container's calls to the
+    # Kubernetes API (it creates the model pods' Secret). Most CNIs evaluate
+    # egress AFTER the Service address is translated, so the port that matters
+    # is the API server's own -- often 6443, sometimes 443. If provisioning
+    # fails with a timeout, allow your API server's endpoint and port here.
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }
