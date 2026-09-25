@@ -9,6 +9,33 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.25 — 2026-09-25
+
+v0.9.25 -- the management API is off unless XHC_MANAGE_TOKEN is set
+
+BREAKING: when XHC_MANAGE_TOKEN is unset or blank, the whole /_cache management
+API now answers 404 "the management API is disabled (XHC_MANAGE_TOKEN is
+unset)" instead of serving anyone. That covers status, repos, jobs, prewarm,
+pins, policy, evict, orphans, /_cache/docker/* and /_cache/authz/*. To use it,
+set XHC_MANAGE_TOKEN and send `Authorization: Bearer <token>`. /healthz and
+/metrics are unaffected.
+
+Why. An unset token used to mean an open management API. For anyone running
+the public image with default settings, that meant anyone who could reach the
+port could:
+  - change the ingest policy at runtime, widening the one restriction the
+    operator had configured;
+  - prewarm arbitrary repos on the operator's bandwidth, disk and Hub token;
+  - unpin or garbage-collect content.
+
+How. One gate, applied as the route class of every /_cache router, so a route
+added later is covered without having to remember to add it. It runs before
+body parsing, so a malformed request cannot turn a refusal into a 422 that
+confirms the route exists. The token is compared in constant time. Unrouted
+/_cache paths stay local and name the setting. At startup, one warning says
+the API is disabled and how to enable it.
+
+
 ## v0.9.24 — 2026-09-25
 
 v0.9.24 -- GCS listings parse; a listing that cannot be read is an error, not an empty bucket
