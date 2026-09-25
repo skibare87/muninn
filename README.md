@@ -2056,7 +2056,11 @@ error, the queue depth, the keys marked bad and the last reconcile.
 - **GCS, in a real deployment** (regional bucket, uniform access, workload
   identity through the GKE metadata server, `XHC_TIER2_CHECKSUM_HEADER` at its
   `gs://` default of `false`): the XML API accepted the metadata bearer token; the
-  probe passed, including 404 for a missing key; multipart uploads completed,
+  probe passed, including 404 for a missing key; ListObjectsV2 was parsed in full
+  (GCS answers in its own XML namespace, `http://doc.s3.amazonaws.com/2006-03-01`;
+  elements are matched by local name, and a listing that declares keys and yields
+  none is refused rather than read as an empty bucket), observed as the reconcile
+  counting every content object with nothing re-enqueued; multipart uploads completed,
   including a single 49.9 GB file, 181 GB in all with no errors; and a re-prewarm after dropping the local copy filled
   every sha256 file from the tier, verified as it arrived, at about 3.6× that
   day's Hub rate on a small node. That is one bucket in one region, not a
@@ -2064,12 +2068,6 @@ error, the queue depth, the keys marked bad and the last reconcile.
 
 **Not yet verified on the real services:**
 
-- ListObjectsV2 on GCS end to end. GCS answers it in a different XML namespace
-  (`http://doc.s3.amazonaws.com/2006-03-01`) from S3 and MinIO, with single-quoted
-  declarations and extra `Generation` elements; the parser matches element names
-  whatever their namespace, and is tested against the exact response shape a real
-  GCS bucket returned, but has not yet run against live GCS. A listing that
-  declares keys and yields none is refused rather than read as an empty bucket.
 
 - `x-amz-checksum-sha256` on GCS (off by default there) and on R2. If the probe
   reports a 400 on its PUT, set `XHC_TIER2_CHECKSUM_HEADER=false`.
@@ -2078,7 +2076,8 @@ error, the queue depth, the keys marked bad and the last reconcile.
   at every start, so a wrong assumption shows up as an unhealthy tier and not as
   silent misbehaviour.
 
-**`tier_objects` / `tier_bytes` in `/_cache/status`** come from a bucket listing at
+**`tier_objects` / `tier_bytes` in `/_cache/status`** count **content** objects only
+(not index entries or the probe object), and come from a bucket listing at
 each reconcile (startup, then every `XHC_TIER2_RECONCILE_INTERVAL`), plus the
 objects this process has uploaded since (`uploaded_since_listing`). They are not a
 fresh listing on every read.
