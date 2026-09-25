@@ -1432,6 +1432,276 @@ hf download otherorg/model                 # 403, GatedRepoError naming the key 
 on a cache hit as on a miss. `models/…` patterns are pull-only; see
 *Rules on the Hugging Face surface* above.
 
+### Workload identity (JWT)
+
+Pods, CI jobs and client-credentials services can authenticate with a **short-lived token
+their platform already issues**, instead of a static key: a Kubernetes projected
+service-account token, a Keycloak (or any OIDC provider's) `client_credentials` token, a
+GitHub Actions OIDC token. The token authenticates as a **principal** in `XHC_AUTHZ_DB`, and
+that principal's rules apply exactly as they do for a key — same rule syntax, same
+enforcement on `/v2` and on the Hugging Face surface, on hits as on misses.
+
+**Off unless `XHC_JWT_ISSUERS` is set.** It requires `XHC_AUTHZ_DB` and refuses to start
+without it.
+
+#### Configuration
+
+`XHC_JWT_ISSUERS` is JSON: one object, or a list of them. One environment variable rather
+than a file, because the declaration holds no secret and a container, a compose file and a
+Kubernetes `env:` (or `valueFrom: configMapKeyRef`) all set it the same way.
+
+```json
+[{"issuer": "https://kubernetes.default.svc.cluster.local",
+  "audience": "muninn",
+  "subject_template": "k8s:{sub}"},
+ {"issuer": "https://token.actions.githubusercontent.com",
+  "audience": "https://github.com/myorg",
+  "subject_template": "gha:{sub}"}]
+```
+
+| key | | |
+|---|---|---|
+| `issuer` | required | compared **exactly** with the token's `iss`. It is the trust anchor: a discovery document declaring a different issuer is refused |
+| `audience` | required | a string or a list. The token's `aud` must contain one of them. Required because the audience is what says a token was minted **for this cache** — without it, any token the issuer mints for anything would be accepted |
+| `subject_template` | required | how a token names its principal. `{sub}` is the identity claim's value, `{iss}` the issuer. Must start with a literal prefix (or `{iss}`) and contain `{sub}` once |
+| `subject_claim` | `sub` | which claim identifies the caller |
+| `algorithms` | `RS256 RS384 RS512 PS256 PS384 PS512 ES256 ES384 ES512` | allowlist; `EdDSA` may be added. `none` and every `HS*` algorithm are refused at startup |
+| `jwks_uri` | from discovery | `https://…`, or `file:///absolute/path` for a mounted key set |
+| `ca_file` | system CAs | CA bundle for fetching discovery and keys, e.g. a cluster's `ca.crt` |
+| `fetch_token_file` | — | a file whose contents are sent as `Bearer` when fetching discovery and keys; re-read on every fetch |
+| `auto_create` | `false` | create an unknown principal on first sight, with **no rules** |
+| `leeway_s` | `30` | clock skew allowed on `exp`, `nbf` and `iat`; at most `300` |
+| `fetch_timeout_s` | `5` | per fetch of discovery or keys |
+
+Anything else in an issuer object — a misspelt key included — refuses startup with a message
+naming the issuer and the key. So does a missing audience, `none` or `HS256` in
+`algorithms`, two issuers with the same `issuer`, and two templates where one's literal
+prefix is a prefix of the other's (`k8s:{sub}` and `k8s:x{sub}`), because then a token from
+one issuer could name a principal of the other.
+
+**HMAC (`HS256` and family) is not supported at all.** An HMAC issuer shares its signing
+secret with every verifier, so this cache would hold a secret able to mint that issuer's
+tokens; and the classic algorithm-confusion attack — a token signed `HS256` with the RSA
+*public* key as the secret — exists only because a verifier accepted both families. Every
+issuer this is for signs asymmetrically.
+
+**Subjects are encoded.** Principal subjects cannot hold `/`, and a GitHub Actions `sub` is
+`repo:myorg/app:ref:refs/heads/main`. `%`, `/` and control characters in the claim are
+percent-encoded, which cannot map two different values to one subject:
+
+| issuer's claim | `subject_template` | principal |
+|---|---|---|
+| `system:serviceaccount:ml:trainer` | `k8s:{sub}` | `k8s:system:serviceaccount:ml:trainer` |
+| `repo:myorg/app:ref:refs/heads/main` | `gha:{sub}` | `gha:repo:myorg%2Fapp:ref:refs%2Fheads%2Fmain` |
+
+Pick a prefix no other principal uses. A template of `svc:{sub}` lets a token whose `sub` is
+`ci` authenticate as a principal `svc:ci` created for a key.
+
+#### Where a token is accepted
+
+| surface | how | username |
+|---|---|---|
+| Hugging Face (with `XHC_HF_AUTH=key`) | `Authorization: Bearer <jwt>`, which is what `huggingface_hub` sends for `HF_TOKEN` | — |
+| `/v2` | the Basic **password**, which is all docker and containerd send, or `Authorization: Bearer <jwt>` | **ignored**; use `jwt` by convention |
+| `/_cache/*` | **never** | — |
+
+The username is ignored because the token carries the identity; a username that could
+disagree with it would be a second, weaker claim about who is asking.
+
+**The credential's shape decides which verifier runs, once.** A JWT is three base64url
+segments separated by `.`; a key is `<key_id>:<secret>` and its secret never contains a
+`.`. A token that fails is never retried as a key, and a key never as a token, so the reason
+a credential was refused is always the reason of the one verifier that owns it. With
+`XHC_JWT_ISSUERS` unset, nothing is parsed differently from before.
+
+**Not on `/_cache`**, which stays on `XHC_MANAGE_TOKEN` alone. That surface pauses
+eviction, deletes repositories, and — with `XHC_AUTHZ_DB` — mints keys and creates
+administrators. Accepting a workload token there would make every pod whose service
+account an administrator ever granted a rule into a candidate operator of the cache, and
+would turn an issuer compromise into a key-minting capability. Management is rare and
+deliberate; it keeps one credential with one meaning.
+
+**What a refusal says.** A refused token is `401` with the general reason in the body and in
+`X-XHC-Auth-Error` — `token expired`, `wrong audience`, `unknown issuer`, `unknown signing
+key`, `bad signature`, `algorithm not allowed`, `issuer keys unavailable`, `unknown
+principal`, `principal disabled`. On the Hugging Face surface it is also in
+`X-Error-Message`, which `huggingface_hub` prints. The token is never echoed; the specific
+reason (which audience, which kid) is in Muninn's log. The docker CLI prints only the
+status.
+
+**An unknown principal is `401`, not `403`.** A genuine token for nobody this cache knows is
+the same situation as an unknown key id — the credential resolves to no identity — and a
+`403` would make `docker login` report success for a principal that does not exist. With
+`auto_create`, the principal is created (never admin) with **no rules**: it authenticates,
+`docker login` succeeds, and every pull is `403` until an administrator grants it
+something, at which point the same token pulls with no restart. Note that an auto-created
+principal makes the store non-empty, so set `XHC_BOOTSTRAP_ADMIN` if a human is meant to
+become admin by logging in later.
+
+**A disabled principal is refused**, on the very next request, however the change was made
+— the console, `/_cache/authz`, or `authzctl` beside a running server.
+
+**No key scope.** A key can be narrowed to part of its holder's grant; a token has no row to
+hang a narrowing on, so it carries its principal's full rules. To give one workload less,
+give it its own principal — which a per-service-account subject already does.
+
+#### Verification
+
+Signature by the issuer's key set, selected by `kid` (a token without one is refused); the
+key's type must match the token's `alg`, which must be in the issuer's allowlist; `iss`
+exact; `aud` must contain a configured audience; `exp` required; `nbf` and `iat` honoured
+with `leeway_s`. Token headers that name their own key (`jku`, `x5u`, `jwk`) are ignored,
+and a token with `crit` extensions is refused.
+
+- **Keys** come from `jwks_uri`, or from the issuer's discovery document, which must
+  declare exactly the configured issuer and an `https` `jwks_uri` — a document fetched over
+  the network cannot point this cache at a file or at plaintext. They are cached, refreshed
+  every 10 minutes, and refetched when a token names an unknown `kid` (which is how key
+  rotation arrives). **Fetches are rate-limited to one per 30 seconds per issuer**, whatever
+  prompted them, so a flood of tokens with invented `kid`s costs the issuer one request per
+  window, not one per token; a new key is picked up by the first token that uses it after
+  the window.
+- **Issuer unreachable.** With keys already in hand, verification continues with them and
+  the log says so — an issuer outage must not become a cache outage. With none — never
+  fetched since start — every token from that issuer is refused (`issuer keys unavailable`),
+  and the issuer is not retried more than once per window. Keys are fetched in the
+  background at startup, so a cache that boots while the issuer is up rides out a later
+  outage.
+- **A `file://` key set** is read at startup — missing, unreadable or holding no usable key
+  refuses startup — and re-read on refresh, so an updated ConfigMap is picked up without a
+  restart.
+
+**Performance.** A pod pulling a 400-file snapshot presents one token 400 times. The
+verified *identity* is cached per token — keyed by its SHA-256, never the token itself — for
+`XHC_JWT_CACHE_TTL` seconds (default 60) and **never past the token's own `exp`**. What the
+principal may do is *not* cached with it: rules and the disabled flag are read on every
+request from the same store snapshot keys use, refreshed on SQLite's change counter, so
+revocation is immediate.
+
+#### Kubernetes, worked
+
+The service account's `sub` is `system:serviceaccount:<namespace>:<name>`. Find the
+cluster's issuer — it is what goes in `issuer`, byte for byte:
+
+```bash
+kubectl get --raw /.well-known/openid-configuration | jq -r .issuer
+# e.g. https://kubernetes.default.svc.cluster.local
+```
+
+**Muninn** — trusting the cluster, and fetching its keys through the in-cluster API server
+with its own service account:
+
+```yaml
+env:
+  - name: XHC_AUTHZ_DB
+    value: /srv/authz/authz.db
+  - name: XHC_HF_AUTH
+    value: key
+  - name: XHC_JWT_ISSUERS
+    value: >-
+      {"issuer": "https://kubernetes.default.svc.cluster.local",
+       "audience": "muninn",
+       "subject_template": "k8s:{sub}",
+       "jwks_uri": "https://kubernetes.default.svc/openid/v1/jwks",
+       "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+       "fetch_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token"}
+```
+
+Three ways to get the cluster's keys, depending on what the cluster allows. *None has been
+exercised against a live cluster by this project's tests*, which use a fake issuer; check
+yours with the `kubectl` commands shown.
+
+1. **Through the API server, authenticated** (above). The discovery and JWKS endpoints are
+   readable by the `system:service-account-issuer-discovery` ClusterRole, which a default
+   cluster binds to all service accounts — so Muninn's own token works. `jwks_uri` is set
+   explicitly because the discovery document's `jwks_uri` names the API server's
+   *advertised* address, which is often not reachable from a pod.
+2. **Anonymously**, if the cluster binds that role to `system:unauthenticated` (some managed
+   clusters also publish discovery at a public URL). Drop `fetch_token_file`, and `ca_file`
+   too if the URL has a public certificate.
+3. **From a file**, for a Muninn that cannot reach the API server at all (outside the
+   cluster, or a locked-down network). Export the key set and mount it:
+
+   ```bash
+   kubectl get --raw /openid/v1/jwks > jwks.json
+   kubectl create configmap cluster-jwks --from-file=jwks.json
+   ```
+
+   and set `"jwks_uri": "file:///etc/muninn/jwks/jwks.json"`. The file is re-read on
+   refresh; you must update it when the cluster's service-account signing key rotates, or
+   new tokens are refused as `unknown signing key`.
+
+**The workload** — a projected token with audience `muninn`, handed to `huggingface_hub`:
+
+```yaml
+spec:
+  serviceAccountName: trainer            # in namespace ml
+  containers:
+    - name: train
+      env:
+        - name: HF_ENDPOINT
+          value: https://cache.example.com
+        - name: HF_TOKEN_PATH            # and do NOT set HF_TOKEN: it takes priority
+          value: /var/run/secrets/muninn/token
+      volumeMounts:
+        - name: muninn-token
+          mountPath: /var/run/secrets/muninn
+          readOnly: true
+  volumes:
+    - name: muninn-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: muninn
+              expirationSeconds: 3600
+```
+
+**The principal and its rules**, from an init container or a shell beside the server:
+
+```bash
+python -m app.authzctl create-principal k8s:system:serviceaccount:ml:trainer --exist-ok
+python -m app.authzctl set-rules k8s:system:serviceaccount:ml:trainer \
+    'models/myorg/* pull' 'docker.io/library/* pull'
+```
+
+No `mint`: there is no key. The pod's token is the credential, and the kubelet rotates it.
+
+**Token rotation and `huggingface_hub`.** The kubelet refreshes a projected token once it is
+80% through its lifetime (or 24 hours old), replacing the file. `huggingface_hub` 0.34.4
+**re-reads the token file on every request** rather than caching it for the process:
+
+- `constants.py:178` resolves `HF_TOKEN_PATH` once, at import — the *path*, not its contents;
+- `utils/_auth.py:121-123`, `_get_token_from_file()`, does `Path(constants.HF_TOKEN_PATH).read_text()`
+  on every call, with no cache;
+- `utils/_headers.py:154`, `get_token_to_send()`, calls `get_token()` whenever no token was
+  passed explicitly, and `file_download.py:972` (`hf_hub_download`) builds its headers per
+  call — `snapshot_download` calls it per file.
+
+So a long-running process picks up the rotated token on its next file. Three ways to defeat
+that, all avoidable:
+
+- **`HF_TOKEN` in the environment wins over the file** (`utils/_auth.py:49`: Colab, then
+  the environment, then the file). Setting `HF_TOKEN=$(cat …)` at process start freezes the
+  token for the process lifetime; after `expirationSeconds` every request is `401 token
+  expired`. Use `HF_TOKEN_PATH`.
+- **Passing a token explicitly** — `token="…"`, `HfApi(token=…)` — pins that string. Leave it
+  unset, or pass `token=True`, which still reads the file each call.
+- **One download in flight keeps the headers it started with.** Muninn authenticates at the
+  start of each request, so a multi-gigabyte transfer that outlives the token completes;
+  the next file uses the new one.
+
+**Image pulls.** `docker login` stores whatever password it is given, so a token used there
+expires with the token:
+
+```bash
+docker login cache.example.com -u jwt --password-stdin < /var/run/secrets/muninn/token
+```
+
+That suits a CI job that logs in per run. **The kubelet does not present a pod's projected
+token when pulling that pod's images** — it uses `imagePullSecrets` or a credential provider
+— so node-level image pulls through this cache still need a key in an `imagePullSecret`.
+
 ### Private registries: the cache authenticates as itself
 
 Mount the host's Docker credentials and point `XHC_REGISTRY_AUTH_FILE` at them. Whatever
