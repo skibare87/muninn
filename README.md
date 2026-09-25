@@ -1332,9 +1332,10 @@ what lets it rescue an instance whose claim mapping is broken at the provider; i
 it belongs **unset outside an emergency**.
 
 **In this mode it matches the subject only, never the email.** A grant re-applied at every
-login must not key on an address most providers let users edit. An email-shaped value (one
-containing `@`) refuses to start rather than silently matching nobody; use the person's
-subject, which `python -m app.authzctl list` and the console's user list both show. Outside
+login must not key on an address most providers let users edit. A value containing `@` logs
+a loud warning at startup, because an email there matches nobody; it is not refused, because
+some providers issue subjects that contain `@`. Use the person's subject, which
+`python -m app.authzctl list` and the console's user list both show. Outside
 this mode nothing changes: subject or email, at first creation only.
 
 Workload tokens (`XHC_JWT_ISSUERS`) are unaffected: they authenticate `/v2` and the Hugging
@@ -2149,7 +2150,7 @@ choosing it.
 | `XHC_OIDC_PKCE` | `1` | set `0` only if a provider **rejects** the parameter. Not advertising support is not the same as refusing it |
 | `XHC_OIDC_ADMIN_CLAIM` | *(unset)* | id_token claim that decides admin, e.g. `groups` or `realm_access.roles` (dotted for nested). With `XHC_OIDC_ADMIN_VALUE`, admin is recomputed at **every** login — granted or **revoked** — and the first-login grant is off. Both or neither; needs `XHC_OIDC_ISSUER`. See [Admin from the identity provider](#admin-from-the-identity-provider-xhc_oidc_admin_claim) |
 | `XHC_OIDC_ADMIN_VALUE` | *(unset)* | the value that grants admin: equal to a string claim, or to one element of a list claim. Exact match |
-| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself. **With `XHC_OIDC_ADMIN_CLAIM` set it is instead a standing break-glass grant**, applied at every login of that person whatever the claim says, matching the **subject only** (an email-shaped value refuses to start) — leave it unset outside an emergency |
+| `XHC_BOOTSTRAP_ADMIN` | *(unset)* | subject or email granted admin **when their principal is first created**, regardless of how many exist. Needed when machine credentials are migrated in before the first human login. Never consulted again, so it cannot re-promote someone demoted, and it never creates a principal by itself. **With `XHC_OIDC_ADMIN_CLAIM` set it is instead a standing break-glass grant**, applied at every login of that person whatever the claim says, matching the **subject only** (a value containing `@` logs a warning at startup, since an email would match nobody) — leave it unset outside an emergency |
 | `XHC_SESSION_SECRET` | *(unset)* | signs the session cookie. No generated default: a per-process random value logs everyone out on restart and fails to log anyone out across replicas |
 | `XHC_SESSION_TTL` | `43200` | session lifetime in seconds (12h). With `XHC_OIDC_ADMIN_CLAIM`, also the longest an existing session keeps admin after the role is revoked at the provider |
 | `XHC_METRICS_AUTH` | `none` | `token` requires `Authorization: Bearer $XHC_MANAGE_TOKEN` on `/metrics`. Default is open, because `/metrics` is usually already a scrape target and gating it silently stops alerting. Worth setting on a public instance: the `registry` label names your upstreams and `muninn_cache_bytes` is a capacity signal |

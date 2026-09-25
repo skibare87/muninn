@@ -8,6 +8,7 @@ back for reporting on /_cache/status.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -524,18 +525,21 @@ class Settings:
                 "XHC_OIDC_ADMIN_CLAIM is set but XHC_OIDC_ISSUER is not: admin is "
                 "read from the login's id_token, and without an issuer there is no login."
             )
-        # Fails on the ARGUMENTS: in claim mode the bootstrap is a standing
-        # grant matched on the SUBJECT only, so an email here would silently
-        # match nobody -- which surfaces as a failed break-glass, the one moment
-        # it must work. Refused instead, saying what to use.
+        # In claim mode the bootstrap is a standing grant matched on the SUBJECT
+        # only (never the email, which users can often change). An '@' here is
+        # probably an email that will match nobody -- but some providers issue
+        # subjects like user@realm, so it is a loud warning, not a refusal:
+        # refusing a valid subject would disable break-glass for exactly those
+        # operators.
         bootstrap_admin = os.environ.get("XHC_BOOTSTRAP_ADMIN") or None
         if oidc_admin_claim and bootstrap_admin and "@" in bootstrap_admin:
-            raise ValueError(
-                f"XHC_BOOTSTRAP_ADMIN={bootstrap_admin!r} looks like an email, but with "
-                "XHC_OIDC_ADMIN_CLAIM set it matches the SUBJECT only: a grant applied "
-                "at every login must not key on an address users can change. Set it to "
-                "the person's subject -- `python -m app.authzctl list` shows every "
-                "principal's subject, as does the console's user list."
+            logging.getLogger("xhc.config").warning(
+                "XHC_BOOTSTRAP_ADMIN=%r contains '@'. With XHC_OIDC_ADMIN_CLAIM set it "
+                "matches the SUBJECT only, never the email. If this is an email it will "
+                "match nobody and break-glass will not work; set it to the person's "
+                "subject (`python -m app.authzctl list` or the console's user list show "
+                "it). If your provider's subjects contain '@', ignore this.",
+                bootstrap_admin,
             )
 
         metrics_auth = (

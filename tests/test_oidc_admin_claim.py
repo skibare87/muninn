@@ -450,17 +450,20 @@ def test_an_admin_claim_without_a_login_is_refused_at_startup(monkeypatch):
         Settings.from_env()
 
 
-def test_an_email_shaped_bootstrap_is_refused_in_claim_mode(monkeypatch):
+def test_an_at_sign_bootstrap_warns_but_starts_in_claim_mode(monkeypatch, caplog):
+    """Some providers issue subjects like user@realm, so '@' cannot be refused:
+    that would disable break-glass for exactly those operators. It warns."""
     from app.config import Settings
 
     for k, v in _LOGIN_ENV.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setenv("XHC_OIDC_ADMIN_CLAIM", "groups")
     monkeypatch.setenv("XHC_OIDC_ADMIN_VALUE", "admins")
-    monkeypatch.setenv("XHC_BOOTSTRAP_ADMIN", "glass@example.com")
-    with pytest.raises(ValueError, match="SUBJECT only") as exc:
-        Settings.from_env()
-    assert "authzctl list" in str(exc.value), "the refusal must say how to find the subject"
+    monkeypatch.setenv("XHC_BOOTSTRAP_ADMIN", "user@realm")
+    with caplog.at_level("WARNING", logger="xhc.config"):
+        s = Settings.from_env()
+    assert s.bootstrap_admin == "user@realm"
+    assert "SUBJECT only" in caplog.text and "authzctl list" in caplog.text
 
 
 def test_a_subject_bootstrap_is_accepted_in_claim_mode(monkeypatch):
