@@ -858,6 +858,20 @@ async def process(item: Upload) -> str | None:
         log.warning("tier upload of %s failed: %s", item.key, exc)
         result = "failed"
     metrics.record_tier_upload(result)
+    if result == "ok":
+        # Keep the status totals live between listings: they are set from a
+        # bucket listing at each reconcile (startup, then every interval), and
+        # without this a first backfill of an empty bucket read 0 objects and
+        # 0 bytes throughout. Listed + uploaded since, not a fresh listing.
+        rec = _s.reconcile
+        if isinstance(rec, dict) and "tier_objects" in rec:
+            try:
+                size = item.path.stat().st_size if item.path is not None else 0
+            except OSError:
+                size = 0
+            rec["tier_objects"] += 1
+            rec["tier_bytes"] += size
+            rec["uploaded_since_listing"] = rec.get("uploaded_since_listing", 0) + 1
     if result in ("ok", "skipped_exists"):
         for idx in item.then:
             await _put_index(idx)

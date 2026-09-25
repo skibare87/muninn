@@ -1043,3 +1043,19 @@ def test_the_bytes_read_counter_ignores_heads(fake, tmp_path):
     asyncio.run(tier.process(tier._content(_hf_key(), p, ETAG)))  # HEAD -> exists
     snap = metrics.snapshot()
     assert snap["tier_bytes_read"] == 0 and snap["tier_bytes_written"] == 0
+
+
+def test_status_totals_count_uploads_made_after_the_listing(fake, tmp_path, monkeypatch):
+    """A first backfill of an empty bucket must not report 0 objects throughout:
+    the totals come from a listing at reconcile time, then grow with each upload."""
+    monkeypatch.setattr(tier._s, "reconcile", {"tier_objects": 0, "tier_bytes": 0})
+    p = tmp_path / "blob"
+    p.write_bytes(TRUE_BYTES)
+    assert asyncio.run(tier.process(tier._content(_hf_key(), p, ETAG))) == "ok"
+    rec = tier._s.reconcile
+    assert rec["tier_objects"] == 1
+    assert rec["tier_bytes"] == len(TRUE_BYTES)
+    assert rec["uploaded_since_listing"] == 1
+    # An object already present is not double-counted.
+    assert asyncio.run(tier.process(tier._content(_hf_key(), p, ETAG))) == "skipped_exists"
+    assert tier._s.reconcile["tier_objects"] == 1

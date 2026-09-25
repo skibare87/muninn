@@ -2049,19 +2049,33 @@ runs in the background, so a bucket that is down at boot delays nothing. The
 result is in the `tier` block of `/_cache/status`, which also shows the last
 error, the queue depth, the keys marked bad and the last reconcile.
 
-**What has been tested against a real server:** MinIO only (`pytest -m minio`,
-and a CI job). That covers SigV4, the payload hash, `x-amz-checksum-sha256`,
-multipart, ListObjectsV2 pagination and the probe's 404. It verifies **nothing**
-about R2, GCS, B2 or AWS themselves. **Not yet verified on the real services:**
+**What has been tested against real servers:**
 
-- GCS XML API accepting the metadata server's bearer token.
-- GCS answering ListObjectsV2 and the multipart calls.
-- `x-amz-checksum-sha256` on R2. It is off by default for `gs://`. If the probe
+- **MinIO** (`pytest -m minio`, and a CI job): SigV4, the payload hash,
+  `x-amz-checksum-sha256`, multipart, ListObjectsV2 pagination and the probe's 404.
+- **GCS, in a real deployment** (regional bucket, uniform access, workload
+  identity through the GKE metadata server, `XHC_TIER2_CHECKSUM_HEADER` at its
+  `gs://` default of `false`): the XML API accepted the metadata bearer token; the
+  probe passed, including 404 for a missing key; ListObjectsV2 drove the startup
+  reconcile; multipart uploads completed, including a single 49.9 GB file, 181 GB
+  in all with no errors; and a re-prewarm after dropping the local copy filled
+  every sha256 file from the tier, verified as it arrived, at about 3.6× that
+  day's Hub rate on a small node. That is one bucket in one region, not a
+  guarantee about GCS in general.
+
+**Not yet verified on the real services:**
+
+- `x-amz-checksum-sha256` on GCS (off by default there) and on R2. If the probe
   reports a 400 on its PUT, set `XHC_TIER2_CHECKSUM_HEADER=false`.
-- R2's single-PUT size limit.
-- 403-versus-404 for a missing key on R2 and GCS. The probe checks this against
-  your bucket at every start, so a wrong assumption shows up as an unhealthy
-  tier and not as silent misbehaviour.
+- Anything on R2, B2 or AWS, including R2's single-PUT size limit and its
+  403-versus-404 for a missing key. The probe checks the last against your bucket
+  at every start, so a wrong assumption shows up as an unhealthy tier and not as
+  silent misbehaviour.
+
+**`tier_objects` / `tier_bytes` in `/_cache/status`** come from a bucket listing at
+each reconcile (startup, then every `XHC_TIER2_RECONCILE_INTERVAL`), plus the
+objects this process has uploaded since (`uploaded_since_listing`). They are not a
+fresh listing on every read.
 
 ### Several instances, one bucket
 
