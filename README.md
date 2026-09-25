@@ -328,9 +328,12 @@ They now refuse the same way. Each ingested HF file is hashed and compared
 against its ETag; a mismatch deletes the blob and fails the ingest rather than
 caching it. Set `XHC_HF_VERIFY=0` to turn this off.
 
-**A file whose ETag is not a content hash is reported as `UNVERIFIABLE`, never
-as verified.** The Hub returns a sha256 for LFS files — every weight file — and
-a git object id for the rest, which says nothing about the bytes on disk.
+**Both kinds of Hub ETag are checked.** The Hub returns a sha256 for LFS files —
+every weight file — and the git blob id for the rest (configs, tokenizers,
+small text), which is `sha1(b"blob <size>\0" + content)`: it does cover the
+bytes, and this was measured to match the Hub's ETag on real repos before
+relying on it. Each is checked in the same single pass over the file. **An ETag
+of neither shape is reported as `UNVERIFIABLE`, never as verified.**
 `muninn_ingest_verify_total{result="..."}` carries all three outcomes and each
 is seeded at zero, so a zero means zero and a missing series means the process
 was down.
@@ -2111,6 +2114,7 @@ different library version can move them.
 | one 1 GB file | ~0.3 GiB |
 | single files of 16 - 50 GB (reported from a deployment) | ~2 - 2.5 GiB |
 | a four-file 15 GB snapshot, `XHC_SNAPSHOT_MAX_WORKERS=1` | ~3.0 GiB |
+| a five-file 24.4 GB snapshot, `XHC_SNAPSHOT_MAX_WORKERS=1` (reported from a deployment, working set, not anon) | ~2.6 GiB, against ~2.5 GiB for one 24 GB file on the same node; the same snapshot at 8 in flight was OOM-killed at 4 GiB |
 | the same snapshot, 8 files in flight | ~4.4 GiB |
 | one 3.9 GB file with `HF_HUB_DISABLE_XET=1` on the cache | ~45 MiB |
 

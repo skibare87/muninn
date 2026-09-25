@@ -324,20 +324,49 @@ def test_muninn_accepts_an_honest_file_and_records_it_verified(ingest):
     assert snap["MISMATCH"] == 0
 
 
-def test_a_non_sha256_etag_is_UNVERIFIABLE_and_not_counted_as_verified(ingest):
-    """An ETag that is a git object id rather than a content hash cannot be
-    checked. That is normal and it must not render the same as a pass -- an
-    unverifiable file passed off as verified is the fail-open this project
-    keeps confessing.
-    """
+def _git_blob_id(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def test_a_git_blob_etag_is_verified(ingest):
+    """A small (non-LFS) file's ETag is its git blob id. Measured against the
+    Hub on real repos: sha1(b"blob <size>\\0" + content) equals the ETag."""
     mgr, job, handler, metrics = ingest
-    handler.etag = "a" * 40  # a git object id, not a sha256
+    handler.etag = _git_blob_id(TRUE_BYTES)
+    handler.body = TRUE_BYTES
+
+    _ingest(mgr, job)
+
+    assert job.state == "done", job.error
+    snap = metrics.snapshot()["ingest_verify"]
+    assert snap["VERIFIED"] == 1
+    assert snap["UNVERIFIABLE"] == 0
+
+
+def test_a_git_blob_etag_that_does_not_match_is_a_mismatch(ingest):
+    mgr, job, handler, metrics = ingest
+    handler.etag = _git_blob_id(b"something else entirely")
+    handler.body = TRUE_BYTES
+
+    _ingest(mgr, job)
+
+    assert job.state == "error"
+    assert "IngestDigestMismatch" in (job.error or "")
+    assert metrics.snapshot()["ingest_verify"]["MISMATCH"] == 1
+
+
+def test_an_etag_of_neither_shape_is_UNVERIFIABLE_and_not_counted_as_verified(ingest):
+    """An ETag that is neither a sha256 nor a git blob id cannot be checked.
+    That must not render the same as a pass."""
+    mgr, job, handler, metrics = ingest
+    handler.etag = "weak-etag-1234"
     handler.body = TRUE_BYTES
 
     _ingest(mgr, job)  # accepted: nothing to check against
 
     assert job.state == "done", job.error
-    assert Path(job.result_path).read_bytes() == TRUE_BYTES
     snap = metrics.snapshot()["ingest_verify"]
     assert snap["UNVERIFIABLE"] == 1
     assert snap["VERIFIED"] == 0, "unverifiable must never be counted as verified"
@@ -413,7 +442,8 @@ def test_verify_tree_hashes_each_blob_once_and_reports_all_three_outcomes(tmp_pa
 
     root = tmp_path
     snap, _, _ = _plant(root, "good.bin", TRUE_BYTES, HONEST_ETAG)
-    _plant(root, "gitfile.txt", b"small config", "b" * 40)  # git oid: unverifiable
+    _plant(root, "gitfile.txt", b"small config", _git_blob_id(b"small config"))  # git blob id: verified
+    _plant(root, "weak.txt", b"other", "weak-etag")  # neither shape: unverifiable
     _plant(root, "bad.bin", b"x" * len(TRUE_BYTES), LYING_ETAG)  # wrong content
     (snap / "alias.bin").symlink_to(snap / "good.bin")  # second ref, same inode
 
@@ -421,12 +451,12 @@ def test_verify_tree_hashes_each_blob_once_and_reports_all_three_outcomes(tmp_pa
     tv = jobs.verify_tree(snap, since=0)
     verified, unverifiable, mismatches = tv.verified, tv.unverifiable, tv.mismatches
 
-    assert verified == 1, "the duplicate reference must not be hashed twice"
+    assert verified == 2, "the duplicate reference must not be hashed twice"
     assert unverifiable == 1
     assert len(mismatches) == 1
     assert "bad" in mismatches[0] or LYING_ETAG in mismatches[0]
     snapshot = metrics.snapshot()["ingest_verify"]
-    assert snapshot["VERIFIED"] == 1
+    assert snapshot["VERIFIED"] == 2
     assert snapshot["UNVERIFIABLE"] == 1
     assert snapshot["MISMATCH"] == 1
 

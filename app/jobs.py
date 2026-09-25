@@ -46,6 +46,9 @@ except ImportError:  # pragma: no cover - private name, keep a sane default
 # use. So this is not a guarantee invented here; it is one the library already
 # implements on a path we do not take.
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# A non-LFS file's ETag is its git blob id: sha1(b"blob <size>\0" + content).
+# Measured against the Hub on real repos before relying on it.
+_GIT_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class IngestDigestMismatch(Exception):
@@ -81,14 +84,25 @@ def verify_ingested(path: Path) -> str:
     """
     blob = path.resolve()
     etag = blob.name
-    if not _SHA256_RE.match(etag):
-        # A git object id, or a copy-mode cache with no symlink to read. Not a
-        # failure -- but it must not be counted as a pass either.
+    if _SHA256_RE.match(etag):
+        h = hashlib.sha256()
+    elif _GIT_SHA1_RE.match(etag):
+        # A small (non-LFS) file: the ETag is the git blob id, which covers the
+        # content through a header naming its length. Same single pass.
+        try:
+            size = blob.stat().st_size
+        except OSError as exc:
+            metrics.record_ingest_verify("MISMATCH")
+            raise IngestDigestMismatch(f"could not stat {blob} to verify: {exc}") from exc
+        h = hashlib.sha1(usedforsecurity=False)
+        h.update(b"blob %d\0" % size)
+    else:
+        # A copy-mode cache with no symlink to read, or an ETag of neither
+        # shape. Not a failure -- but it must not be counted as a pass either.
         metrics.record_ingest_verify("UNVERIFIABLE")
-        log.debug("ingest unverifiable (etag is not a sha256): %s", blob)
+        log.debug("ingest unverifiable (etag is neither sha256 nor a git blob id): %s", blob)
         return "UNVERIFIABLE"
 
-    h = hashlib.sha256()
     try:
         with blob.open("rb") as fh:
             for chunk in iter(lambda: fh.read(4 << 20), b""):
