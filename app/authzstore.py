@@ -216,6 +216,12 @@ class AuthzStore:
 
         So migration tooling uses this, where the admin flag is a parameter
         somebody had to type rather than a consequence of ordering.
+
+        WHAT THIS DOES NOT AVOID: any row at all makes the store non-empty, so a
+        principal created here on an empty store still means the first
+        interactive login is NOT made admin. It avoids handing admin to the
+        machine account; it does not preserve the grant for the human. That is
+        what XHC_BOOTSTRAP_ADMIN is for.
         """
         with self._connect() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -231,6 +237,13 @@ class AuthzStore:
             c.commit()
         self._invalidate()
         return Principal(subject, email, is_admin=is_admin, disabled=False)
+
+    def get_principal(self, subject: str) -> Principal | None:
+        with self._connect() as c:
+            r = c.execute("SELECT * FROM principals WHERE subject=?", (subject,)).fetchone()
+        if r is None:
+            return None
+        return Principal(r["subject"], r["email"], bool(r["is_admin"]), bool(r["disabled"]))
 
     def list_principals(self) -> list[Principal]:
         with self._connect() as c:
@@ -341,14 +354,24 @@ class AuthzStore:
         self._invalidate()
 
     def set_key_disabled(self, key_id: str, disabled: bool) -> None:
+        """Raises KeyError for an unknown key, as set_principal_disabled does.
+
+        An UPDATE matching no rows succeeds, so a mistyped key id reported a
+        revocation that revoked nothing.
+        """
         with self._connect() as c:
-            c.execute("UPDATE keys SET disabled=? WHERE key_id=?",
-                      (1 if disabled else 0, key_id))
+            cur = c.execute("UPDATE keys SET disabled=? WHERE key_id=?",
+                            (1 if disabled else 0, key_id))
+            if cur.rowcount == 0:
+                raise KeyError(f"no such key: {key_id}")
         self._invalidate()
 
     def delete_key(self, key_id: str) -> None:
+        """Raises KeyError for an unknown key, for the reason above."""
         with self._connect() as c:
-            c.execute("DELETE FROM keys WHERE key_id=?", (key_id,))
+            cur = c.execute("DELETE FROM keys WHERE key_id=?", (key_id,))
+            if cur.rowcount == 0:
+                raise KeyError(f"no such key: {key_id}")
         self._invalidate()
 
     def list_keys(self, principal: str | None = None) -> list[Key]:

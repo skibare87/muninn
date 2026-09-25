@@ -29,7 +29,7 @@ import logging
 from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import authz, dockerauth, webauth
+from . import authz, authzadmin, dockerauth, webauth
 
 log = logging.getLogger("xhc.console")
 
@@ -57,28 +57,11 @@ def _store():
     return st
 
 
-def _rule_out(rule: authz.Rule) -> dict:
-    return {"pattern": rule.pattern, "pull": rule.pull, "push": rule.push}
-
-
-def _key_out(key: authz.Key) -> dict:
-    """A key as the UI sees it. NOTE what is absent: secret_hash.
-
-    The hash is not the secret, but it is the only thing standing between a
-    stolen database row and a working credential, and there is no reason for it
-    to cross this boundary.
-    """
-    return {
-        "key_id": key.key_id,
-        "label": key.label,
-        "principal": key.principal,
-        "disabled": key.disabled,
-        # What the HOLDER may do, and what THIS KEY may do of that. Reported
-        # separately because a refusal is diagnosed differently depending on
-        # which one stopped it.
-        "rules": [_rule_out(r) for r in key.rules],
-        "scope": [_rule_out(r) for r in key.scope],
-    }
+# One serialisation for every management surface, and it has no secret field
+# and no hash field. Shared with /_cache/authz rather than copied, because the
+# copy that grows a field is the one that leaks.
+_rule_out = authzadmin.rule_out
+_key_out = authzadmin.key_out
 
 
 def _owned_key(request: Request, key_id: str) -> authz.Key:
@@ -161,17 +144,11 @@ async def set_key_scope(request: Request, key_id: str, body: ScopeIn) -> dict:
     registry -- without inventing a separate account to hang the scope on.
     """
     key = _owned_key(request, key_id)
-    parsed = [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
-    # "*" means NO LIMIT, which is what everyone reads it as, so it is stored as
-    # no limit. It is not an escalation and never was: a key is bounded by its
-    # holder's allowlist regardless, so the widest a scope can reach is exactly
-    # what that holder already has.
-    #
-    # An earlier version REFUSED it. That was an error dressed as a control --
-    # it stopped a legitimate edit, protected nothing, and made the interface
-    # behave in a way nobody expects.
-    if any(r.pattern == "*" for r in parsed):
-        parsed = []
+    # "*" means NO LIMIT and is stored as no limit; the reasoning lives with
+    # normalise_scope, which the headless provisioning path shares.
+    parsed = authz.normalise_scope(
+        [authz.Rule(r.pattern, r.pull, r.push) for r in body.rules]
+    )
     _store().set_key_scope(key.key_id, parsed)
     log.info("scope set on key %s: %d rule(s)", key.key_id, len(parsed))
     return {"key_id": key.key_id, "scope": [_rule_out(r) for r in parsed]}
