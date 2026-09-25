@@ -1132,6 +1132,129 @@ way that leaves a tag pointing at the previous manifest — a push that reports 
 having half-succeeded. The login is a browser concern; it does not need to sit in front of
 the bytes.
 
+### Headless provisioning (`/_cache/authz`, `python -m app.authzctl`)
+
+For CI, clusters and anything else with **no identity provider**: create principals, set
+their rules and mint keys without a browser. Two front ends over the same operations — an
+HTTP API behind the manage token, and a CLI shipped in the image that works directly on the
+database, so an init container can provision before the server starts.
+
+> **Setting `XHC_MANAGE_TOKEN` together with `XHC_AUTHZ_DB` makes the manage token a
+> key-minting credential.** Anyone holding it can create an administrator and mint keys for
+> any principal. Handle it as a Secret — never in a compose file, an image, a command line or
+> a CI log — and rotate it the way you would rotate a root password.
+
+**Unconfigured means absent, not open.** The other `/_cache` routes serve anyone when
+`XHC_MANAGE_TOKEN` is unset. These do not: without **both** `XHC_AUTHZ_DB` and a non-empty
+`XHC_MANAGE_TOKEN` every one of them returns `404`, whatever you send. A wrong or missing
+token is `401`.
+
+#### Endpoints
+
+All take and return JSON, authorised by `Authorization: Bearer $XHC_MANAGE_TOKEN`.
+
+| method | path | purpose |
+|---|---|---|
+| `GET` | `/_cache/authz/principals` | principals with their rules and key count |
+| `POST` | `/_cache/authz/principals` | `{"subject": "svc:ci", "email": "", "is_admin": false}` → `201`; `409` if it exists |
+| `DELETE` | `/_cache/authz/principals/{subject}` | delete a principal **and its keys**; `409` for the last admin |
+| `PUT` | `/_cache/authz/principals/{subject}/rules` | replace the grant: `{"rules": ["docker.io/library/* pull"]}`; `400` names a bad line |
+| `POST` | `/_cache/authz/principals/{subject}/keys` | mint: `{"label": "ci", "scope": ["docker.io/library/alpine pull"]}` → `201` with `key_id` and `secret` |
+| `GET` | `/_cache/authz/keys?principal=` | keys, all or one principal's — never a secret or its hash |
+| `POST` | `/_cache/authz/keys/{key_id}/disabled` | `{"disabled": true}` or `false` |
+| `DELETE` | `/_cache/authz/keys/{key_id}` | delete one key |
+
+An unknown principal or key is `404` on every route — disabling a mistyped key id is an
+error, not a `200` that revoked nothing.
+
+- **`is_admin` is `false` unless you send the literal boolean `true`.** Provisioning never
+  goes through the first-login-becomes-admin path, so a machine account created on an empty
+  store is not an admin. Unknown fields are refused (`422`), so a misspelt `is_admin` cannot
+  silently produce the wrong kind of principal.
+- **Rules use the console's syntax**, one per item: `<pattern> pull|push|pull+push`, the
+  verb defaulting to `pull`. A line that does not parse is refused with `400` naming it, and
+  nothing is written. An empty list is accepted and **grants nothing**.
+- **A scope narrows one key** to part of its holder's rules. `*` in a scope means no limit,
+  as in the console.
+- **The server generates the secret**, with the same generator as the console, and returns
+  it **once**, with `Cache-Control: no-store`. Only its SHA-256 is stored; nothing can
+  retrieve it again. There is no way to supply your own.
+- **Subjects** must not contain `/`, control characters or surrounding whitespace, and are
+  refused rather than trimmed. They share a namespace with OIDC subjects, so use a prefix
+  such as `svc:` that no provider will issue.
+- **A provisioned principal makes the store non-empty**, so if you later enable
+  `XHC_OIDC_ISSUER`, the first person to log in is *not* made admin. Set
+  `XHC_BOOTSTRAP_ADMIN` to their subject or email for that.
+
+#### The CLI
+
+```bash
+python -m app.authzctl --db /srv/authz/authz.db <command>   # or set XHC_AUTHZ_DB
+```
+
+| command | |
+|---|---|
+| `create-principal SUBJECT [--email E] [--admin] [--exist-ok]` | `--exist-ok` succeeds on a re-run, but fails if the existing principal's admin flag differs |
+| `set-rules SUBJECT RULE...` | one rule per argument; setting none needs `--empty` |
+| `mint SUBJECT [--label L] [--scope RULE]... [--secret-file PATH]` | the only command that prints a secret |
+| `list` | principals and keys as JSON, never secrets |
+| `disable-key` / `enable-key` / `delete-key KEY_ID` | |
+| `delete-principal SUBJECT` | |
+
+`--secret-file PATH` writes the secret to a **new** file created `0600` and prints only the
+key id. It refuses an existing file (`--overwrite` replaces it) and is created *before*
+minting, so an unwritable path leaves no orphaned key. `--secret-file-format token` writes
+`<key_id>:<secret>`, the form `HF_TOKEN` takes; the default writes the secret alone, which
+is the docker password.
+
+It runs safely beside a live server. The server checks SQLite's own change counter on every
+authentication, so a key minted by the CLI authenticates on the very next request and a key
+disabled by it is refused on the very next request — no restart, no signal.
+
+`mint` is not idempotent: every run creates another key. Mint from a one-shot job, not from
+an init container that re-runs on every pod start, or delete the previous key when you
+replace it.
+
+#### Worked example
+
+Over HTTP:
+
+```bash
+H="Authorization: Bearer $XHC_MANAGE_TOKEN"
+curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals \
+     -d '{"subject": "svc:ci"}' -H 'content-type: application/json'
+curl -fsS -H "$H" -X PUT https://cache.example.com/_cache/authz/principals/svc:ci/rules \
+     -d '{"rules": ["docker.io/library/* pull", "ghcr.io/myorg/* pull+push"]}' \
+     -H 'content-type: application/json'
+curl -fsS -H "$H" -X POST https://cache.example.com/_cache/authz/principals/svc:ci/keys \
+     -d '{"label": "ci runner"}' -H 'content-type: application/json'
+# -> {"key_id": "3f2a…", "secret": "Qm9…", …}   shown once
+```
+
+Or the same from an init container, straight into a file a Secret can be built from:
+
+```bash
+python -m app.authzctl create-principal svc:ci --exist-ok
+python -m app.authzctl set-rules svc:ci 'docker.io/library/* pull' 'ghcr.io/myorg/* pull+push'
+python -m app.authzctl mint svc:ci --label 'ci runner' \
+    --secret-file /secrets/muninn-token --secret-file-format token
+```
+
+Then use the key on both surfaces:
+
+```bash
+echo "$SECRET" | docker login cache.example.com -u "$KEY_ID" --password-stdin
+docker pull cache.example.com/docker.io/library/alpine:3.20
+
+export HF_ENDPOINT=https://cache.example.com
+export HF_TOKEN="$KEY_ID:$SECRET"          # with XHC_HF_AUTH=key
+```
+
+**Rules are enforced on `/v2` only.** On the Hugging Face surface, `XHC_HF_AUTH=key` is a
+gate: any live key passes, whatever its rules, and what may be fetched is decided by the
+server-wide `XHC_INGEST_POLICY` / `XHC_ALLOW_REPOS`. There is no rule syntax for model
+repositories, so do not write `hf/…` patterns expecting them to restrict anything.
+
 ### Private registries: the cache authenticates as itself
 
 Mount the host's Docker credentials and point `XHC_REGISTRY_AUTH_FILE` at them. Whatever
@@ -1209,6 +1332,7 @@ All under `/_cache`. Set `XHC_MANAGE_TOKEN` to require `Authorization: Bearer �
 | `DELETE` | `/_cache/viewer` | drop cached dataset metadata |
 | `POST` | `/_cache/evict` | force an LRU sweep |
 | `DELETE` | `/_cache/repos` | drop a repo, or one `revision` of it (409 if pinned) |
+| various | `/_cache/authz/*` | principals, rules and keys — see *Headless provisioning*. **Requires** the token: absent without it |
 | `GET` | `/healthz` | container healthcheck |
 
 `/_cache/status` echoes the Xet variables the process actually sees. A silently
@@ -1388,7 +1512,7 @@ experiments age out.
 | `XHC_VIEWER_CACHE_TTL` | `3600` | seconds; `0` disables freshness but keeps entries for deleted datasets |
 | `XHC_DATASETS_SERVER` | `https://datasets-server.huggingface.co` | upstream for the `/datasets-server/*` route; empty disables it |
 | `XHC_DATASETS_SERVER_ENDPOINTS` | `splits,first-rows,info,size,is-valid,parquet` | which of those to cache (never `rows`) |
-| `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*` |
+| `XHC_MANAGE_TOKEN` | unset | bearer token for `/_cache/*`. With `XHC_AUTHZ_DB` set it also enables `/_cache/authz`, which **mints keys** — handle it as a Secret |
 | `XHC_STREAM_CHUNK` | `4194304` | LAN read/serve chunk size |
 | `XHC_MAX_RANGES` | `64` | max parts in a multi-range request before the header is ignored |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | **main WAN throughput dial** (`hf_xet` default is 16) |
