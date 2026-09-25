@@ -614,6 +614,7 @@ ENV_TO_SETTING = [
     ("XHC_AUTHZ_DB", "/srv/authz.db", "authz_db", "/srv/authz.db"),
     ("XHC_AUTHZ_DB", "/srv/authz.db", "authz_db", "/srv/authz.db"),
     ("XHC_INGEST_CONCURRENCY", "9", "ingest_concurrency", 9),
+    ("XHC_SNAPSHOT_MAX_WORKERS", "3", "snapshot_max_workers", 3),
     ("XHC_NEGATIVE_TTL", "11", "negative_ttl_s", 11.0),
     ("XHC_ORPHAN_POLICY", "evict", "orphan_policy", "evict"),
     ("XHC_ORPHAN_CHECK_INTERVAL", "77", "orphan_check_interval_s", 77.0),

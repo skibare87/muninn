@@ -794,7 +794,7 @@ class JobManager:
                 token=settings.hf_token,
                 endpoint=settings.upstream,
                 allow_patterns=job.allow_patterns,
-                max_workers=8,
+                max_workers=settings.snapshot_max_workers,
             )
         )
 

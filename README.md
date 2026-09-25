@@ -1728,6 +1728,49 @@ failure mode for a fleet rollout: better to run hot on disk than to evict the
 model every node is about to request. Pin the current working set; let
 experiments age out.
 
+## Sizing memory for ingest
+
+Almost all of the memory an ingest uses belongs to **hf-xet**, the library
+`huggingface_hub` uses to download from Xet storage, not to Muninn. These are
+measurements of peak anonymous memory (the part a container limit kills on, not
+page cache), hf-xet 1.6.0, `huggingface_hub` 0.34.4. They are not guarantees; a
+different library version can move them.
+
+| what was downloaded | peak |
+|---|---|
+| one 3.9 GB file, plain `hf_hub_download`, no Muninn involved | ~2.3 GiB |
+| the same file through Muninn | 1.9 - 2.6 GiB |
+| one 1 GB file | ~0.3 GiB |
+| single files of 16 - 50 GB (reported from a deployment) | ~2 - 2.5 GiB |
+| a four-file 15 GB snapshot, `XHC_SNAPSHOT_MAX_WORKERS=1` | ~3.0 GiB |
+| the same snapshot, 8 files in flight | ~4.4 GiB |
+| one 3.9 GB file with `HF_HUB_DISABLE_XET=1` on the cache | ~45 MiB |
+
+So the peak rises with file size and then levels off around 2 - 2.5 GiB per
+file, climbs somewhat across a multi-file snapshot, and stacks with every file
+or job in flight. Neither `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY`, the range-GET
+count nor `MALLOC_ARENA_MAX` moved it where it was measured.
+
+**Rule of thumb:** allow about 3 GiB per concurrent ingest
+(`XHC_INGEST_CONCURRENCY`) with one file in flight each, plus headroom. Two
+settings multiply:
+
+- `XHC_INGEST_CONCURRENCY` bounds **jobs**.
+- `XHC_SNAPSHOT_MAX_WORKERS` bounds **files within one snapshot job**. It
+  defaults to 1: hf-xet already parallelises inside a file, and one file at a
+  time was also the fastest of 1, 2 and 8 where it was measured.
+
+At startup Muninn compares these against the container's cgroup memory limit and
+logs a warning when the limit looks too small. It warns rather than refuses,
+because the comparison is against the estimates above. A limit that is too
+small shows up as an OOM kill, and the job as `interrupted` in `/_cache/jobs`.
+
+`HF_HUB_DISABLE_XET=1` *on the cache* cuts ingest memory to almost nothing, at a
+throughput cost that depends on the path (about 60% of xet's rate in one
+measurement; much worse has been seen elsewhere) and with `huggingface_hub`'s
+50 GB per-file download limit applying. Measure it on your own network before
+choosing it.
+
 ## Configuration
 
 | variable | default | meaning |
@@ -1757,7 +1800,8 @@ experiments age out.
 | `XHC_HF_AUTH` | `none` | `key` requires a credential from `XHC_AUTHZ_DB` on the **Hugging Face surface** — the catch-all serving everything not claimed by another router. Accepts Basic **or** `Bearer <key_id>:<secret>`, so a user can set `HF_TOKEN` to that and Hugging Face's own tooling works unchanged. The web root stays public, so a homepage still renders logged out |
 | `XHC_HF_RULES` | `enforce` | with `XHC_HF_AUTH=key`: `enforce` lets a key pull only the Hugging Face repos its rules cover (`models/org/*` and so on), on hits as well as misses; `off` lets any live key pull anything, the behaviour before this setting existed. **Upgrading with `XHC_HF_AUTH=key` on changes behaviour** for principals with only registry rules. See [Rules on the Hugging Face surface](#rules-on-the-hugging-face-surface-xhc_hf_rules). No effect when `XHC_HF_AUTH=none` |
 | `XHC_DOCS` | `1` | FastAPI's `/docs`, `/redoc` and `/openapi.json`. They describe the management API and are unauthenticated by construction; set `0` on a public deployment |
-| `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests |
+| `XHC_INGEST_CONCURRENCY` | `4` | simultaneous WAN ingests (jobs) |
+| `XHC_SNAPSHOT_MAX_WORKERS` | `1` | files in flight **within** one snapshot ingest, passed to huggingface_hub as `max_workers`. It multiplies with `XHC_INGEST_CONCURRENCY`. Memory is the reason: see *Sizing memory for ingest*. Before this setting existed it was fixed at 8 |
 | `XHC_NEGATIVE_TTL` | `60` | seconds to remember an upstream 404; `0` disables |
 | `XHC_ORPHAN_POLICY` | `retain` | `retain` \| `evict` — what to do with repos deleted upstream |
 | `XHC_ORPHAN_CHECK_INTERVAL` | `21600` | seconds between upstream liveness sweeps; `0` disables |

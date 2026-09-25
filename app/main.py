@@ -18,6 +18,7 @@ from . import (
     dockerauth,
     hfcompat,
     manage,
+    memcheck,
     metrics,
     ocicompat,
     ocigc,
@@ -53,6 +54,9 @@ async def lifespan(app: FastAPI):
     # raises for an unreadable ledger: job history is not protection (see
     # JobManager.load_ledger for why this is the opposite of pins).
     manager.load_ledger()
+    warning = memcheck.check(settings.ingest_concurrency, settings.snapshot_max_workers)
+    if warning:
+        log.warning(warning)
 
     if os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() in ("1", "true", "yes"):
         # This is the exact misconfiguration the whole design exists to avoid.

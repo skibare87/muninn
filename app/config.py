@@ -125,6 +125,12 @@ class Settings:
     # casUrl and pull bytes straight from HF, bypassing this cache.
     block_client_xet: bool = True
     ingest_concurrency: int = 4
+    # Files in flight WITHIN one snapshot ingest (huggingface_hub's max_workers).
+    # XHC_INGEST_CONCURRENCY bounds jobs; this bounds files inside a job, and
+    # the two multiply. hf-xet already parallelises inside a file, so one file
+    # at a time lost no throughput where it was measured and cut peak memory:
+    # a 4-shard 15 GB snapshot peaked at 4505 MiB anon with 8, 3011 with 1.
+    snapshot_max_workers: int = 1
     # Serve a static web root at / so one hostname can be a homepage AND a
     # cache. Unset means the behaviour is exactly as before.
     #
@@ -517,6 +523,7 @@ class Settings:
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
             hf_verify_ingest=_env_bool("XHC_HF_VERIFY", True),
             ingest_concurrency=_env_int("XHC_INGEST_CONCURRENCY", 4),
+            snapshot_max_workers=_env_int("XHC_SNAPSHOT_MAX_WORKERS", 1),
             web_root=os.environ.get("XHC_WEB_ROOT") or None,
             authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
             hf_auth=hf_auth,
