@@ -9,6 +9,30 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.19 — 2026-09-25
+
+v0.9.19 -- files in flight per snapshot are bounded, and the memory limit is checked at startup
+
+A snapshot ingest used to fetch up to 8 files at once, fixed. XHC_INGEST_CONCURRENCY
+bounds jobs, not files within a job, so a single multi-shard prewarm could
+OOM a container sized for one ingest. Almost all ingest memory belongs to hf-xet
+(about 2 - 2.5 GiB per file in flight, measured on hf-xet 1.6.0), and it stacks.
+
+XHC_SNAPSHOT_MAX_WORKERS (default 1) sets files in flight within one snapshot.
+On a four-file 15 GB snapshot, peak anonymous memory was 4505 MiB with 8 and
+3011 MiB with 1, and 1 was also the fastest of 1, 2 and 8 where measured,
+because hf-xet already parallelises inside a file. BEHAVIOUR CHANGE: the
+default drops from 8 to 1; set it back to 8 to restore the old behaviour.
+
+At startup Muninn compares XHC_INGEST_CONCURRENCY and XHC_SNAPSHOT_MAX_WORKERS
+against the container's cgroup memory limit and logs a warning if the limit
+looks too small. It warns rather than refuses because the comparison uses
+measured estimates, not guarantees.
+
+The README gains "Sizing memory for ingest", with the measurements and the
+HF_HUB_DISABLE_XET trade-off.
+
+
 ## v0.9.18 — 2026-09-25
 
 v0.9.18 -- per-key rules on the Hugging Face surface; Muninn is read-only toward the Hub
