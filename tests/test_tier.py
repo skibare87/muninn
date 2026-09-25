@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tierfake import FakeS3
 
-from app import hfcompat, jobs, metrics, ocistore, refs, registry, s3client, tier
+from app import hfcompat, jobs, metrics, ocistore, registry, s3client, tier
 from app.config import Settings, TierSettings, settings
 from app.jobs import manager
 
@@ -156,19 +156,8 @@ async def _settle() -> None:
     await tier.drain()
 
 
-async def _close_clients() -> None:
-    await hfcompat.close_client()
-    await refs.close_client()
-
-
 def _run(coro_fn):
-    async def main():
-        try:
-            return await coro_fn()
-        finally:
-            await _close_clients()
-
-    return asyncio.run(main())
+    return asyncio.run(coro_fn())
 
 
 async def _get(path: str, headers: dict | None = None) -> httpx.Response:

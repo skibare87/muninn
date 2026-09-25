@@ -54,7 +54,6 @@ def _build(monkeypatch, tmp_path, allow_upstream=False, **overrides):
     """
     from fastapi.testclient import TestClient
 
-    from app import hfcompat
     from app.config import settings
 
     (tmp_path / "cache").mkdir(exist_ok=True)
@@ -64,7 +63,6 @@ def _build(monkeypatch, tmp_path, allow_upstream=False, **overrides):
     upstream = _Upstream(allow_upstream)
     monkeypatch.setattr(httpx.AsyncClient, "send",
                         lambda self, req, **kw: upstream.send(self, req, **kw))
-    monkeypatch.setattr(hfcompat, "_client", None, raising=False)
     import app.main as main
 
     main = importlib.reload(main)

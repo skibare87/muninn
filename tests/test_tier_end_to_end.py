@@ -78,14 +78,6 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "miss_policy", "stream")
     monkeypatch.setattr(settings, "orphan_check_interval_s", 0.0)
     monkeypatch.setattr(settings, "state_dir", None)
-    # Module-level HTTP clients left behind by earlier tests are bound to event
-    # loops that no longer exist, and this test runs the lifespan, whose
-    # shutdown closes them. Start from none.
-    from app import hfcompat, orphans, refs, registry
-
-    for mod in (hfcompat, orphans, refs, registry):
-        monkeypatch.setattr(mod, "_client", None)
-
     # Exactly what an operator would set.
     for k, v in {
         "XHC_TIER2": "s3://bkt/muninn",

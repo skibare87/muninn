@@ -141,14 +141,9 @@ def test_a_corrupt_ledger_does_not_stop_the_service_serving(state, monkeypatch):
     """The whole service, through its real startup, with a garbage ledger."""
     from fastapi.testclient import TestClient
 
-    from app import hfcompat, orphans, refs, registry
     from app.main import app
 
     monkeypatch.setattr(settings, "docker_enabled", False)
-    # Shutdown closes these module-level clients. One left behind by an earlier
-    # test belongs to that test's (closed) event loop, so start without them.
-    for mod in (hfcompat, orphans, refs, registry):
-        monkeypatch.setattr(mod, "_client", None)
     ledger = _ledger(state)
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_bytes(b"\x00\xff garbage")

@@ -51,7 +51,7 @@ class _NoUpstream:
 def _import_real_app(monkeypatch, tmp_path, **overrides):
     """app.main, re-imported under these settings with docker and authz ON, so
     every /_cache router is mounted and enumerable."""
-    from app import dockerauth, hfcompat
+    from app import dockerauth
     from app.config import settings
 
     (tmp_path / "cache").mkdir(exist_ok=True)
@@ -71,7 +71,6 @@ def _import_real_app(monkeypatch, tmp_path, **overrides):
     upstream = _NoUpstream()
     monkeypatch.setattr(httpx.AsyncClient, "send",
                         lambda self, req, **kw: upstream.send(self, req, **kw))
-    monkeypatch.setattr(hfcompat, "_client", None, raising=False)
     import app.main as main
 
     return importlib.reload(main), upstream
@@ -306,13 +305,6 @@ def test_metrics_token_mode_is_unchanged(real_app):
 
 def test_startup_warns_once_that_management_is_off(real_app, caplog, monkeypatch):
     from fastapi.testclient import TestClient
-
-    from app import hfcompat, orphans, refs, registry
-
-    # The lifespan closes these clients on shutdown; one left over from another
-    # test belongs to a closed event loop.
-    for mod in (hfcompat, orphans, refs, registry):
-        monkeypatch.setattr(mod, "_client", None, raising=False)
 
     main, _ = real_app(manage_token=None)
     with caplog.at_level(logging.WARNING), TestClient(main.app):
