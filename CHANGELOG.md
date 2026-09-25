@@ -9,6 +9,38 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.15 — 2026-09-25
+
+v0.9.15 -- headless provisioning of principals, rules and keys
+
+Anyone running Muninn for CI or cluster workloads without an identity provider
+can now create credentials without a browser.
+
+  /_cache/authz/*       HTTP, authorised only by XHC_MANAGE_TOKEN
+  python -m app.authzctl  the same operations directly against XHC_AUTHZ_DB,
+                          for an init container before the server starts
+
+Create principals (never admin unless explicitly requested), set their rules,
+mint keys, list, disable, enable and delete. The server generates every secret
+and returns it exactly once, with Cache-Control: no-store; only its hash is
+stored. `--secret-file` writes it to a new 0600 file, and
+`--secret-file-format token` writes key_id:secret for HF_TOKEN. A key minted by
+the CLI authenticates on the next request to a running server.
+
+The surface answers 404 when XHC_AUTHZ_DB or XHC_MANAGE_TOKEN is unset: an unset
+token never means open here. It is always mounted, so a request to it can never
+fall through to the upstream proxy. XHC_MANAGE_TOKEN is now a key-minting
+credential; handle it as a secret.
+
+Rules still apply to the registry surface only. On the Hugging Face surface
+XHC_HF_AUTH=key checks that a key is live, not what it may pull.
+
+Also: disabling or deleting an unknown key id now reports it instead of
+succeeding silently, rule text has one server-side parser shared by the console,
+the API and the CLI, and the /_cache management token is compared in constant
+time.
+
+
 ## v0.9.14 — 2026-09-25
 
 v0.9.14 -- XHC_STATE_DIR keeps durable state off the blob disk
