@@ -33,10 +33,13 @@ push cannot identify itself.
 from __future__ import annotations
 
 import asyncio
+import base64
+import errno
 import hashlib
 import json
 import logging
 import os
+import shutil
 import time
 import uuid as uuidlib
 from dataclasses import dataclass, field
@@ -45,7 +48,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from . import ocistore, pushlimits, registry
+from . import ocistore, pushlimits, registry, statedir
 from .config import settings
 
 log = logging.getLogger("xhc.ocipush")
@@ -110,14 +113,198 @@ class Upload:
         return "sha256:" + self.digest.hexdigest()
 
 
+# --- the durable queue: what a pending push needs, and where it lives ---------
+#
+# A store-forward push that has been answered 201 needs exactly three things to
+# be completed by a later process: the OBLIGATION (upstream, api, repo, digest,
+# and for a manifest the reference it goes to), the BYTES (a blob's content, a
+# manifest's body and media type), and credentials for the upstream. The
+# credentials come from configuration (XHC_REGISTRY_AUTH_FILE), not from the
+# obligation, so they survive anything configuration survives. Upload sessions
+# are deliberately NOT durable: a session that was never finalised was never
+# answered 201, and the client retries it.
+#
+# XHC_STATE_DIR UNSET (the default, unchanged): obligations live in
+# `<docker dir>/_pending/` and the bytes live only in the cache tree. The docker
+# dir is the durable storage; lose it and pending pushes go with it.
+#
+# XHC_STATE_DIR SET: the operator has declared the docker dir disposable, so
+# everything above lives in `$XHC_STATE_DIR/oci/pending/` until the upstream
+# confirms: `<key>.json` (a manifest's body embedded) and `<key>.blob` (a hard
+# link to the landed blob when the two share a filesystem, otherwise a verified
+# copy). Moving only the .json would not have been a fix -- an obligation to
+# forward bytes that no longer exist is still a lost push.
+
+# Kept free on the state volume when a hold has to COPY bytes there. The volume
+# also carries pins, orphan marks and possibly the authz DB; a push that fills
+# it to the last byte would break the writes that protect everything else.
+PENDING_RESERVE_BYTES = 64 * 1024 * 1024
+
+_HELD_SUFFIX = ".blob"
+_TMP_SUFFIXES = (".partial", ".linking", ".writing")
+
+# Bytes currently held in the pending directory (json + blobs). None until
+# first needed, then maintained in memory: the check and the increment in
+# _reserve() run with no await between them, so two concurrent pushes cannot
+# both squeeze under the bound. None again means "re-count from disk".
+_held: dict[str, int | None] = {"bytes": None}
+
+
+def _durable() -> bool:
+    """True when pending pushes must survive the docker dir (XHC_STATE_DIR set)."""
+    return bool(getattr(settings, "state_dir", None))
+
+
+def _legacy_obligations_dir() -> Path:
+    return Path(settings.docker_dir) / "_pending"
+
+
 def _obligations_dir() -> Path:
-    d = Path(settings.docker_dir) / "_pending"
+    d = statedir.oci_dir() / "pending" if _durable() else _legacy_obligations_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+def _stem(key: str) -> str:
+    return key.replace("/", "_").replace(":", "_")
+
+
 def _obligation_path(key: str) -> Path:
-    return _obligations_dir() / (key.replace("/", "_").replace(":", "_") + ".json")
+    return _obligations_dir() / (_stem(key) + ".json")
+
+
+def _held_path(key: str) -> Path:
+    return _obligations_dir() / (_stem(key) + _HELD_SUFFIX)
+
+
+def _tmp_tag() -> str:
+    """Unique per write: two concurrent pushes of the same blob or manifest
+    must not share a temp file, or each could rename the other's half-copy."""
+    return uuidlib.uuid4().hex[:12]
+
+
+def _fsync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_durable(path: Path, data: bytes) -> None:
+    """Temp, fsync, rename, fsync the directory. A crash leaves the old file or
+    the new one, never a truncated obligation that then reads as unreadable."""
+    tmp = path.with_name(f"{path.name}.{_tmp_tag()}.writing")
+    try:
+        with tmp.open("wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_dir(path.parent)
+
+
+def _copy_verified(src: Path, dest: Path, digest: str) -> None:
+    """Copy across filesystems, hashing as it goes. The copy becomes `dest`
+    only if it hashes to `digest` and has been fsynced; otherwise OSError, and
+    nothing is left behind."""
+    tmp = dest.with_name(f"{dest.name}.{_tmp_tag()}.partial")
+    h = hashlib.sha256()
+    try:
+        with src.open("rb") as fin, tmp.open("wb") as fout:
+            while True:
+                data = fin.read(READ_SIZE)
+                if not data:
+                    break
+                h.update(data)
+                fout.write(data)
+            fout.flush()
+            os.fsync(fout.fileno())
+        got = "sha256:" + h.hexdigest()
+        if got != digest:
+            raise OSError(errno.EIO, f"copy of {src} hashes to {got}, expected {digest}")
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_dir(dest.parent)
+
+
+def _link_or_copy(src: Path, dest: Path, digest: str, *, reserve: bool) -> None:
+    """Make `dest` a durable copy of `src`: a hard link when the two share a
+    filesystem (free, and the same already-verified inode), a verified copy
+    when they do not. `reserve` enforces PENDING_RESERVE_BYTES on a copy."""
+    tmp = dest.with_name(f"{dest.name}.{_tmp_tag()}.linking")
+    try:
+        os.link(src, tmp)
+    except OSError:
+        pass
+    else:
+        os.replace(tmp, dest)
+        _fsync_dir(dest.parent)
+        return
+    if reserve:
+        size = src.stat().st_size
+        free = shutil.disk_usage(dest.parent).free
+        if free - size < PENDING_RESERVE_BYTES:
+            raise OSError(errno.ENOSPC,
+                          f"holding {size} bytes would leave {free - size} free on "
+                          f"{dest.parent}, under the {PENDING_RESERVE_BYTES}-byte "
+                          "reserve kept for the rest of the durable state")
+    _copy_verified(src, dest, digest)
+
+
+def _held_total() -> int:
+    if _held["bytes"] is None:
+        total = 0
+        for p in _obligations_dir().iterdir():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        _held["bytes"] = total
+    return _held["bytes"]
+
+
+def _reserve(n: int) -> None:
+    """Claim `n` bytes of the pending area, or refuse the push. Synchronous on
+    purpose: see _held."""
+    cap = getattr(settings, "docker_push_pending_max_bytes", None)
+    total = _held_total()
+    if cap is not None and total + n > cap:
+        raise PushError(
+            507, "UNAVAILABLE",
+            f"store-forward pending area is full: {total} bytes are held awaiting "
+            f"their upstream, this push needs {n} more, and "
+            f"XHC_DOCKER_PUSH_PENDING_MAX_SIZE is {cap}. Refused rather than "
+            "accepted and dropped; retry once pending forwards are delivered "
+            "(GET /_cache/docker/pending).")
+    _held["bytes"] = total + n
+
+
+def _release(n: int) -> None:
+    if _held["bytes"] is not None:
+        _held["bytes"] = max(0, _held["bytes"] - n)
+
+
+def _refusal(exc: OSError, what: str) -> PushError:
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return PushError(
+            507, "UNAVAILABLE",
+            f"cannot hold {what} on the state volume ({exc}); the push was NOT "
+            "accepted. Free space there, or set XHC_DOCKER_PUSH_PENDING_MAX_SIZE "
+            "so this is refused before the volume fills.")
+    return PushError(503, "UNAVAILABLE",
+                     f"cannot hold {what} on the state volume ({exc}); the push "
+                     "was NOT accepted")
 
 
 def _record_obligation(key: str, record: dict) -> None:
@@ -137,9 +324,14 @@ def _record_obligation(key: str, record: dict) -> None:
 
     This is a minimal durable queue, not a general one: one small file per
     outstanding forward, removed on success.
+
+    This lenient form is the XHC_STATE_DIR-unset path, where a failed write has
+    always been logged and the push still accepted. With the state dir set,
+    _record_obligation_strict is used instead: the operator asked for pending
+    pushes to survive the disk, and one whose record was not written would not.
     """
     try:
-        _obligation_path(key).write_text(json.dumps(record))
+        _write_durable(_obligation_path(key), json.dumps(record).encode())
     except OSError:
         # Never fail a push because the marker could not be written -- but say
         # so, because it means this forward will not survive a restart.
@@ -147,8 +339,100 @@ def _record_obligation(key: str, record: dict) -> None:
                       "be LOST if this process restarts before it completes", key)
 
 
+def _record_obligation_strict(key: str, record: dict) -> None:
+    """Write the obligation or raise PushError. Counts against the bound."""
+    data = json.dumps(record).encode()
+    path = _obligation_path(key)
+    grow = max(0, len(data) - (path.stat().st_size if path.exists() else 0))
+    _reserve(grow)
+    try:
+        _write_durable(path, data)
+    except OSError as exc:
+        _release(grow)
+        raise _refusal(exc, f"the record of {key}") from exc
+
+
 def _clear_obligation(key: str) -> None:
-    _obligation_path(key).unlink(missing_ok=True)
+    for p in (_obligation_path(key), _held_path(key)):
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        p.unlink(missing_ok=True)
+        _release(size)
+
+
+def _migrate_legacy() -> None:
+    """XHC_STATE_DIR newly set with pushes already pending: bring them across.
+
+    Obligations MOVE rather than copy. Pins are copied because a stale extra
+    copy of a pin is harmless; a stale extra copy of an obligation re-sends a
+    manifest to a tag that may have moved on since, if the variable is ever
+    unset again. The bytes are held first and the marker written second, so a
+    crash part-way leaves the old marker in place and the next boot repeats.
+
+    A failure to hold bytes that ARE present stops the boot (StateDirError) and
+    leaves the old marker where it was: continuing would mean running with an
+    acknowledged push that the operator believes survives the disk and does
+    not. Bytes already MISSING cannot be held; the marker still moves, so the
+    loss stays visible as a failed forward instead of vanishing.
+    """
+    old_dir = _legacy_obligations_dir()
+    if not _durable() or not old_dir.is_dir():
+        return
+    new_dir = _obligations_dir()
+    for marker in sorted(old_dir.glob("*.json")):
+        dest = new_dir / marker.name
+        if not dest.exists():
+            raw = marker.read_bytes()
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                rec = None
+            try:
+                if not isinstance(rec, dict):
+                    pass    # unreadable moves byte for byte: unreadable is not absent
+                elif rec.get("kind") == "manifest":
+                    held = ocistore.load_manifest(rec["upstream"], rec["digest"])
+                    if "body_b64" not in rec and held is not None:
+                        rec["body_b64"] = base64.b64encode(held.body).decode()
+                        rec["media_type"] = held.media_type
+                        raw = json.dumps(rec).encode()
+                else:
+                    key = f"{rec['upstream']}/{rec['digest']}"
+                    src = ocistore.blob_path(rec["upstream"], rec["digest"])
+                    if src.is_file():
+                        _link_or_copy(src, _held_path(key), rec["digest"], reserve=False)
+                    else:
+                        log.error("migrating the forward of %s: its bytes are already "
+                                  "gone from the docker dir; moving the record so the "
+                                  "loss stays visible", key)
+                _write_durable(dest, raw)
+            except OSError as exc:
+                raise statedir.StateDirError(
+                    f"XHC_STATE_DIR: could not move the pending push {marker} and its "
+                    f"bytes to {new_dir}: {exc}. Refusing to start: that push was "
+                    "acknowledged to a client and would not survive losing the docker "
+                    "dir. The old record is left in place.") from exc
+        marker.unlink()
+        log.warning("migrated pending push %s -> %s (its bytes are held there until "
+                    "the upstream confirms)", marker, dest)
+
+
+def _sweep_strays() -> None:
+    """Held bytes with no obligation are a push that was never acknowledged
+    (the hold is written before the record) or one already delivered whose
+    cleanup was interrupted. Either way nothing is owed; reclaim the space."""
+    if not _durable():
+        return
+    d = _obligations_dir()
+    for p in d.iterdir():
+        stray = p.name.endswith(_TMP_SUFFIXES) or (
+            p.name.endswith(_HELD_SUFFIX)
+            and not (d / (p.name[: -len(_HELD_SUFFIX)] + ".json")).exists())
+        if stray:
+            log.info("removing %s from the pending area: nothing is owed for it", p.name)
+            p.unlink(missing_ok=True)
 
 
 def recover() -> list[dict]:
@@ -158,6 +442,9 @@ def recover() -> list[dict]:
     because store-forward's promise to the client was eventual delivery and a
     restart is not a reason to withdraw it.
     """
+    _migrate_legacy()
+    _sweep_strays()
+    _held["bytes"] = None
     out = []
     for marker in sorted(_obligations_dir().glob("*.json")):
         try:
@@ -179,6 +466,26 @@ def recover() -> list[dict]:
     return out
 
 
+async def _fail(exc: Exception) -> None:
+    raise exc
+
+
+def _recovered_manifest(rec: dict) -> tuple[bytes, str] | None:
+    """The body and media type a manifest obligation owes: embedded in the
+    record since obligations became self-contained, from the store for a
+    record written before that."""
+    if "body_b64" in rec:
+        try:
+            body = base64.b64decode(rec["body_b64"])
+        except ValueError:
+            return None
+        if ocistore.compute_digest(body) != rec["digest"]:
+            return None
+        return body, rec.get("media_type") or "application/vnd.oci.image.manifest.v1+json"
+    held = ocistore.load_manifest(rec["upstream"], rec["digest"])
+    return (held.body, held.media_type) if held is not None else None
+
+
 async def resume() -> None:
     """Schedule everything recover() found. Separate so it can be tested."""
     for rec in recover():
@@ -187,16 +494,31 @@ async def resume() -> None:
         key = f"{rec['upstream']}/{rec['digest']}"
         _pinned.add(key)
         if rec.get("kind") == "manifest":
-            held = ocistore.load_manifest(rec["upstream"], rec["digest"])
-            if held is None:
-                log.error("manifest %s was owed to %s but is no longer in the "
-                          "store; cannot resume it", rec["digest"], rec["upstream"])
-                _clear_obligation(key)
-                _pinned.discard(key)
+            got = _recovered_manifest(rec)
+            if got is None:
+                # Kept, pinned and visible as FAILED rather than cleared. This
+                # used to delete the record: an acknowledged push erased with
+                # nothing but a log line to say so. Giving up on it is the
+                # operator's call (DELETE /_cache/docker/pending).
+                log.error("manifest %s was owed to %s but its body is no longer "
+                          "available; cannot resume it", rec["digest"], rec["upstream"])
+                _pending[key] = asyncio.create_task(_fail(PushError(
+                    502, "UNAVAILABLE",
+                    f"manifest {rec['digest']} was acknowledged but its body is "
+                    "gone; it cannot be delivered")))
                 continue
+            body, media_type = got
+            if ocistore.load_manifest(rec["upstream"], rec["digest"]) is None:
+                # Back into the cache (the disk was replaced), so a pull
+                # resolves the tag here while the forward is still owed.
+                try:
+                    _store_manifest(ref, rec["digest"], body, media_type,
+                                    rec["reference"], force_keep=True)
+                except (OSError, ocistore.DigestMismatch):
+                    log.exception("could not restore manifest %s to the cache; "
+                                  "forwarding it anyway", rec["digest"])
             _pending[key] = asyncio.create_task(_forward_manifest_later(
-                ref, held.body, held.media_type, rec["reference"],
-                rec["digest"], key))
+                ref, body, media_type, rec["reference"], rec["digest"], key))
         else:
             _pending[key] = asyncio.create_task(
                 _forward_later(ref, rec["digest"], key))
@@ -472,12 +794,41 @@ async def finalise_blob(up: Upload, claimed: str) -> None:
     # ANSWERED; cache_on_push is WHETHER THE COPY IS KEPT AFTERWARDS. With it
     # off the store is EPHEMERAL -- the blob must survive long enough to be
     # forwarded, and is deleted once upstream confirms.
-    _land(up, claimed, pin=True, force_keep=True)
     key = f"{up.ref.upstream}/{claimed}"
-    _record_obligation(key, {"kind": "blob", "upstream": up.ref.upstream,
-                             "api": up.ref.api, "repo": up.ref.repo,
-                             "digest": claimed})
+    record = {"kind": "blob", "upstream": up.ref.upstream,
+              "api": up.ref.api, "repo": up.ref.repo, "digest": claimed}
+    if _durable():
+        # Held on the state volume BEFORE the 201, or refused. Everything that
+        # can fail happens before _land, so a refusal leaves nothing pinned,
+        # recorded or landed.
+        try:
+            await _hold(up, claimed, key)
+            _record_obligation_strict(key, record)
+        except PushError:
+            discard(up)
+            raise
+        _land(up, claimed, pin=True, force_keep=True)
+    else:
+        _land(up, claimed, pin=True, force_keep=True)
+        _record_obligation(key, record)
     _pending[key] = asyncio.create_task(_forward_later(up.ref, claimed, key))
+
+
+async def _hold(up: Upload, digest: str, key: str) -> None:
+    """Put a copy of a verified upload in the pending area, within the bound.
+
+    Content-addressed, so an existing hold for the same key is already these
+    bytes and is neither re-copied nor re-counted."""
+    held = _held_path(key)
+    if held.is_file():
+        return
+    size = up.path.stat().st_size
+    _reserve(size)
+    try:
+        await asyncio.to_thread(_link_or_copy, up.path, held, digest, reserve=True)
+    except OSError as exc:
+        _release(size)
+        raise _refusal(exc, f"{size} bytes of {digest}") from exc
 
 
 def _land(up: Upload, digest: str, *, pin: bool = False,
@@ -641,9 +992,25 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
     nowhere else, and now collectable by the next GC. A failed forward must
     leave the evidence pinned and visible, not tidy it away.
     """
+    src = ocistore.blob_path(ref.upstream, digest)
+    held = _held_path(key) if _durable() else None
+    if held is not None and held.is_file():
+        # The held copy is what survives the disk, so it is what gets sent.
+        # If the cache copy went with a replaced disk, put it back too, so a
+        # pull (and the HEAD that ensure_forward relies on) finds it here
+        # while delivery is still owed. Best effort: forwarding does not need it.
+        if not src.is_file():
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(_link_or_copy, held, src, digest,
+                                        reserve=False)
+            except OSError:
+                log.exception("could not restore %s to the cache from the pending "
+                              "area; forwarding from the held copy anyway", digest)
+        src = held
     try:
         await _with_retries(
-            lambda: push_blob(ref, ocistore.blob_path(ref.upstream, digest), digest),
+            lambda: push_blob(ref, src, digest),
             what=f"blob {digest} to {ref.upstream}", key=key)
     except asyncio.CancelledError:
         log.warning("store-forward push of %s to %s was CANCELLED; it stays "
@@ -718,12 +1085,22 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
         return digest
 
     # store-forward: land it, answer, deliver behind -- after its blobs.
-    _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
+    #
+    # The body travels IN the obligation, so the record is self-contained: a
+    # manifest owed upstream no longer depends on the cache tree still holding
+    # it, which is the half of a pending push that a replaced disk took away.
     key = f"{ref.upstream}/{digest}"
+    record = {"kind": "manifest", "upstream": ref.upstream, "api": ref.api,
+              "repo": ref.repo, "digest": digest, "reference": reference,
+              "media_type": media_type,
+              "body_b64": base64.b64encode(body).decode()}
+    if _durable():
+        _record_obligation_strict(key, record)     # refused before any 201
+        _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
+    else:
+        _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
+        _record_obligation(key, record)
     _pinned.add(key)
-    _record_obligation(key, {"kind": "manifest", "upstream": ref.upstream,
-                             "api": ref.api, "repo": ref.repo, "digest": digest,
-                             "reference": reference})
     _pending[key] = asyncio.create_task(
         _forward_manifest_later(ref, body, media_type, reference, digest, key))
     return digest

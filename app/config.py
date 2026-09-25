@@ -527,6 +527,13 @@ class Settings:
     # registry does not require writing and mounting a file for one integer.
     # 0 means no chunking: a monolithic PUT, which is what a docker client does.
     docker_blob_chunk: int = 0
+    # Upper bound on the bytes a store-forward push may hold on the STATE
+    # volume while it waits for the upstream (only when XHC_STATE_DIR is set;
+    # see ocipush._reserve). None: bounded only by that volume's free space,
+    # less a reserve kept for pins and the rest of the durable state. Over the
+    # bound a push is REFUSED -- accepting it and dropping it later is the
+    # silent loss the state dir exists to prevent.
+    docker_push_pending_max_bytes: int | None = None
     # Registry-host and image policy. Defaults to `open`, at parity with
     # XHC_INGEST_POLICY on the HF side -- the maintainer's ruling was parity.
     # NOTE the exposure that parity implies: path-prefix routing means anyone
@@ -805,6 +812,9 @@ class Settings:
             ),
             docker_push_limits=os.environ.get("XHC_DOCKER_PUSH_LIMITS") or None,
             docker_blob_chunk=parse_size(os.environ.get("XHC_DOCKER_BLOB_CHUNK"), cls.docker_blob_chunk),
+            docker_push_pending_max_bytes=parse_size(
+                os.environ.get("XHC_DOCKER_PUSH_PENDING_MAX_SIZE"), None
+            ),
             docker_policy=docker_policy,
             allow_registries=os.environ.get("XHC_ALLOW_REGISTRIES", cls.allow_registries),
             deny_registries=os.environ.get("XHC_DENY_REGISTRIES", cls.deny_registries),

@@ -666,6 +666,7 @@ ENV_TO_SETTING = [
     ("XHC_DOCKER_CACHE_ON_PUSH", "0", "docker_cache_on_push", False),
     ("XHC_DOCKER_PUSH_LIMITS", "/cfg/lim.json", "docker_push_limits", "/cfg/lim.json"),
     ("XHC_DOCKER_BLOB_CHUNK", "16Mi", "docker_blob_chunk", 16 * 1024**2),
+    ("XHC_DOCKER_PUSH_PENDING_MAX_SIZE", "2G", "docker_push_pending_max_bytes", 2 * 1024**3),
     # --- interactive login. Only the ones valid ON THEIR OWN live here; the
     # rest are in ENV_GROUPS below, because XHC_OIDC_ISSUER on its own is a
     # configuration error and this table sets exactly one variable per row.

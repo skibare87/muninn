@@ -38,6 +38,12 @@ cache tree (`hf_tree_dir()`), on purpose. So do the prewarm manifests
 (`.xhc/manifests/`, see manifests.py): they describe those blobs and are only
 meaningful while the blobs exist.
 
+Pending store-forward pushes live here too, under `oci/pending/`, but they are
+owned by ocipush.py rather than this module: they MOVE on migration instead of
+being copied (a stale second copy of an obligation would re-send a manifest),
+and they carry the blob bytes they need, because an obligation to forward bytes
+that went with the disk is still a lost push.
+
 The ingest job ledger (`jobs.json`) does live here, because its whole purpose
 is to outlive the process -- but it is history, not protection, and an
 unreadable one never stops the service (see JobManager.load_ledger).
