@@ -153,6 +153,8 @@ def test_under_budget_but_disk_nearly_full_is_loud(monkeypatch, caplog, tmp_path
 
     from app import cachefs
 
+    # Eviction now sweeps stale partials under cache_dir first; keep it here.
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
     monkeypatch.setattr(cachefs, "load_pins", lambda strict=False: set())
     monkeypatch.setattr(cachefs, "load_orphans", lambda strict=False: {})
     monkeypatch.setattr(cachefs, "protected_keys", lambda strict=False: set())
@@ -173,13 +175,15 @@ def test_under_budget_but_disk_nearly_full_is_loud(monkeypatch, caplog, tmp_path
     )
 
 
-def test_plenty_of_free_space_stays_quiet(monkeypatch, caplog):
+def test_plenty_of_free_space_stays_quiet(monkeypatch, caplog, tmp_path):
     """The negative control: the warning must not fire on a healthy disk, or
     it becomes noise and gets filtered, which is the same as not having it."""
     import logging
 
     from app import cachefs
 
+    # Eviction now sweeps stale partials under cache_dir first; keep it here.
+    monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
     monkeypatch.setattr(cachefs, "load_pins", lambda strict=False: set())
     monkeypatch.setattr(cachefs, "load_orphans", lambda strict=False: {})
     monkeypatch.setattr(cachefs, "protected_keys", lambda strict=False: set())
