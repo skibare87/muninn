@@ -556,6 +556,13 @@ _READ_ONLY_POSTS = (
 
 
 def _may_forward(method: str, full_path: str) -> bool:
+    # A GET that is a WRITE: the xet write token is a CAS upload credential for
+    # the cache's own account. Refused here in every mode and whatever
+    # XHC_BLOCK_CLIENT_XET says -- that setting governs read tokens, and handing
+    # this one to anyone with pull access is the exposure this section closes.
+    # With XHC_HF_WRITES=on, hfwrites claims it first and requires push.
+    if "/xet-write-token/" in f"/{full_path}":
+        return False
     if method in ("GET", "HEAD"):
         return True
     if method == "POST":

@@ -406,6 +406,11 @@ write and is refused: commits and preupload, creating, moving or deleting repos,
 tags, settings, LFS uploads, discussions, Space controls, collections. Pushing to the Hub goes
 direct to the Hub, with your own token — unless you opt in to the one exception below.
 
+One `GET` is a write too: `/api/{type}s/<repo>/xet-write-token/<rev>` hands out an upload
+credential for xet storage **as the cache's account**. It is refused with `405` whenever
+`XHC_HF_WRITES` is off, **whatever `XHC_BLOCK_CLIENT_XET` is set to** — that setting governs
+xet *read* tokens. With writes on it is forwarded only to a key granted `push` on the repo.
+
 ### Writes to the Hub (`XHC_HF_WRITES`, off by default)
 
 `XHC_HF_WRITES=on` lets a named set of **repository writes** through the cache, each one only

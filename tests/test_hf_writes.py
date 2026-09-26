@@ -162,6 +162,47 @@ def test_off_is_the_old_405_even_for_a_key_holding_push(env, monkeypatch):
     assert env.hub.calls == []
 
 
+# ---------------------------------------------------------------- xet write token
+
+
+XET_WRITE = "/api/models/org/x/xet-write-token/main"
+
+
+@pytest.mark.parametrize("block", [False, True], ids=["block-xet-0", "block-xet-1"])
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_writes_off_refuses_the_xet_write_token_whatever_the_xet_block(
+        env, monkeypatch, block, method):
+    """A CAS write credential for the cache's account, requested by a GET. With
+    writes off it is a local 405 for everyone -- including a key that could pull
+    the repo, which is exactly who got one before."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "hf_writes", "off")
+    monkeypatch.setattr(settings, "block_client_xet", block)
+    h = env.key(["models/org/* pull"])
+    r = env.client.request(method, XET_WRITE, headers=h)
+    assert r.status_code == 405, f"{method} block={block} -> {r.status_code}"
+    assert env.hub.calls == []
+    # The read side is untouched: the same key still reaches the Hub for a read.
+    assert env.client.get("/api/models/org/x/refs", headers=h).status_code == 200
+
+
+@pytest.mark.parametrize("block", [False, True], ids=["block-xet-0", "block-xet-1"])
+def test_writes_on_the_xet_write_token_needs_push(env, monkeypatch, block):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "block_client_xet", block)
+    r = env.client.get(XET_WRITE, headers=env.key(["models/org/* pull"]))
+    assert r.status_code == 403
+    assert "no rule granting push on models/org/x" in r.headers["x-error-message"]
+    assert env.hub.calls == []
+    r = env.client.get(XET_WRITE, headers=env.key(["models/org/* pull+push"]))
+    assert r.status_code == 200
+    [call] = env.hub.calls
+    assert (call["method"], call["path"]) == ("GET", XET_WRITE)
+    assert call["headers"]["authorization"] == f"Bearer {CACHE_TOKEN}"
+
+
 # ---------------------------------------------------------------- push
 
 
