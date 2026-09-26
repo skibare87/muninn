@@ -9,6 +9,35 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.28 — 2026-09-25
+
+v0.9.28 -- OCI prewarm jobs survive restarts, and "done" means the whole image is verified and present
+
+OCI prewarm (/_cache/docker/prewarm) used to keep its jobs in an unbounded
+in-memory table that was lost on restart. It now uses the same durable,
+bounded ledger as Hugging Face ingest: the shared ledger logic moved into
+app/ledger.py, and the OCI ledger is stored as prewarm.json in the OCI state
+dir.
+
+  - After a restart, a job that was in flight shows as `interrupted`, with its
+    counts. A finished job keeps its result. A corrupt ledger is set aside and
+    a fresh one started; serving is unaffected. The ledger keeps the newest 50
+    jobs for up to 7 days.
+  - Re-submitting an interrupted prewarm resumes it. Blobs already present are
+    skipped, with no upstream request, and `blobs_present` and `resumes`
+    report this.
+  - New: GET /_cache/docker/prewarm lists all prewarm jobs and the ledger's
+    health.
+  - "done" now means verified. Jobs go through `verifying` before `done`, and
+    `done` is set only after every manifest and blob of the image is confirmed
+    on disk. A layer that a GC sweep removes during a long prewarm now ends
+    the job in `error` instead of `done`. Manifests fetched by digest are now
+    checked against the digest that was asked for, not the digest the same
+    response claims.
+  - At shutdown, running prewarms are stopped within a time bound and
+    recorded as `interrupted`.
+
+
 ## v0.9.27 — 2026-09-25
 
 v0.9.27 -- shutdown can no longer hang on a swallowed cancel
