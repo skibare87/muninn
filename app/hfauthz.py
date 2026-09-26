@@ -1,4 +1,4 @@
-"""Per-key rules on the Hugging Face surface (XHC_HF_RULES).
+"""Per-key rules on the Hugging Face surface (XHC_HF_RULES), for reads and writes.
 
 XHC_HF_AUTH=key answers WHO is asking. This answers whether they may have the
 repository they asked for, using the same XHC_AUTHZ_DB rules as /v2 over the
@@ -260,3 +260,64 @@ def require_path(request: Request, full_path: str) -> Response | None:
         return None
     log.error("hf authz: %r forwarded without being authorised", full_path)
     return refusal("this request was not authorised", authz.HF_ANY_ENDPOINT)
+
+
+# ---------------------------------------------------------------------------
+# WRITES (XHC_HF_WRITES=on, app/hfwrites.py). The same decision point as a pull
+# -- authz.decide on the "hf" surface, against the same references classify()
+# produces -- asked with verb `push`, and additionally `delete` for a
+# destructive write. Only the verbs differ; there is no second rule engine.
+# ---------------------------------------------------------------------------
+
+
+def write_refusal(reason: str, reference: str, verbs: str) -> Response:
+    """403 for a write, naming the key, the repository and the grant it lacked.
+
+    NOT GatedRepo, unlike a pull refusal: huggingface_hub turns that code into
+    "cannot access gated repo", which is wrong for a push. A plain 403 with
+    X-Error-Message is printed by hf_raise_for_status as "403 Forbidden: <msg>".
+    """
+    message = _header_safe(f"refused by this cache's rules: {reason}")
+    return JSONResponse(
+        {"error": message,
+         "hint": f"an administrator can grant it with a rule matching '{reference}', "
+                 f"e.g. 'models/<org>/* {verbs}'"},
+        status_code=403,
+        headers={"x-error-message": message, "x-xhc-authz": "denied"},
+    )
+
+
+def decide_write(
+    key: authz.Key | None, needs: list[tuple[authz.Operation, str]]
+) -> tuple[bool, str, str]:
+    """Every (operation, reference) must be granted. (allowed, reason, reference).
+
+    `key` None is a refusal, never "proceed": reaching here without one means
+    authentication was skipped.
+    """
+    if not needs:
+        # Nothing to check is not "allowed": a write whose target could not be
+        # worked out has not been authorised for anything.
+        return False, "the write names no repository", authz.HF_ANY_ENDPOINT
+    for operation, reference in needs:
+        allowed, reason = authz.decide(key, operation, reference, "hf")
+        if not allowed:
+            return False, reason, reference
+    return True, "granted", ""
+
+
+def may_push_somewhere(key: authz.Key | None) -> bool:
+    """Whether this key could push to ANY Hugging Face repository.
+
+    For the one write-path endpoint that names no repository (validate-yaml,
+    which create_commit calls before committing a README). Same two lists as
+    Key.allows -- the holder's grant, then this key's narrowing -- asked of the
+    rules rather than of a reference, because there is no reference to ask.
+    """
+    if key is None or key.disabled:
+        return False
+
+    def pushes(rules: list[authz.Rule]) -> bool:
+        return any(r.push and authz.is_hf_pattern(r.pattern) for r in rules)
+
+    return pushes(key.rules) and (not key.scope or pushes(key.scope))

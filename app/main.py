@@ -17,6 +17,7 @@ from . import (
     console,
     dockerauth,
     hfcompat,
+    hfwrites,
     httpclients,
     jwtauth,
     manage,
@@ -44,6 +45,41 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
 )
 log = logging.getLogger("xhc")
+
+
+def _describe_hf_writes() -> None:
+    """Say at boot what XHC_HF_WRITES means for the rules actually stored.
+
+    A rule granting push on a Hugging Face repository can be SAVED only with
+    writes on, but it can outlive that: turn writes off and it stays in the
+    database, granting nothing, because with writes off no write reaches a
+    decision at all. Deleting or rewriting it on a settings change would make
+    the off switch destructive and unrecoverable; refusing to start would make
+    the off switch -- the one an operator reaches for in an incident -- fail.
+    So it stays, inert, and is COUNTED here, which is what keeps it from being
+    a silent never-match: the operator is told it exists and does nothing.
+    """
+    st = dockerauth.store()
+    push, delete = hfwrites.describe_rules(st) if st is not None else (0, 0)
+    if settings.hf_writes == "on":
+        log.warning(
+            "Hugging Face writes are ENABLED (XHC_HF_WRITES=on): %d stored rule(s) "
+            "grant push on Hugging Face repositories, %d of them delete. Every "
+            "forwarded write appears on the Hub as THIS CACHE'S ACCOUNT, not the "
+            "caller's; the audit log (xhc.hfwrites) is the only record of who asked. "
+            "The HF_TOKEN's own scopes are the outer bound of what any rule can grant.",
+            push, delete,
+        )
+        if not settings.hf_token:
+            log.warning("XHC_HF_WRITES=on with no HF_TOKEN: every forwarded write will be "
+                        "anonymous upstream and refused by the Hub.")
+    elif push:
+        log.warning(
+            "%d stored rule(s) grant push on Hugging Face repositories (%d of them "
+            "delete). They grant NOTHING while XHC_HF_WRITES=off: every write toward "
+            "the Hub is refused locally. Set XHC_HF_WRITES=on to use them, or change "
+            "them to pull.", push, delete,
+        )
 
 
 @asynccontextmanager
@@ -84,6 +120,7 @@ async def lifespan(app: FastAPI):
         )
     if not settings.hf_token:
         log.warning("no HF_TOKEN set; gated repos and higher rate limits unavailable")
+    _describe_hf_writes()
     if not managegate.enabled():
         log.warning(
             "management API is disabled: XHC_MANAGE_TOKEN is unset, so every /_cache "

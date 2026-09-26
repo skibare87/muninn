@@ -37,6 +37,7 @@ from . import (
     cachefs,
     dockerauth,
     hfauthz,
+    hfwrites,
     httpclients,
     managegate,
     metrics,
@@ -393,6 +394,16 @@ def negative_cache_clear() -> int:
     return n
 
 
+def negative_cache_drop_repo(repo_type: str, repo_id: str) -> int:
+    """Forget remembered 404s for one repo, after a write that may have created
+    the file (or the repo) they describe."""
+    target = repo_id.lower()
+    doomed = [k for k in _negative if k[0] == repo_type and k[1].lower() == target]
+    for k in doomed:
+        _negative.pop(k, None)
+    return len(doomed)
+
+
 async def fetch_metadata(repo_type: str, repo_id: str, revision: str, filename: str):
     """HEAD upstream for etag/commit/size. Cheap, and always authoritative."""
     url = upstream_resolve_url(repo_type, repo_id, revision, filename)
@@ -533,6 +544,10 @@ def _reserved_refusal(entry: _Reserved, full_path: str, request: Request) -> Res
 #
 # Applies in EVERY mode, with or without XHC_HF_AUTH and XHC_HF_RULES: this is
 # not authorisation, it is what the cache's credential may be used for.
+#
+# THE ONE EXCEPTION IS OPT-IN: XHC_HF_WRITES=on (app/hfwrites.py). Then a named
+# set of repository writes is forwarded, each only on a per-repo grant, after
+# the credential gate. Anything that set does not name is still refused here.
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_POSTS = (
@@ -550,12 +565,15 @@ def _may_forward(method: str, full_path: str) -> bool:
 
 def _read_only_refusal(request: Request, full_path: str) -> Response:
     log.warning("refused to forward %s /%s: read-only toward the Hub", request.method, full_path)
-    return PlainTextResponse(
-        f"Muninn is read-only toward the Hugging Face Hub: {request.method} requests "
-        "are not forwarded, except the read-only POST endpoints downloads use.\n",
-        status_code=405,
-        headers={"allow": "GET, HEAD"},
-    )
+    if hfwrites.enabled():
+        text = (f"Muninn does not forward this write to the Hugging Face Hub: with "
+                f"XHC_HF_WRITES=on it forwards repository content writes only (commits, "
+                f"uploads, branches, tags, and creating, moving or deleting repos). "
+                f"{request.method} /{full_path} is not one of them.\n")
+    else:
+        text = (f"Muninn is read-only toward the Hugging Face Hub: {request.method} requests "
+                "are not forwarded, except the read-only POST endpoints downloads use.\n")
+    return PlainTextResponse(text, status_code=405, headers={"allow": "GET, HEAD"})
 
 
 def _web_root_file(full_path: str) -> Path | None:
@@ -657,7 +675,11 @@ async def catch_all(full_path: str, request: Request) -> Response:
     #     because the answer is the same for everyone and discloses nothing.
     #     A reserved path is Muninn's and is answered locally below, never
     #     forwarded, so it keeps its own 404.
-    if reserved is None and not _may_forward(request.method, full_path):
+    #     With XHC_HF_WRITES=on, a write hfwrites names is let past HERE and
+    #     nowhere else; it is authorised after the credential gate, at 0w2.
+    write = (hfwrites.match(request.method, full_path)
+             if reserved is None and hfwrites.enabled() else None)
+    if reserved is None and write is None and not _may_forward(request.method, full_path):
         return _read_only_refusal(request, full_path)
 
     # 0a. THE CREDENTIAL GATE FOR THIS ENTIRE SURFACE, and its position is the
@@ -677,6 +699,13 @@ async def catch_all(full_path: str, request: Request) -> Response:
     refused = await dockerauth.authenticate_hf_request(request)
     if refused is not None:
         return refused
+
+    # 0w2. A WRITE (XHC_HF_WRITES=on only). Authorised per repository with push
+    #      (and delete, for a destructive one), its body inspected, forwarded
+    #      and audited, all in hfwrites. Before 0b because 0b asks `pull`, and
+    #      before the xet block because a write token is not a read bypass.
+    if write is not None:
+        return await hfwrites.handle(request, full_path, write)
 
     # 0b. PER-KEY RULES (XHC_HF_RULES), decided from the path alone and before
     #     any branch below, so a cached hit is refused exactly as a miss is.

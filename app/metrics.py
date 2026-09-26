@@ -37,6 +37,8 @@ _ingest_verify: Counter[str] = Counter()  # VERIFIED | UNVERIFIABLE | MISMATCH
 _clients: Counter[str] = Counter()  # by X-Muninn-Client, when sent
 _bytes_served = 0
 _bytes_ingested = 0
+# Writes toward the Hub (XHC_HF_WRITES=on), by outcome. See _HF_WRITE_SERIES.
+_hf_writes: Counter[str] = Counter()
 
 # Docker/OCI counters, kept separate from the HF ones so a registry problem is
 # not averaged away into model traffic and vice versa.
@@ -96,6 +98,20 @@ _DOCKER_SERIES: tuple[tuple[str, str], ...] = (
 # and it is seeded so that a zero means zero rather than "nothing reported yet".
 _INGEST_VERIFY_SERIES: tuple[str, ...] = ("VERIFIED", "UNVERIFIABLE", "MISMATCH")
 
+# Every write that reaches app/hfwrites.py ends in exactly one of these:
+#   forwarded             the Hub answered 1xx-3xx
+#   upstream_rejected     forwarded, and the Hub answered 4xx/5xx
+#   upstream_unreachable  forwarded, and no answer came back
+#   denied                refused locally: a grant was missing
+#   too_large             refused locally: body over XHC_HF_WRITE_MAX_BODY
+#   invalid               refused locally: a body that could not be inspected
+# `denied` is the one worth an alert when it is not expected; `forwarded` is the
+# one that says the cache's own account is changing things on the Hub.
+_HF_WRITE_SERIES: tuple[str, ...] = (
+    "forwarded", "upstream_rejected", "upstream_unreachable",
+    "denied", "too_large", "invalid",
+)
+
 # Results carrying no kind dimension are seeded the same way.
 _REQUEST_SERIES: tuple[str, ...] = (
     "DSSERVER-HIT", "DSSERVER-MISS", "DSSERVER-SYNTHESIZED",
@@ -120,9 +136,20 @@ def _seed() -> None:
         _tier_upload.setdefault(k, 0)
     for k in _TIER_INDEX_SERIES:
         _tier_index_writes.setdefault(k, 0)
+    for k in _HF_WRITE_SERIES:
+        _hf_writes.setdefault(k, 0)
 
 
 _seed()
+
+
+def record_hf_write(result: str) -> None:
+    """One outcome from _HF_WRITE_SERIES. An undeclared result is a bug, and is
+    refused here rather than creating a series nobody seeded."""
+    if result not in _HF_WRITE_SERIES:
+        raise ValueError(f"undeclared hf write result {result!r}")
+    with _lock:
+        _hf_writes[result] += 1
 
 
 def record_request(result: str, client: str | None = None) -> None:
@@ -232,6 +259,7 @@ def snapshot() -> dict:
             "tier_index_writes": dict(_tier_index_writes),
             "tier_bytes_read": _tier_bytes_read,
             "tier_bytes_written": _tier_bytes_written,
+            "hf_writes": dict(_hf_writes),
         }
 
 
@@ -244,6 +272,7 @@ def reset() -> None:
         _tier_verify.clear()
         _tier_upload.clear()
         _tier_index_writes.clear()
+        _hf_writes.clear()
         _tier_bytes_read = 0
         _tier_bytes_written = 0
         _requests.clear()
@@ -345,6 +374,7 @@ def render(gauges: dict[str, float], help_text: dict[str, str] | None = None) ->
         ("muninn_tier_verify_total", "tier_verify"),
         ("muninn_tier_upload_total", "tier_upload"),
         ("muninn_tier_index_writes_total", "tier_index_writes"),
+        ("muninn_hf_writes_total", "hf_writes"),
     ):
         emit(name, "counter",
              [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap[key].items())])

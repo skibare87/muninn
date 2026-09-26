@@ -149,6 +149,18 @@ def invalidate(repo_type: str, repo_id: str, revision: str | None = None) -> Non
             _cache.pop(key, None)
 
 
+def invalidate_repo(repo_type: str, repo_id: str) -> int:
+    """Forget every remembered ref of one repo, matching the id case-insensitively
+    (the Hub does). Called after a write this cache forwarded, so the next pull
+    of a mutable ref asks the Hub instead of waiting out XHC_REF_TTL. Returns
+    how many were dropped."""
+    target = repo_id.lower()
+    doomed = [k for k in _cache if k[0] == repo_type and k[1].lower() == target]
+    for k in doomed:
+        _cache.pop(k, None)
+    return len(doomed)
+
+
 def clear() -> None:
     _cache.clear()
     _locks.clear()
