@@ -9,6 +9,52 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.33 — 2026-09-26
+
+v0.9.33 -- object-store tier phase 2: a cached model survives the Hub going away
+
+A model that was cached, written back and indexed can now be served when the
+Hub is unreachable or the repo has been deleted upstream. The index maps
+revision -> commit -> files; content is fetched from the tier and verified
+against its ETag, whether a sha256 or a git blob id, before a byte is served.
+
+When the tier restores:
+  - on no response at all (transport errors only; a local fault never counts),
+    on any 5xx, and on a 404 for the repo or revision (RepoNotFound,
+    RevisionNotFound). With a valid HF_TOKEN a deleted repo answers 404
+    RepoNotFound (measured), so deletion is survived.
+  - NEVER on 401 or 403: the upstream said no, and serving anyway would bypass
+    a revoked grant. Without a valid HF_TOKEN the Hub answers a missing repo
+    with 401, so a token-less cache survives outages but not deletions.
+  - never on 404 EntryNotFound (the file is not in that revision) or on 429.
+
+Trust. Restore requires an index entry signed with XHC_TIER2_INDEX_KEY. The
+HMAC is recomputed from the configured key and compared in constant time, and
+covers the request's own host, repo, ref or commit, path, and the observation
+time. A copied, moved, re-keyed or re-versioned entry is refused and counted.
+Unsigned entries restore only with XHC_TIER2_RESTORE_UNSIGNED=true, which is
+logged at startup and on every such restore. XHC_TIER2_RESTORE=false turns
+restore off entirely.
+
+Also:
+  - Small non-LFS files (config.json, tokenizers) are now written to the tier,
+    keyed by git blob id, and verified the same way.
+  - A restored ref serves the most recent signed observation, with
+    x-xhc-ref-observed-at and x-xhc-ref-age. A pinned commit has no staleness.
+  - A prewarm whose listing fails with a restore trigger runs entirely from
+    the index, all or nothing.
+  - Restored responses say x-xhc-cache: TIER-RESTORE.
+  - New metrics: muninn_tier_restore_total and muninn_tier_index_reads_total.
+  - Only what was cached, written back and indexed survives. A repo fetched
+    file by file restores only those files.
+
+Fixed on the way: a tier fill took huggingface_hub's per-blob file lock on one
+thread and released it on another, which intermittently failed as a 500 when
+one process filled the same blob twice. Refs requested by revision are now
+recorded in the index, which snapshot_download (fetching by commit) never did.
+A docs test now fails if the README names a setting nothing reads.
+
+
 ## v0.9.32 — 2026-09-26
 
 v0.9.32 -- optional, rule-gated writes to the Hugging Face Hub
