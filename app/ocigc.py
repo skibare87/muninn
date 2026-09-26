@@ -263,7 +263,11 @@ def _enumerate(kind: str) -> list[OnDisk]:
             continue
         for dirpath, _dirs, files in os.walk(base):
             for fn in files:
-                if fn.endswith(".meta") or fn.startswith(".") or ".incomplete" in fn:
+                # Positive match: exactly a digest's hex. Temps from
+                # ocistore._atomic_write, `.incomplete` downloads, `.meta`
+                # sidecars and anything unforeseen are not content, and a GC
+                # that sweeps a live temp fails the write that owns it.
+                if not ocistore.FINAL_NAME_RE.match(fn):
                     continue
                 full = Path(dirpath) / fn
                 try:
@@ -339,8 +343,25 @@ def _partial_digest(fn: str) -> str:
     return "sha256:" + fn.split(".", 1)[0]
 
 
+def _is_write_temp(kind: str, fn: str) -> bool:
+    """A temp from ocistore._atomic_write whose final name is well-formed for
+    the tree it sits in. Anything else is left alone: not ours to delete."""
+    m = ocistore.WRITE_TEMP_RE.match(fn)
+    if not m:
+        return False
+    final = m.group("final")
+    if kind == "manifests":
+        return bool(ocistore.FINAL_NAME_RE.match(final.removesuffix(".meta")))
+    return final.endswith(".json")  # tags: `<tag>@<accept>.json`
+
+
+def _new_counts(age: float) -> dict:
+    return {"scanned": 0, "removed": 0, "freed_bytes": 0, "kept_owned": 0,
+            "kept_locked": 0, "kept_young": 0, "max_age_s": age}
+
+
 def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dict:
-    """Remove `.incomplete` blobs that no download owns any more.
+    """Remove `.incomplete` blobs, and write temps, that nothing owns any more.
 
     A download writes `<digest>.incomplete` (or `.tier.incomplete`) and renames
     it into place on a digest match; a process killed mid-download leaves the
@@ -360,31 +381,52 @@ def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dic
     conservative. Returns what it saw as well as what it did: `scanned` and the
     three `kept_*` counts make a zero `removed` distinguishable from "found
     nothing to look at".
+
+    The same sweep, on the same three guards, reclaims temps that
+    `ocistore._atomic_write` leaves under manifests/ and tags/ when killed
+    between write and rename (`<final>.part<pid>[.<8 hex>]`). There the owner
+    is the in-process write table, and the writer holds the lock until its
+    rename. They are counted in the top-level totals and broken out under
+    `writes`, so a reader can tell a reclaimed download from a reclaimed write.
     """
     from . import ocicompat  # ocicompat imports this module
 
     age = settings.docker_partial_max_age_s if max_age_s is None else max_age_s
-    res = {"scanned": 0, "removed": 0, "freed_bytes": 0, "kept_owned": 0,
-           "kept_locked": 0, "kept_young": 0, "max_age_s": age}
+    res = _new_counts(age)
+    writes = _new_counts(age)
+    res["writes"] = writes
     r = ocistore.root()
     if not r.is_dir():
         return res
     for up in sorted(p for p in r.iterdir() if p.is_dir() and not statedir.is_oci_state_entry(p)):
         base = up / "blobs" / "sha256"
-        if not base.is_dir():
-            continue
-        for dirpath, _dirs, files in os.walk(base):
-            for fn in files:
-                if not fn.endswith(ocistore.PARTIAL_SUFFIX):
-                    continue
-                res["scanned"] += 1
-                _consider_partial(Path(dirpath) / fn, up.name, _partial_digest(fn),
-                                  age, dry_run, res, ocicompat.owns_partial)
+        if base.is_dir():
+            for dirpath, _dirs, files in os.walk(base):
+                for fn in files:
+                    if not fn.endswith(ocistore.PARTIAL_SUFFIX):
+                        continue
+                    res["scanned"] += 1
+                    _consider_partial(Path(dirpath) / fn, up.name, _partial_digest(fn),
+                                      age, dry_run, res, ocicompat.owns_partial)
+        for kind in ("manifests", "tags"):
+            base = up / kind
+            if not base.is_dir():
+                continue
+            for dirpath, _dirs, files in os.walk(base):
+                for fn in files:
+                    if not _is_write_temp(kind, fn):
+                        continue
+                    path = Path(dirpath) / fn
+                    writes["scanned"] += 1
+                    _consider_partial(path, up.name, fn, age, dry_run, writes,
+                                      lambda _u, _d, p=path: ocistore.owns_write(p))
+    for k in ("scanned", "removed", "freed_bytes", "kept_owned", "kept_locked", "kept_young"):
+        res[k] += writes[k]
     if res["removed"]:
-        log.info("docker GC: %s %d stale partial download(s), %d bytes "
+        log.info("docker GC: %s %d stale partial(s), %d of them write temps, %d bytes "
                  "(kept %d owned, %d locked, %d younger than %.0fs)",
                  "would remove" if dry_run else "removed", res["removed"],
-                 res["freed_bytes"], res["kept_owned"], res["kept_locked"],
+                 writes["removed"], res["freed_bytes"], res["kept_owned"], res["kept_locked"],
                  res["kept_young"], age)
     return res
 

@@ -32,7 +32,9 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +44,12 @@ from .config import settings
 log = logging.getLogger("xhc.ocistore")
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# The on-disk name of a blob or manifest: the digest's hex, and nothing else.
+# Walks over blobs/ and manifests/ admit a file ONLY on this exact match, so a
+# temp, a sidecar or anything else that lands there can never be mistaken for
+# content -- a denylist of known non-content suffixes is one new suffix from
+# sweeping a live write.
+FINAL_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 _stats_cache: tuple[float, dict] | None = None
@@ -163,11 +171,51 @@ def partial_is_locked(path: Path) -> bool:
 # -- atomic writes ----------------------------------------------------------
 
 
+#
+# Manifests, their .meta sidecars and tag files are written to a temp beside the
+# target and renamed into place. The temp is `<final name>.part<pid>.<8 hex>`:
+# unique per write, so two threads writing the same manifest cannot rename each
+# other's half-written file. v0.9.29 and earlier wrote `<final name>.part<pid>`,
+# and leftovers in that form are still recognised.
+#
+# A process killed between write and rename leaves the temp behind. The GC
+# reclaims it on the same three guards as a stale `.incomplete` download
+# (ocigc.sweep_partials): no write in this process owns it, no process holds its
+# lock, and it has been idle past XHC_DOCKER_PARTIAL_MAX_AGE. So the writer
+# registers the temp before creating it and holds its lock until the rename.
+
+WRITE_TEMP_RE = re.compile(r"^(?P<final>.+)\.part\d+(?:\.[0-9a-f]{8})?$")
+
+_writing: set[str] = set()
+_writing_lock = threading.Lock()
+
+
+def owns_write(path: Path) -> bool:
+    """True while an `_atomic_write` in THIS process has `path` as its temp."""
+    with _writing_lock:
+        return str(path) in _writing
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".part{os.getpid()}")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.part{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    key = str(tmp)
+    with _writing_lock:
+        _writing.add(key)
+    try:
+        with open(tmp, "wb") as fh:
+            # Held until close, i.e. past the rename: the lock is what a GC in
+            # another process sharing this directory sees.
+            hold_partial(fh)
+            fh.write(data)
+            fh.flush()
+            os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        with _writing_lock:
+            _writing.discard(key)
 
 
 def store_manifest(upstream: str, digest: str, body: bytes, media_type: str) -> None:
@@ -372,7 +420,7 @@ def stats(force: bool = False) -> dict:
                     except OSError:
                         pass
             for _dirpath, _dirnames, filenames in os.walk(up / "manifests"):
-                manifests += sum(1 for fn in filenames if not fn.endswith(".meta"))
+                manifests += sum(1 for fn in filenames if FINAL_NAME_RE.match(fn))
     out = {"blobs": blobs, "manifests": manifests, "bytes": blob_bytes}
     _stats_cache = (now, out)
     return out

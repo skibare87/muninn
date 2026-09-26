@@ -799,6 +799,24 @@ can be told apart from "found nothing to look at". Each removal is logged with i
 size and idle time. Partial bytes are not added to the result's top-level `freed_bytes`,
 which counts blobs and manifests.
 
+**Only a file named exactly by its digest is a blob or manifest.** The GC walk admits a
+file under `blobs/` or `manifests/` only if its name is 64 lowercase hex characters, and
+ignores everything else rather than trying to list what to skip. Manifests, their `.meta`
+sidecars and tag files are written to a temp beside the target
+(`<name>.part<pid>.<8 hex>`; releases up to v0.9.29 wrote `<name>.part<pid>`) and renamed
+into place. Before this rule, the walk read a manifest temp as an unreferenced manifest and
+swept it. That reclaimed leftovers, but only by accident, and in the window between write
+and rename it could delete a live temp, which failed the manifest write.
+
+A temp left by a process killed before its rename is reclaimed by the same partial sweep,
+on the same three guards: no write in this process owns it, no process holds its lock (the
+writer holds an exclusive `flock` on the temp until the rename), and it has been idle for
+`XHC_DOCKER_PARTIAL_MAX_AGE`. Only names of the form `<final>.part<digits>` or
+`<final>.part<digits>.<8 hex>`, where `<final>` is a well-formed name for that tree, are
+considered. Any other file is left alone. These temps count in the `partials` totals and
+are also broken out under `partials.writes` with the same fields, so a reclaimed write can
+be told apart from a reclaimed download.
+
 ### `XHC_DOCKER_TAG_TTL` has three regimes, and `0` is the surprising one
 
 | value | meaning |
@@ -971,7 +989,7 @@ different `pin` value is a different prewarm).
 | `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |
 | `XHC_DOCKER_MAX_BLOB_BYTES` | unset | refuse an oversized layer before bytes move |
 | `XHC_DOCKER_MIN_FREE` | `1G` | below this much free space, a miss is **proxied to the client uncached** instead of ingested; `0` disables |
-| `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob must go unwritten before GC may remove it, and then only if no download owns it and no process holds its lock. See *Garbage collection is mark-and-sweep* |
+| `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob, or a manifest or tag write temp (`.part<pid>`), must go unwritten before GC may remove it, and then only if nothing in this process owns it and no process holds its lock. See *Garbage collection is mark-and-sweep* |
 | `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
 
 > **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing
