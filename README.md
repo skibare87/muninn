@@ -2638,6 +2638,34 @@ become a blob. The `POST /_cache/evict` result breaks the figure down as `blob_b
 `muninn_cache_bytes` still mean blob bytes only. `disk.fs_used` is the filesystem's own
 figure and always included partials.
 
+**Two other things a killed ingest leaves are deliberately not removed.**
+
+- **An empty `snapshots/<commit>/` directory.** `huggingface_hub` creates the snapshot
+  directory and writes `refs/<revision>` before the first byte of a file arrives, so an
+  ingest killed before any file lands leaves an empty snapshot. `/_cache/repos` lists it as
+  a revision with `nb_files: 0`. If a prewarm recorded a manifest for that commit, the
+  revision shows `complete: false` (0 of N files). Without a manifest it shows
+  `complete: null`. Neither reads as a finished snapshot. The sweep leaves the directory
+  alone because it holds no bytes, the next ingest of that commit reuses it, and removing
+  it while `refs/` still names it would make `scan_cache_dir()` reject the whole repo
+  ("Reference(s) refer to missing commit hashes"). That would drop the repo from
+  `/_cache/repos`, and eviction would stop seeing its blobs. Since the ref is written first,
+  a referenced empty snapshot is the usual case.
+- **hf-xet's log files.** hf-xet writes one log file per process (about 44 KB each) to
+  `$HF_XET_CACHE/logs/`, which is `/xet/logs` in the image. hf-xet prunes that directory
+  itself each time a process starts: it deletes logs older than
+  `HF_XET_LOG_DIR_MAX_RETENTION_AGE` (default 14 days), then trims oldest-first to
+  `HF_XET_LOG_DIR_MAX_SIZE` (default `250mb`). It never deletes a file younger than
+  `HF_XET_LOG_DIR_MIN_DELETION_AGE` (default 1 day) or one whose process is still running.
+  This was checked against hf-xet 1.6.0's source (xet-core `v1.6.0`,
+  `xet_runtime/src/config/groups/log.rs` and `logging/init.rs`) and by running it: a
+  30-day-old log was removed at import, and a 3-day-old one was kept. Muninn adds no
+  pruner of its own, because that would be a second mechanism deleting the same files. To
+  tighten the bound, set those variables. To write no files at all, set
+  `HF_XET_LOG_DEST=""`, which sends hf-xet's logs to the console at `warn` level.
+  `RUST_LOG` sets the level. `HF_XET_LOG_DIR_DISABLE_CLEANUP` turns pruning off, so leave
+  it unset. A test fails if an hf-xet upgrade stops pruning.
+
 ## Sizing memory for ingest
 
 Almost all of the memory an ingest uses belongs to **hf-xet**, the library
@@ -2744,6 +2772,8 @@ choosing it.
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` (image) | range-GET parallelism in older `hf_xet`. **On hf-xet 1.6.0 it appears to have no effect:** the name is absent from the library, and 1, 4 and 32 gave the same time and memory on one ~110 MB/s link. Kept in the image for versions that read it |
 | `HF_XET_HIGH_PERFORMANCE` | unset | bigger buffers/concurrency; wants ≥64 GB RAM |
 | `HF_XET_CHUNK_CACHE_SIZE_BYTES` | `100G` (compose) | `hf_xet` scratch; the one place chunk-level dedup can pay off |
+| `HF_XET_LOG_DEST` | unset | where hf-xet logs. Unset: one file per process in `$HF_XET_CACHE/logs/`, pruned by hf-xet. Empty string: console only, no files. See *Pinning vs. eviction* |
+| `HF_XET_LOG_DIR_MAX_RETENTION_AGE` / `HF_XET_LOG_DIR_MAX_SIZE` / `HF_XET_LOG_DIR_MIN_DELETION_AGE` | `14d` / `250mb` / `1d` (hf-xet's defaults) | hf-xet's own pruning of its log directory. `HF_XET_LOG_DIR_DISABLE_CLEANUP` turns it off. Leave that unset |
 | `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY` | `1` (image) | asks for front-to-back writes, which the default `stream` policy needs. hf-xet 1.6.0 writes sequentially with or without it (measured; see *stream* above) |
 
 Invalid config fails at import rather than at first request — a bad
