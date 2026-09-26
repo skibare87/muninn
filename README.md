@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brand/muninn-banner.png" alt="Muninn — Hugging Face edge cache" width="820">
+  <img src="brand/muninn-banner.png" alt="Muninn — pull-through cache for Hugging Face and container images" width="820">
 </p>
 
 <p align="center">
@@ -8,7 +8,11 @@
   <a href="https://github.com/skibare87/muninn/pkgs/container/muninn"><img src="https://img.shields.io/badge/ghcr.io-muninn-2496ED?logo=docker&logoColor=white" alt="ghcr.io/skibare87/muninn"></a>
 </p>
 
-A Hugging Face edge cache for a fleet of GPU hosts backed by a large NVMe array.
+A pull-through cache for **Hugging Face** models and datasets and for **OCI container
+images**: fetch once over the WAN, then serve every host on your network from local
+disk. It runs as one container on a single box, a NAS or a Kubernetes cluster, with
+optional per-key access control, workload-identity (OIDC/JWT) auth, and an
+object-store second tier (S3, GCS, R2) to refill a lost disk.
 
 *In the Norse telling, Odin's raven Muninn — "memory" — flies out each day and
 returns with what it found. Same job here: fetch it once, remember it, and let
@@ -20,7 +24,7 @@ serve both with one reverse proxy.
 | leg | protocol | why |
 |---|---|---|
 | NAS ← Hugging Face | native **Xet**, parallel range GETs | 16–64 concurrent streams against the CDN. This is where Xet's speed actually comes from. |
-| edge node ← NAS | plain HTTP, whole file | no chunk reassembly, no second chunk cache on the node. Just bytes off NVMe. |
+| edge node ← NAS | plain HTTP, whole file | no chunk reassembly, no second chunk cache on the node. Just bytes off local disk. |
 
 A conventional caching reverse proxy (nginx, olah, dingospeed, Artifactory)
 can't do this, because its upstream leg inherits whatever protocol the client
@@ -128,7 +132,7 @@ file bytes are intercepted:
 
 ```
 GET /org/model/resolve/main/model.safetensors
-  ├─ cached?  → 200, stream from NVMe            (x-xhc-cache: HIT)
+  ├─ cached?  → 200, stream from local disk      (x-xhc-cache: HIT)
   └─ miss     → start/join single-flight ingest  (x-xhc-cache: MISS)
                  └─ per XHC_MISS_POLICY: stream | redirect | wait
 ```
