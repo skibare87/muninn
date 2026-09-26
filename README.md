@@ -404,7 +404,170 @@ Hub. This holds in every mode — with `XHC_HF_AUTH=none`, with `XHC_HF_RULES=of
 That is the only read among the `POST`s `huggingface_hub` 0.34.4 makes. Everything else is a
 write and is refused: commits and preupload, creating, moving or deleting repos, branches,
 tags, settings, LFS uploads, discussions, Space controls, collections. Pushing to the Hub goes
-direct to the Hub, with your own token.
+direct to the Hub, with your own token — unless you opt in to the one exception below.
+
+### Writes to the Hub (`XHC_HF_WRITES`, off by default)
+
+`XHC_HF_WRITES=on` lets a named set of **repository writes** through the cache, each one only
+when the caller's rules grant it on the target repository. With the default `off`, everything
+in the section above holds exactly: every write is a local `405`.
+
+```yaml
+environment:
+  XHC_HF_AUTH: key            # required
+  XHC_HF_RULES: enforce       # required (the default)
+  XHC_AUTHZ_DB: /srv/authz/authz.db
+  XHC_HF_WRITES: "on"
+  HF_TOKEN: hf_...            # the account every write is made as -- see below
+```
+
+**It refuses to start** with `XHC_HF_AUTH=none` or `XHC_HF_RULES=off`. Without a credential
+there is nobody to hold a grant, and without rules there is no grant to check, so either
+combination could only mean "forward everyone's writes as the cache". That is input that can
+never be valid, and the error (`HfWritesConfigError`) names both settings.
+
+#### Every write appears on the Hub as the cache's account
+
+**The Hub never learns which key asked.** A commit made through Muninn is authored, on the
+Hub, by the account whose `HF_TOKEN` the cache holds — for every user, every key, every
+workload token. Consequences worth deciding on before you enable this:
+
+- **The cache's token scopes are the outer bound.** A rule can only narrow what that token may
+  already do; it cannot grant beyond it. Give the cache a fine-grained token with write access
+  to exactly the repositories or organisations you intend to expose, and nothing else. A token
+  with write access to your whole account makes every `models/*` rule a grant over all of it.
+- **Muninn's audit log is the only record of who did what** (below). Ship it somewhere durable.
+- Hub-side history, notifications and permissions all show the cache's account. If attribution
+  on the Hub matters, users should push with their own tokens, directly.
+
+#### Grants: `push`, and `delete` on top of it
+
+Rules on the Hugging Face surface take `push` once writes are on, and a separate `delete` verb
+for destructive writes. Verbs are a set joined by `+`, in any order:
+
+```
+models/myorg/*           pull+push            # commit, upload, branch, tag, create
+models/myorg/scratch-*   pull+push+delete     # ...and delete files, branches, repos
+datasets/myorg/*         pull+push
+```
+
+- `delete` is never implied by `push`, and is accepted only together with it, only on a
+  Hugging Face pattern, and only with writes on. Anything else could never take effect and is
+  refused when the rule is saved.
+- **A bare `*` never grants a write to the Hub.** It still grants pull there. `* pull+push`
+  was written by everyone who has one before Hub writes existed, and meant registry push;
+  turning writes on must not quietly let each of them commit as the cache. Hub writes have to
+  be named: `models/*`, `datasets/*`, `spaces/*`.
+- **Scopes narrow writes exactly as they narrow pulls.** A key scoped to
+  `models/myorg/app pull+push` pushes to that one repository, and cannot delete, whatever its
+  holder may do.
+- **With writes off, saving a rule that grants `push` on a Hugging Face pattern is refused**,
+  in the console, `/_cache/authz` and `python -m app.authzctl` alike, with a message saying to
+  enable `XHC_HF_WRITES`. The CLI reads the same variable, so provision with it set.
+- **A rule saved while writes were on stays stored when they are turned off, and grants
+  nothing** — no write reaches a decision while writes are off. It is neither deleted nor
+  rewritten, so turning writes off (the switch you reach for in an incident) is instant and
+  reversible and never refuses to start. Startup logs how many such rules exist, so it is not
+  a silent never-match. Editing that principal's allowlist while writes are off will ask you to
+  change the rule to `pull`, because saving goes through the same check.
+
+#### What is forwarded, and what each needs
+
+Taken from `huggingface_hub` 0.34.4. The repository comes from the path for most, and from
+the JSON body for creating, deleting and moving repos.
+
+| request | `HfApi` method | needs |
+|---|---|---|
+| `POST /api/{type}s/<repo>/commit/<rev>` | `create_commit`, `upload_file`, `upload_folder`, `delete_file`, … | `push`; **`+delete` if the commit deletes** (below) |
+| `POST /api/{type}s/<repo>/preupload/<rev>` | every upload | `push` |
+| `POST [datasets/\|spaces/]<repo>.git/info/lfs/objects/batch` and `…/verify` | LFS uploads | `push` |
+| `GET /api/{type}s/<repo>/xet-write-token/<rev>` | xet uploads | `push` |
+| `POST /api/{type}s/<repo>/branch/<name>` | `create_branch` | `push` |
+| `POST /api/{type}s/<repo>/tag/<rev>` | `create_tag` | `push` |
+| `POST /api/repos/create` | `create_repo` | `push` on the repo the body names |
+| `POST /api/validate-yaml` | called by `create_commit` before committing a `README.md` | `push` on *some* Hugging Face repo — it names none |
+| `DELETE /api/{type}s/<repo>/branch/<name>` | `delete_branch` | `push+delete` |
+| `DELETE /api/{type}s/<repo>/tag/<tag>` | `delete_tag` | `push+delete` |
+| `POST /api/{type}s/<repo>/super-squash/<branch>` | `super_squash_history` | `push+delete` |
+| `POST /api/{type}s/<repo>/lfs-files/batch` | `permanently_delete_lfs_files` | `push+delete` |
+| `DELETE /api/repos/delete` | `delete_repo` | `push+delete` on the repo the body names |
+| `POST /api/repos/move` | `move_repo` | `push+delete` on the source, `push` on the destination |
+
+**Everything else stays `405` whatever the grants**: repo settings and visibility, discussions
+and pull-request merges, Space secrets, variables, storage, hardware, restart and pause,
+collections, webhooks, jobs, inference endpoints, likes, access requests. Those are not
+pushing to a repository, and a grammar of repository patterns cannot describe them.
+
+#### Commits are inspected, because deleting a file is a commit
+
+`delete_file` and `delete_folder` are not HTTP `DELETE`s: they are commits whose NDJSON body
+carries a `deletedFile` or `deletedFolder` line. So every commit body is read and each line
+classified — `header`, `file`, `lfsFile` are writes; `deletedFile`, `deletedFolder` need
+`delete` — **before** anything is forwarded.
+
+- It is read as it streams, line by line, and refused at the first deletion the caller may not
+  make, without reading further.
+- **It is bounded by `XHC_HF_WRITE_MAX_BODY` (default `64M`).** A body over it is a `413` and is
+  never forwarded uninspected. A commit carries LFS *pointers*, not LFS bytes, but small files
+  travel inline as base64, so a commit of many small files can be large; raise the bound if you
+  hit it.
+- **What is forwarded is exactly the bytes that were inspected** — one buffer, read once.
+- **It fails closed.** A line that is not strict JSON, repeats a key (`{"key":"file",
+  "key":"deletedFile"}` is read differently by different parsers), or names an operation not
+  in that list is a `400`; a body that is not `application/x-ndjson`, or is compressed, is a
+  `415`. An operation this cache cannot classify is never assumed harmless.
+- Overwriting a file with new content is `push`, not `delete`: the Hub keeps both in history.
+  What destroys history is `super_squash_history` and `permanently_delete_lfs_files`, which
+  need `delete`.
+
+#### LFS and xet uploads: what goes through the cache
+
+The bytes of a large file never travel in the commit. An upload is a sequence of requests,
+and **only some of them reach Muninn**:
+
+| step | through Muninn? | gated by |
+|---|---|---|
+| `preupload` — which files are LFS | yes | `push` |
+| LFS `batch` — where to upload | yes | `push` on the repo in its path |
+| the upload itself (`PUT` to the `href` the batch returned) | **no** — straight to the object-storage URL the Hub signed | the batch call that produced it |
+| LFS `verify` | yes, when the Hub returns a Hub URL (the client rewrites it to the cache) | `push` |
+| xet: `xet-write-token`, then the upload to the xet service | the token request only; bytes go to the xet service directly | `push` |
+| the `commit` naming the uploaded files | yes, inspected | `push` (+`delete`) |
+
+So the per-repository gate on LFS and xet bytes is the batch call or the write token; the bytes
+themselves bypass the cache, because the Hub hands the client a URL signed for one object.
+What lands in the repository is still only what a commit names, and every commit is gated.
+A Hub URL the client is sent back to that is **not** under `<repo>.git/info/lfs/` names no
+repository, so it is not forwarded: if the Hub returns one — its multipart-completion URL may
+be such a URL; this has not been checked against the live Hub — the upload fails at that step
+with a `405` rather than being forwarded unauthorised. The xet write token is forwarded even
+with `XHC_BLOCK_CLIENT_XET` on: that block exists to stop xet *read* tokens letting downloads
+bypass the cache, and a write token is gated as a push instead. The tests exercise the token
+request; the xet upload that follows it goes to the xet service and is not exercised here.
+
+#### Audit, and the metric
+
+Every write that reaches this code is logged at `INFO` on the `xhc.hfwrites` logger, forwarded
+or not, with the outcome, key id, principal, method, path, repository, whether it deleted
+anything, the status, and for a refusal the reason:
+
+```
+hf write forwarded: key=3f2a… principal=ci-bot method=POST path=/api/models/myorg/app/commit/main repo=models/myorg/app deletes=no status=200
+hf write denied: key=3f2a… principal=ci-bot method=POST path=/api/models/myorg/app/commit/main repo=models/myorg/app deletes=yes status=403 reason=key 3f2a… has no rule granting delete on models/myorg/app
+```
+
+A workload token logs as `key=jwt:<subject>`. `muninn_hf_writes_total{result=...}` counts the
+same outcomes — `forwarded`, `upstream_rejected` (the Hub said 4xx/5xx), `upstream_unreachable`,
+`denied`, `too_large`, `invalid` — each present at zero from startup.
+
+#### Pulls see a commit immediately
+
+After a write the Hub accepts, the cache forgets what it remembered about that repository's
+refs and its recent 404s, so the next pull of `main` asks the Hub rather than serving the
+previous commit until `XHC_REF_TTL` runs out. The whole repository, not only the revision in
+the path: a commit with `create_pr=1` moves `refs/pr/N`, not the branch it names. This is
+per process — another cache instance keeps its own ref TTL — and with `XHC_REF_TTL=0` mutable
+refs are never revalidated at all, so there is nothing to invalidate.
 
 ### One hostname as a homepage and a cache
 
@@ -1271,8 +1434,11 @@ docker.io/library/*          pull
 ghcr.io/myorg/*              pull+push
 models/google/gemma-4-*      pull      # some of one organisation's models
 datasets/*                   pull      # every dataset
-*                            pull+push # anything, anywhere, Hugging Face included
+*                            pull+push # anything, anywhere; on Hugging Face, pull only
 ```
+
+On Hugging Face patterns `push` — and `delete`, for destructive writes — are accepted only
+with `XHC_HF_WRITES=on`; see [Writes to the Hub](#writes-to-the-hub-xhc_hf_writes-off-by-default).
 
 `*` spans `/`. Patterns match the repository and **never the tag**, so
 `docker.io/library/alpine pull` covers every tag of alpine. The list is **allow-only with
