@@ -660,6 +660,7 @@ ENV_TO_SETTING = [
     ("XHC_DOCKER_MAX_BLOB_BYTES", "10G", "docker_max_blob_bytes", 10 * 1024**3),
     # Below this much free space a miss is proxied uncached instead of ingested.
     ("XHC_DOCKER_MIN_FREE", "2G", "docker_min_free_bytes", 2 * 1024**3),
+    ("XHC_DOCKER_PARTIAL_MAX_AGE", "900", "docker_partial_max_age_s", 900.0),
     # --- push-through (0.8.0, an internal issue) ---
     ("XHC_DOCKER_PUSH", "1", "docker_push_enabled", True),
     ("XHC_DOCKER_PUSH_MODE", "store-forward", "docker_push_mode", "store-forward"),

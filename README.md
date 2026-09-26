@@ -774,6 +774,31 @@ If the pin or orphan state cannot be read, **GC refuses rather than proceeding**
 state file legitimately means "nothing is pinned"; an unreadable one means "unknown", and
 collapsing those would silently disarm pin protection inside an unattended loop.
 
+**Partial downloads left by a killed process are reclaimed too.** A layer is written to
+`<digest>.incomplete` (or `<digest>.tier.incomplete` when it comes from the object-store
+tier) and renamed into place only after its digest matches. Kill the process mid-download
+and that file stays; it is not a blob, so mark-and-sweep never considered it. Each GC pass
+now also sweeps partials, and so does startup (once, before the first interval). A partial
+is removed only when **all three** of these hold:
+
+1. no download in this process owns it (the in-process single-flight table);
+2. no process holds its lock: every writer holds an exclusive `flock` on the file while it
+   has it open, and the kernel releases it when the writer dies, so a second Muninn
+   process sharing the directory is seen too;
+3. it has not been written to for `XHC_DOCKER_PARTIAL_MAX_AGE` seconds (default `21600`,
+   six hours). This is the backstop for a filesystem that does not honour `flock` (some
+   network and FUSE mounts), so it has to exceed any silence a live download can have.
+   Upstream blob reads have no read timeout, which means a stalled registry can hold a
+   download open for a long time without sending a byte.
+
+Removing a live partial would not corrupt anything, since its writer's rename fails and
+that pull errors, but it would fail a pull, so every guard errs towards keeping. The GC
+result carries a `partials` object: `removed`, `freed_bytes`, and what was looked at and
+kept (`scanned`, `kept_owned`, `kept_locked`, `kept_young`, `max_age_s`), so a `removed: 0`
+can be told apart from "found nothing to look at". Each removal is logged with its name,
+size and idle time. Partial bytes are not added to the result's top-level `freed_bytes`,
+which counts blobs and manifests.
+
 ### `XHC_DOCKER_TAG_TTL` has three regimes, and `0` is the surprising one
 
 | value | meaning |
@@ -883,10 +908,33 @@ mid-pull and assemble a tree from two commits.
   prewarm asked for it **by digest**, against *that* digest, not just the one the
   upstream's response header named;
 - `verifying` then confirms the whole closure (every manifest and blob) is on disk at
-  its content address. That step catches a real case: an image prewarmed by digest and
-  not pinned is referenced by no tag, so a garbage-collection sweep during a long pull
-  can take the early layers. That job ends in `error`, not `done`. Pin it (`"pin": true`)
-  or prewarm by tag.
+  its content address. That step catches a real case: an image prewarmed by digest with
+  `"pin": false` is referenced by no tag, so a garbage-collection sweep during a long
+  pull can take the early layers. That job ends in `error`, not `done`.
+
+**A by-digest prewarm is pinned by default.** No tag points at an image fetched by
+digest, so without a pin the next GC sweep would collect the image you just asked to
+have warm, and a sweep during the pull would take its early layers. So when the
+request does not say, `pin` is decided by the reference:
+
+| `pin` in the request | by digest (`…@sha256:…`) | by tag (`…:1.2.3`) |
+| --- | --- | --- |
+| absent | **pinned** | not pinned (the tag already protects it; a pinned tag is exempt from capacity eviction) |
+| `true` | pinned | the tag is pinned |
+| `false` | not pinned: the old behaviour, collectable once the job ends | not pinned |
+
+The pin is written **before the first byte is fetched**, so a sweep mid-pull already
+honours it. It is an ordinary pin: it appears in `GET /_cache/docker/pins` as
+`<upstream>/<repo>@sha256:…`, the job reports the exact entry as `pinned_as`, and you
+remove it with `DELETE /_cache/docker/pins` `{"image": "<that entry>"}`, after which the
+image is ordinary garbage. **Pins accumulate:** every distinct by-digest prewarm adds one,
+and nothing expires them. Review `GET /_cache/docker/pins` when rolling a release forward,
+or send `"pin": false` for images you only need warm for one rollout.
+
+If the prewarm ends in `error`, a pin **that job added** is removed again (a pin that was
+already there is left alone). An `interrupted` prewarm keeps its pin, because re-submitting
+resumes it. If `pins.json` cannot be read, a pinning prewarm fails rather than rewriting
+the file: saving over an unreadable pins file would silently drop every other pin.
 
 Blobs already on disk are **not re-hashed** — they only ever arrive by a verified
 rename — and the job says how many there were (`blobs_present`, a subset of
@@ -923,6 +971,7 @@ different `pin` value is a different prewarm).
 | `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |
 | `XHC_DOCKER_MAX_BLOB_BYTES` | unset | refuse an oversized layer before bytes move |
 | `XHC_DOCKER_MIN_FREE` | `1G` | below this much free space, a miss is **proxied to the client uncached** instead of ingested; `0` disables |
+| `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob must go unwritten before GC may remove it, and then only if no download owns it and no process holds its lock. See *Garbage collection is mark-and-sweep* |
 | `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
 
 > **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing
@@ -2468,6 +2517,20 @@ even if that means the cache can't reach its low-water mark. That's the right
 failure mode for a fleet rollout: better to run hot on disk than to evict the
 model every node is about to request. Pin the current working set; let
 experiments age out.
+
+**Known gap: `.incomplete` files in the Hugging Face cache are not swept.** The Docker
+side reclaims stale partial downloads (see *Garbage collection is mark-and-sweep*); the
+Hugging Face side does not yet. From reading `huggingface_hub` 0.34.4 (not from a
+measured kill): it downloads into `blobs/<etag>.incomplete` and renames on completion, so
+a process killed mid-file leaves that file behind. It is reclaimed only if the same file is
+requested again (the HTTP path resumes by appending to it) or when the whole repo is
+deleted or evicted (removing a repo's last revision removes the repo folder). Evicting
+some revisions leaves it in place. `scan_cache_dir()` counts only blobs a snapshot links
+to, so these bytes are invisible to eviction's accounting while still using the disk.
+Muninn's own tier fill writes `blobs/<etag>.tier.incomplete`, a name `huggingface_hub`
+never resumes, so after a kill that file lasts until the repo is removed. To reclaim the
+space by hand, stop the service and delete `*.incomplete` under the cache's `blobs/`
+directories.
 
 ## Sizing memory for ingest
 

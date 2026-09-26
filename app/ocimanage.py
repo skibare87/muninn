@@ -87,6 +87,12 @@ class PrewarmJob:
     id: str
     image: str
     pin: bool = False
+    # The exact pins.json entry this job holds, so an operator can see it and
+    # DELETE it by name. Set whenever `pin` is, before the first byte moves.
+    pinned_as: str | None = None
+    # This job wrote that entry (it was not already there). Only such a pin is
+    # rolled back when the job ends in `error`.
+    pin_added: bool = False
     kind: str = "prewarm"
     state: str = "pending"
     error: str | None = None
@@ -118,7 +124,8 @@ class PrewarmJob:
 
     def as_dict(self) -> dict:
         d = {
-            "id": self.id, "image": self.image, "pin": self.pin, "state": self.state,
+            "id": self.id, "image": self.image, "pin": self.pin,
+            "pinned_as": self.pinned_as, "state": self.state,
             "error": self.error, "created_at": self.created_at,
             "started_at": self.started_at, "finished_at": self.finished_at,
             "updated_at": self.updated_at, "interrupted_at": self.interrupted_at,
@@ -137,7 +144,8 @@ class PrewarmJob:
         return d
 
     _RECORD_FIELDS = (
-        "id", "image", "pin", "kind", "state", "error", "created_at", "started_at",
+        "id", "image", "pin", "pinned_as", "kind", "state", "error", "created_at",
+        "started_at",
         "finished_at", "manifests_done", "blobs_total", "blobs_done",
         "blobs_present", "bytes_done", "resumes", "interrupted_at",
     )
@@ -185,12 +193,16 @@ class PrewarmManager(ledger.LedgeredJobs):
     def _retention_s(self) -> float:
         return _RETENTION_S
 
-    def submit(self, image: str, ref: registry.Ref, reference: str, pin: bool) -> PrewarmJob:
+    def submit(self, image: str, ref: registry.Ref, reference: str,
+               pin: bool | None = None) -> PrewarmJob:
         """Start a prewarm, or join the one already running for the same image.
 
-        No await between the lookup and the insert, so two requests racing
-        cannot both start one.
+        `pin=None` is the default and means: pin a by-digest prewarm, do not pin
+        a by-tag one (see default_pin). No await between the lookup and the
+        insert, so two requests racing cannot both start one.
         """
+        if pin is None:
+            pin = default_pin(reference)
         job = PrewarmJob(id=uuid.uuid4().hex[:12], image=image, pin=pin)
         existing = self._active.get(job.key)
         if existing is not None:
@@ -215,6 +227,11 @@ class PrewarmManager(ledger.LedgeredJobs):
         try:
             job.state = "running"
             job.started_at = time.time()
+            if job.pin:
+                # BEFORE the first fetch, not after the last: a by-digest
+                # closure is referenced by nothing else, so a GC sweep that runs
+                # mid-pull would otherwise take the early layers.
+                _add_pin(job, pin_key(ref, reference))
             self._persist(transition=True)
             manifests, blobs = await _fetch_closure(job, ref, reference)
             job.blobs_total = len(blobs)
@@ -233,13 +250,6 @@ class PrewarmManager(ledger.LedgeredJobs):
                     raise RuntimeError(f"blob {d} failed: {bj.error}")
                 job.blobs_done += 1
                 job.bytes_done += bj.size or 0
-
-            if job.pin:
-                pins = ocigc.load_pins()
-                pins.add(f"{ref.upstream}/{ref.repo}"
-                         + (f"@{reference}" if ocistore.DIGEST_RE.match(reference)
-                            else f":{reference}"))
-                ocigc.save_pins(pins)
 
             job.state = "verifying"
             self._persist(transition=True)
@@ -264,6 +274,7 @@ class PrewarmManager(ledger.LedgeredJobs):
             job.state = "error"
             job.error = f"{type(exc).__name__}: {exc}"
             log.warning("docker prewarm %s failed: %s", job.id, exc)
+            _rollback_pin(job)
         finally:
             if job.finished_at is None and not stopped:
                 job.finished_at = time.time()
@@ -342,6 +353,66 @@ async def _fetch_closure(job: PrewarmJob, ref: registry.Ref,
     return manifests, list(dict.fromkeys(blobs))
 
 
+def default_pin(reference: str) -> bool:
+    """Whether a prewarm that did not say pin or not should pin.
+
+    BY DIGEST, YES. Nothing else references a closure fetched by digest -- no
+    tag points at it -- so without a pin the next GC sweep takes the image the
+    operator just asked to have warm, and one that runs mid-pull takes it
+    before the job finishes. A prewarm that is immediately collectable does
+    nothing an operator could want.
+
+    BY TAG, NO. The tag file already roots the closure, and a pinned tag is
+    exempt from capacity eviction; pinning every prewarmed tag by default would
+    quietly turn "warm this" into "never evict this".
+    """
+    return bool(ocistore.DIGEST_RE.match(reference))
+
+
+def pin_key(ref: registry.Ref, reference: str) -> str:
+    """The pins.json entry for a prewarm: `<upstream>/<repo>@sha256:…` or `…:tag`."""
+    sep = "@" if ocistore.DIGEST_RE.match(reference) else ":"
+    return f"{ref.upstream}/{ref.repo}{sep}{reference}"
+
+
+def _add_pin(job: PrewarmJob, key: str) -> None:
+    """Record the pin, strictly. An unreadable pins file raises: loading it as
+    empty and saving would REPLACE every existing pin with this one."""
+    try:
+        pins = ocigc.load_pins(strict=True)
+    except StateUnavailable as exc:
+        raise RuntimeError(f"cannot pin {key}: docker pins unreadable ({exc})") from exc
+    job.pinned_as = key
+    if key not in pins:
+        pins.add(key)
+        ocigc.save_pins(pins)
+        job.pin_added = True
+        log.info("docker prewarm %s pinned %s (remove with DELETE /_cache/docker/pins)",
+                 job.id, key)
+
+
+def _rollback_pin(job: PrewarmJob) -> None:
+    """Undo a pin this job added, when the job failed.
+
+    A failed prewarm is not a warm image, and a pin left behind would hold its
+    partial closure forever with nobody knowing to remove it. A pin that was
+    already there belongs to someone else and stays. An INTERRUPTED job keeps
+    its pin: re-submitting resumes it, and until then the work it did is kept.
+    """
+    if not (job.pin_added and job.pinned_as):
+        return
+    try:
+        pins = ocigc.load_pins(strict=True)
+    except StateUnavailable:
+        log.error("docker prewarm %s failed and its pin %s could not be removed: "
+                  "pins unreadable", job.id, job.pinned_as)
+        return
+    pins.discard(job.pinned_as)
+    ocigc.save_pins(pins)
+    job.pin_added = False
+    job.pinned_as = None
+
+
 def _missing_from_disk(upstream: str, manifests: list[str], blobs: list[str]) -> list[str]:
     out = [d for d in manifests if not ocistore.manifest_path(upstream, d).is_file()]
     out += [d for d in blobs if not ocistore.blob_path(upstream, d).is_file()]
@@ -350,7 +421,14 @@ def _missing_from_disk(upstream: str, manifests: list[str], blobs: list[str]) ->
 
 class PrewarmRequest(BaseModel):
     image: str = Field(description="e.g. ghcr.io/org/img:1.2.3 or …@sha256:…")
-    pin: bool = Field(default=False, description="pin the image and its whole blob closure")
+    pin: bool | None = Field(
+        default=None,
+        description=(
+            "pin the image and its whole blob closure. Unset: pinned when the "
+            "image is given by digest (nothing else would protect it from GC), "
+            "not pinned when given by tag. false opts a by-digest prewarm out."
+        ),
+    )
 
 
 class PinRequest(BaseModel):
@@ -386,6 +464,10 @@ async def prewarm(req: PrewarmRequest) -> dict:
     tree from two commits. Re-submitting while the same prewarm runs returns
     that job; re-submitting after it was interrupted resumes it, skipping
     every blob already cached.
+
+    A by-digest prewarm is PINNED unless the request says `"pin": false`: no
+    tag references it, so otherwise the next GC sweep collects it. The job's
+    `pinned_as` names the entry; DELETE /_cache/docker/pins removes it.
     """
     name, reference = _split(req.image)
     try:
