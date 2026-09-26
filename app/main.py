@@ -204,6 +204,18 @@ async def lifespan(app: FastAPI):
         # Every step is time-bounded and names itself if it overruns: a
         # cancelled task is not guaranteed to finish (see app/shutdown.py), and
         # a shutdown that waits on one forever is a hang with no culprit.
+        #
+        # HF ingest jobs FIRST, and marked before they are cancelled: stop()
+        # records every in-flight job as `interrupted` and writes the ledger
+        # synchronously, so that record exists even if a later step overruns
+        # or the orchestrator's kill arrives. Only then are the jobs cancelled,
+        # and their cancel handler leaves the mark alone. The old order -- a
+        # flush here, the cancel left to asyncio.run's teardown -- let that
+        # handler overwrite the flush with `error: cancelled` whenever the
+        # process outlived the lifespan, which as a container's PID 1 it does.
+        await shutdown.bounded(
+            manager.stop(), "HF ingest shutdown", timeout=2 * shutdown.STEP_TIMEOUT_S
+        )
         await shutdown.cancel_and_wait(
             (evictor, orphan_sweep, docker_gc, jwt_warm), "the background loops"
         )
@@ -216,10 +228,6 @@ async def lifespan(app: FastAPI):
                 ocimanage.manager.stop(), "OCI prewarm shutdown",
                 timeout=2 * shutdown.STEP_TIMEOUT_S,
             )
-        # Record the final state of anything still running. A graceful stop
-        # leaves those jobs running in the ledger, so the next boot reports
-        # them as interrupted -- which is what they are.
-        manager.flush()
         # tier.stop() bounds its own two waits; its outer bound is longer than
         # both together, so it is only reached if stop() itself is at fault.
         await shutdown.bounded(tier.stop(), "tier.stop()", timeout=3 * shutdown.STEP_TIMEOUT_S)

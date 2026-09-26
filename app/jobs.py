@@ -27,7 +27,7 @@ from typing import Literal
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import filter_repo_objects
 
-from . import cachefs, ledger, manifests, metrics, statedir, tier
+from . import cachefs, ledger, manifests, metrics, shutdown, statedir, tier
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
@@ -132,6 +132,7 @@ def verify_ingested(path: Path) -> str:
 #   pending -> running -> [verifying] -> done
 #                     \-------+-------> error
 #   pending | running | verifying  --(process restart)-->  interrupted
+#   pending | running | verifying  --(graceful stop)---->  interrupted
 #
 # `verifying` is entered only when XHC_HF_VERIFY is on: the bytes have
 # landed and are being hashed against their ETags. `done` is set ONLY after
@@ -142,10 +143,16 @@ def verify_ingested(path: Path) -> str:
 # at state=done, finished_at=null for minutes while it was still being hashed.
 # A verification failure ends in `error`, never `done`.
 #
-# `interrupted`: the ledger last saw this job pending, running or verifying, and
-# then the process that owned it went away (OOM kill, crash, redeploy). Its
-# outcome is unknown -- some files may have landed -- and it is not resumed
-# automatically. See JobManager.load_ledger.
+# `interrupted`: the process that owned this job went away before it finished.
+# Two routes, one state. A crash or OOM kill leaves the ledger saying pending,
+# running or verifying, and the next boot turns that into interrupted (see
+# JobManager.load_ledger). A graceful stop records it directly: JobManager.stop
+# marks and writes every in-flight job BEFORE cancelling it, and the job's own
+# cancel handler leaves that mark alone. Either way its outcome is unknown --
+# some files may have landed -- and it is not resumed automatically.
+#
+# Only a stop sets it. A job cancelled for any other reason ends in
+# `error: cancelled`, as before.
 JobState = Literal["pending", "running", "verifying", "done", "error", "interrupted"]
 ACTIVE_STATES = ledger.ACTIVE_STATES
 _SNAPSHOT_SAMPLE_S = 5.0
@@ -334,6 +341,9 @@ class JobManager(ledger.LedgeredJobs):
         super().__init__()
         self._lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(settings.ingest_concurrency)
+        # The _run task of every job still in flight: what stop() cancels.
+        # _tasks also holds the progress loop and tier write-backs.
+        self._runners: set[asyncio.Task] = set()
 
     # -- ledger hooks --------------------------------------------------------
     #
@@ -409,16 +419,85 @@ class JobManager(ledger.LedgeredJobs):
                 return existing
             self._active[job.key] = job
             self._by_id[job.id] = job
-        self._track(asyncio.create_task(self._run(job)))
+        runner = self._track(asyncio.create_task(self._run(job)))
+        self._runners.add(runner)
+        runner.add_done_callback(self._runners.discard)
         self._persist(transition=True)
         self._ensure_progress_loop()
         return job
+
+    # -- shutdown ----------------------------------------------------------
+
+    def interrupt_active(self) -> int:
+        """Record every in-flight job as `interrupted`, wake its waiters, write.
+
+        Synchronous on purpose: nothing here can overrun, so once it has run
+        the ledger says what happened even if every later shutdown step hangs
+        or the orchestrator's kill arrives first.
+
+        WHY THIS HAS TO HAPPEN BEFORE THE CANCEL. After the lifespan ends,
+        asyncio.run cancels whatever is still alive, and a job's cancel handler
+        used to write `error: cancelled` over the running mark the lifespan had
+        just flushed. Whether that happened depended on how the process was
+        started: uvicorn re-raises SIGTERM once it has shut down, which kills an
+        ordinary process before the cancel -- but the image runs uvicorn as
+        PID 1, where the kernel drops that re-raised signal, so in a container
+        every graceful stop turned a cut-short prewarm into an apparent failure.
+        Marking first and having _run respect the mark removes the dependency.
+
+        Waiters are woken with `done` set and the state `interrupted`, which
+        every waiter treats as not-done (see hfcompat and serving.tail_follow).
+        Progress is whatever was last measured: live for a file job, the last
+        5 s sample for a snapshot.
+        """
+        now = time.time()
+        marked = 0
+        for job in list(self._active.values()):
+            if job.state not in ACTIVE_STATES:
+                continue
+            job.state = "interrupted"
+            job.interrupted_at = now
+            job.tier_decided.set()
+            job.done.set()
+            marked += 1
+        self.flush()
+        return marked
+
+    async def stop(self) -> None:
+        """Shutdown: mark in-flight jobs interrupted and write that, THEN cancel.
+
+        The cancel is bounded like every other shutdown step; a job that does
+        not finish within it is abandoned, already recorded as interrupted. A
+        download running in a worker thread is not stopped by cancelling its
+        task -- the thread runs until the process exits -- so this stops the
+        job's bookkeeping, not the transfer.
+        """
+        marked = self.interrupt_active()
+        if marked:
+            log.warning(
+                "shutdown: %d ingest job(s) still in flight, recorded as "
+                "interrupted. Re-submit to resume.", marked,
+            )
+        await shutdown.cancel_and_wait(list(self._runners), "HF ingest jobs")
+        self.flush()
+
+    @staticmethod
+    def _stop_if_interrupted(job: Job) -> None:
+        """Refuse to move a job on once shutdown has recorded it interrupted.
+
+        Between the mark and the cancel the loop keeps running, and a download
+        that returns in that gap must not walk the job forward to verifying
+        or done after its waiters were told it was interrupted.
+        """
+        if job.state == "interrupted":
+            raise asyncio.CancelledError
 
     # -- execution ---------------------------------------------------------
 
     async def _run(self, job: Job) -> None:
         try:
             async with self._sem:
+                self._stop_if_interrupted(job)  # was pending when the stop came
                 job.state = "running"
                 job.started_at = time.time()
                 self._persist(transition=True)
@@ -451,6 +530,7 @@ class JobManager(ledger.LedgeredJobs):
                         path = await asyncio.to_thread(self._download_snapshot, job)
                     finally:
                         watcher.cancel()
+                self._stop_if_interrupted(job)
                 job.result_path = str(path)
                 # NB: for a snapshot, `path` is a DIRECTORY. stat().st_size on it
                 # returns the inode size (a few KB), not the tree -- so this used
@@ -476,24 +556,38 @@ class JobManager(ledger.LedgeredJobs):
                     ) if job.tier_etags else 0
                     metrics.record_ingested(fetched - from_tier)
                 if settings.hf_verify_ingest:
+                    self._stop_if_interrupted(job)
                     job.state = "verifying"
                     self._persist(transition=True)
                     await self._verify(job, Path(path))
+                self._stop_if_interrupted(job)
                 # done and finished_at in one step: nothing can observe one
                 # without the other, because there is no await between them.
                 job.finished_at = time.time()
                 job.state = "done"
                 log.info("ingest done %s in %.1fs", job.id, time.time() - (job.started_at or 0))
         except asyncio.CancelledError:
-            job.state = "error"
-            job.error = "cancelled"
+            # A stop already recorded this job as interrupted; that stands.
+            # Any other cancel is a failure of this job and says so.
+            if job.state != "interrupted":
+                job.state = "error"
+                job.error = "cancelled"
             raise
         except Exception as exc:
-            job.state = "error"
-            job.error = f"{type(exc).__name__}: {exc}"
-            log.exception("ingest failed %s", job.id)
+            if job.state == "interrupted":
+                # Failed after the stop marked it: a download torn down by the
+                # shutdown looks like this. The mark is the truer account.
+                log.info("ingest %s ended after being interrupted: %s: %s",
+                         job.id, type(exc).__name__, exc)
+            else:
+                job.state = "error"
+                job.error = f"{type(exc).__name__}: {exc}"
+                log.exception("ingest failed %s", job.id)
         finally:
-            if job.finished_at is None:
+            # An interrupted job's end is unknown, so it has no finished_at;
+            # updated_at is its last known moment (as for one restored by
+            # load_ledger).
+            if job.finished_at is None and job.state != "interrupted":
                 job.finished_at = time.time()
             job.tier_decided.set()
             job.done.set()
@@ -597,7 +691,10 @@ class JobManager(ledger.LedgeredJobs):
         is why /metrics 500'd for the whole life of a file ingest but only
         briefly for a snapshot one. an internal issue.
         """
-        root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_type, job.repo_id)
+        # (repo_id, repo_type): the other order names a folder that never exists,
+        # and _tree_bytes reads a missing root as 0 -- so every in-flight
+        # prewarm reported 0 bytes until it finished.
+        root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_id, job.repo_type)
         started = job.started_at or time.time()
         try:
             while True:

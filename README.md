@@ -2329,6 +2329,7 @@ nothing.
 pending -> running -> verifying -> done
                   \-------+------> error
 pending | running | verifying  --(process restart)-->  interrupted
+pending | running | verifying  --(graceful stop)---->  interrupted
 ```
 
 `verifying` appears only with `XHC_HF_VERIFY=1` (the default). `done` means the
@@ -2339,12 +2340,32 @@ active.
 **Jobs survive a restart.** (OCI image prewarms do too, in their own ledger and on
 the same terms: see *Docker management endpoints*.) Job records are kept in a small ledger,
 `jobs.json` in the HF state directory (`<HF_HUB_CACHE>/.xhc/`, or
-`$XHC_STATE_DIR/hf/`). When the process starts, any job the ledger last saw as
-`pending`, `running` or `verifying` is reported as **`interrupted`**, with
-`interrupted_at` set to the new process's start time and `downloaded_bytes`
+`$XHC_STATE_DIR/hf/`). A job that was `pending`, `running` or `verifying` when
+the process stopped comes back as **`interrupted`**, with `downloaded_bytes`
 showing the last recorded progress. It is **not** resumed automatically and
 **not** dropped: a poller holding its id gets an answer instead of
-`no such job`.
+`no such job`. How it gets there depends on how the process stopped:
+
+- **Crash, OOM kill, `SIGKILL`.** Nothing runs at the end, so the ledger still
+  says `pending`, `running` or `verifying`. The next process reports the job as
+  `interrupted`, with `interrupted_at` set to **its own start time**.
+- **Graceful stop** (`SIGTERM`, `docker stop`, a pod being deleted). Shutdown
+  records every job still in flight as `interrupted`, with `interrupted_at` set
+  to **the moment of the stop**, and writes the ledger before anything else
+  shuts down. The next process reports it unchanged. A snapshot's progress is
+  the last 5-second sample. Anything still waiting on the job in this process
+  is told it was interrupted: a `wait` request gets `503` with `Retry-After`,
+  and a `stream` response ends early, so the client sees a short body and
+  retries.
+- **Neither.** A job cancelled for any other reason ends as `error` with
+  `error: cancelled`.
+
+Graceful means uvicorn reached its shutdown step, and it first waits for open
+responses to finish. If the orchestrator's `SIGKILL` lands before then, that is
+the crash case. A **second** `SIGTERM` or `Ctrl-C` makes uvicorn skip the
+shutdown step, so nothing marks the job: it comes back `interrupted` if the
+process dies at once, but can be recorded as `error: cancelled` if the process
+lives on to cancel it (as it does when uvicorn is a container's PID 1).
 
 - **Bound.** Finished and interrupted jobs are kept for at most **7 days**, and
   at most the newest **50 prewarm (snapshot) jobs** and **200 file jobs**. Those
