@@ -259,3 +259,27 @@ def test_the_readme_pins_no_concrete_release_of_this_image():
     readme = (ROOT / "README.md").read_text()
     pinned = re.findall(r"muninn:\d+\.\d+(?:\.\d+)?\b", readme)
     assert not pinned, f"the README hard-codes a release of the image: {pinned}"
+
+
+def _names_the_deployment_reads() -> set[str]:
+    """Every XHC_ name something actually reads: config.py, the modules that read
+    their own settings, the `<KEY>_FILE` form of a secret, and the compose file's
+    own interpolation variables."""
+    app = ROOT / "app"
+    read = set()
+    for f in app.glob("*.py"):
+        read |= set(re.findall(r'"(XHC_[A-Z0-9_]+)"', f.read_text()))
+    read |= {f"{k}_FILE" for k in read}
+    compose = (ROOT / "docker-compose.yml").read_text()
+    read |= set(re.findall(r"\$\{(XHC_[A-Z0-9_]+)", compose))
+    return read
+
+
+def test_every_setting_the_readme_names_is_read_by_something():
+    """The reverse of the test above. A README that names a variable nothing
+    reads sends an operator to set a knob that does nothing -- it named
+    XHC_HF_TOKEN, which never existed, for the Hub token that HF_TOKEN carries."""
+    readme = (ROOT / "README.md").read_text()
+    named = set(re.findall(r"\bXHC_[A-Z0-9_]*[A-Z0-9]\b", readme))
+    phantom = sorted(named - _names_the_deployment_reads())
+    assert not phantom, f"the README names settings nothing reads: {phantom}"
