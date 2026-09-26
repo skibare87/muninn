@@ -9,6 +9,36 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.31 — 2026-09-25
+
+v0.9.31 -- a push can no longer store a truncated blob under a full digest; abandoned uploads expire
+
+INTEGRITY. A chunked push appended each chunk to a staging file opened in
+append mode, while the digest was computed in memory over the chunks as they
+arrived. If the staging file was removed during a live session -- by anything
+outside Muninn, or a sweep in another process sharing the directory -- append
+mode silently recreated it empty. The upload then finished with a correct
+digest over bytes that were never all on disk. v0.9.30 answered 201 and
+stored a 500-byte file under the digest of a 1000-byte layer. Each chunk is
+now written without creating the file, and only if the file is exactly the
+expected length. Finalise checks the same. Otherwise the session is dropped
+and the client gets 404 BLOB_UPLOAD_UNKNOWN, not a 500.
+
+ABANDONED UPLOADS. Upload sessions lived in memory with no expiry, and their
+staging files were never reclaimed. A session now expires after
+XHC_DOCKER_PARTIAL_MAX_AGE of inactivity, deleting its staging file; a
+finalise in progress counts as activity. The partial sweep also reclaims
+orphaned staging files, under the same guards as other partials: no live
+owner, no lock held, and idle past the threshold. Pending-push temps are now
+swept in both the legacy <docker dir>/_pending layout and the state dir.
+
+HF LEFTOVERS, no code change. Empty snapshots/<commit>/ directories left by a
+killed ingest are kept on purpose: a ref still names them, and removing one
+makes huggingface_hub reject the whole repo. hf-xet 1.6.0 already prunes its
+own log directory, and the README now documents the settings that control it
+(HF_XET_LOG_DIR_MAX_RETENTION_AGE and related).
+
+
 ## v0.9.30 — 2026-09-25
 
 v0.9.30 -- partial downloads and write temps are reclaimed safely, on both protocols
