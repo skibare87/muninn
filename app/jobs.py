@@ -597,7 +597,10 @@ class JobManager(ledger.LedgeredJobs):
         is why /metrics 500'd for the whole life of a file ingest but only
         briefly for a snapshot one. an internal issue.
         """
-        root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_type, job.repo_id)
+        # (repo_id, repo_type): the other order names a folder that never exists,
+        # and _tree_bytes reads a missing root as 0 -- so every in-flight
+        # prewarm reported 0 bytes until it finished.
+        root = Path(settings.cache_dir) / cachefs.repo_folder_name(job.repo_id, job.repo_type)
         started = job.started_at or time.time()
         try:
             while True:
