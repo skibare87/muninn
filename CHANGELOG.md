@@ -9,6 +9,38 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.30 — 2026-09-25
+
+v0.9.30 -- partial downloads and write temps are reclaimed safely, on both protocols
+
+HUGGING FACE PARTIALS. A killed ingest leaves blobs/<etag>.incomplete in the HF
+cache. This was measured with SIGKILL on both the plain-HTTP and xet paths.
+Nothing cleaned it up, and eviction could not see it:
+scan_cache_dir() reported 0 bytes with 10 MiB on disk. The xet path does not
+resume such a file; it rewrites it from offset 0. Now:
+
+  - A sweep runs at startup and on every eviction pass. It removes an HF
+    partial only when no job in this process owns it, no process holds
+    huggingface_hub's file lock for that blob, and it has been idle for
+    XHC_HF_PARTIAL_MAX_AGE (default 6 h). It deletes while holding the lock,
+    so no download can start on that blob in between.
+  - Eviction's used figure now includes partials still on disk. The evict
+    result and /_cache/status report blob_bytes, partial_bytes and the last
+    sweep. muninn_cache_bytes is unchanged: it is a monitoring contract.
+
+OCI WRITE TEMPS. Garbage collection treated in-progress manifest temp files as
+unreferenced manifests. It could sweep one mid-write and make that write fail.
+
+  - Only a file named with exactly 64 hex characters now counts as a manifest
+    or blob.
+  - Manifest and tag writes hold an flock on their temp file.
+  - Stale temps left by a killed writer are reclaimed under the same three
+    guards as partial blobs.
+  - Two threads writing the same manifest no longer share a temp name.
+  - Tag temps, which previously accumulated forever, are now reclaimed.
+  - The GC result's `partials` gains a `writes` breakdown.
+
+
 ## v0.9.29 — 2026-09-25
 
 v0.9.29 -- a graceful stop records running jobs as interrupted; digest prewarms are protected; stale partials reclaimed
