@@ -879,10 +879,33 @@ mid-pull and assemble a tree from two commits.
   prewarm asked for it **by digest**, against *that* digest, not just the one the
   upstream's response header named;
 - `verifying` then confirms the whole closure (every manifest and blob) is on disk at
-  its content address. That step catches a real case: an image prewarmed by digest and
-  not pinned is referenced by no tag, so a garbage-collection sweep during a long pull
-  can take the early layers. That job ends in `error`, not `done`. Pin it (`"pin": true`)
-  or prewarm by tag.
+  its content address. That step catches a real case: an image prewarmed by digest with
+  `"pin": false` is referenced by no tag, so a garbage-collection sweep during a long
+  pull can take the early layers. That job ends in `error`, not `done`.
+
+**A by-digest prewarm is pinned by default.** No tag points at an image fetched by
+digest, so without a pin the next GC sweep would collect the image you just asked to
+have warm, and a sweep during the pull would take its early layers. So when the
+request does not say, `pin` is decided by the reference:
+
+| `pin` in the request | by digest (`…@sha256:…`) | by tag (`…:1.2.3`) |
+| --- | --- | --- |
+| absent | **pinned** | not pinned (the tag already protects it; a pinned tag is exempt from capacity eviction) |
+| `true` | pinned | the tag is pinned |
+| `false` | not pinned: the old behaviour, collectable once the job ends | not pinned |
+
+The pin is written **before the first byte is fetched**, so a sweep mid-pull already
+honours it. It is an ordinary pin: it appears in `GET /_cache/docker/pins` as
+`<upstream>/<repo>@sha256:…`, the job reports the exact entry as `pinned_as`, and you
+remove it with `DELETE /_cache/docker/pins` `{"image": "<that entry>"}`, after which the
+image is ordinary garbage. **Pins accumulate:** every distinct by-digest prewarm adds one,
+and nothing expires them. Review `GET /_cache/docker/pins` when rolling a release forward,
+or send `"pin": false` for images you only need warm for one rollout.
+
+If the prewarm ends in `error`, a pin **that job added** is removed again (a pin that was
+already there is left alone). An `interrupted` prewarm keeps its pin, because re-submitting
+resumes it. If `pins.json` cannot be read, a pinning prewarm fails rather than rewriting
+the file: saving over an unreadable pins file would silently drop every other pin.
 
 Blobs already on disk are **not re-hashed** — they only ever arrive by a verified
 rename — and the job says how many there were (`blobs_present`, a subset of
