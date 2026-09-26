@@ -426,6 +426,25 @@ class JobManager(ledger.LedgeredJobs):
         self._ensure_progress_loop()
         return job
 
+    def owns_partial(self, folder: str, etag: str) -> bool:
+        """Whether a job in THIS process may be writing that blob's partial.
+
+        Any job still in the single-flight table counts, whatever its state:
+        the entry is removed only when _run ends, and a job marked interrupted
+        at shutdown can still have a download thread writing. A snapshot job,
+        and a file job with no known etag, own every partial in their repo,
+        because they do not say which blobs they are fetching. Called from the
+        sweep's worker thread: list() copies the values in one step.
+        """
+        for job in list(self._active.values()):
+            if cachefs.repo_folder_name(job.repo_id, job.repo_type) != folder:
+                continue
+            if job.kind == "snapshot" or not job.etag or job.etag == etag:
+                return True
+            if job.incomplete_path and Path(job.incomplete_path).name.split(".", 1)[0] == etag:
+                return True
+        return False
+
     # -- shutdown ----------------------------------------------------------
 
     def interrupt_active(self) -> int:

@@ -356,10 +356,23 @@ def hf_lock(repo_type: str, repo_id: str, etag: str) -> filelock.FileLock:
     need not be the same one. flock is per open file, so this conflicts with
     huggingface_hub's own FileLock on the same path even inside one process.
     """
-    p = (Path(settings.cache_dir) / ".locks" / cachefs.repo_folder_name(repo_id, repo_type)
-         / f"{etag}.lock")
+    p = cachefs.hub_lock_path(cachefs.repo_folder_name(repo_id, repo_type), etag)
     p.parent.mkdir(parents=True, exist_ok=True)
     return filelock.FileLock(str(p), thread_local=False)
+
+
+# (repo folder, etag) of every tier fill in flight in this process, from before
+# it takes the blob's lock until after its partial is renamed or removed. The
+# HF partial sweep reads it (cachefs.owns_partial) from a worker thread; a dict
+# membership test needs no lock. A count, because two fills of one blob can be
+# in flight at once (one waiting on the lock) and the first to end must not
+# disown the second.
+_filling: dict[tuple[str, str], int] = {}
+
+
+def owns_partial(folder: str, etag: str) -> bool:
+    """Whether a tier fill in THIS process owns that blob's partial."""
+    return (folder, etag) in _filling
 
 
 async def _fill_blob(repo_type: str, repo_id: str, etag: str, size: int | None, *,
@@ -389,6 +402,21 @@ async def _fill_blob(repo_type: str, repo_id: str, etag: str, size: int | None, 
     blob = blobs / etag
     if blob.exists():
         return False
+    owner = (cachefs.repo_folder_name(repo_id, repo_type), etag)
+    _filling[owner] = _filling.get(owner, 0) + 1
+    try:
+        return await _fill_blob_locked(repo_type, repo_id, etag, size, key, blobs, blob,
+                                       stream=stream, on_answer=on_answer)
+    finally:
+        if _filling.get(owner, 0) <= 1:
+            _filling.pop(owner, None)
+        else:
+            _filling[owner] -= 1
+
+
+async def _fill_blob_locked(repo_type: str, repo_id: str, etag: str, size: int | None,
+                            key: str, blobs: Path, blob: Path, *,
+                            stream: bool, on_answer) -> bool:
     lock = hf_lock(repo_type, repo_id, etag)
     await asyncio.to_thread(lock.acquire)
     try:

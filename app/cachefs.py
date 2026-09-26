@@ -11,17 +11,20 @@ readable by any standard HF client, so you can bypass this service entirely
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import logging
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from huggingface_hub import scan_cache_dir
 
-from . import manifests, statedir
+from . import manifests, shutdown, statedir
 from .config import settings
 
 log = logging.getLogger("xhc.cachefs")
@@ -171,6 +174,235 @@ def blob_incomplete_path(repo_type: str, repo_id: str, etag: str) -> Path:
     return base / "blobs" / f"{etag}.incomplete"
 
 
+def hub_lock_path(folder: str, etag: str) -> Path:
+    """huggingface_hub's own per-blob lock: `.locks/<repo folder>/<etag>.lock`.
+
+    The hub holds it (a filelock flock) for the whole life of the blob's
+    `.incomplete` file, and the tier fill takes the same lock for its
+    `.tier.incomplete`. The kernel drops it when the holder dies.
+    """
+    return Path(settings.cache_dir) / ".locks" / folder / f"{etag}.lock"
+
+
+# --------------------------------------------------------------------------
+# stale partial downloads
+# --------------------------------------------------------------------------
+#
+# huggingface_hub downloads into `blobs/<etag>.incomplete` and renames it on
+# completion; the tier fill writes `blobs/<etag>.tier.incomplete`. A process
+# killed mid-file leaves the partial behind (measured: SIGKILL leaves the
+# partial, a 0-byte `.locks/<repo>/<etag>.lock`, `refs/<rev>` and an empty
+# `snapshots/<commit>/`, on the plain-HTTP and the xet path alike).
+# scan_cache_dir() counts only blobs a snapshot links to, so without this those
+# bytes use the disk and are invisible to eviction.
+
+PARTIAL_SUFFIX = ".incomplete"
+_REPO_PREFIXES = ("models--", "datasets--", "spaces--")
+
+# The last sweep's result, for /_cache/status. None until the first sweep.
+_last_partial_sweep: dict | None = None
+
+
+def _partial_etag(name: str) -> str:
+    # `<etag>.incomplete` or `<etag>.tier.incomplete`; an etag has no dot.
+    return name.split(".", 1)[0]
+
+
+def iter_partials():
+    """Yield (repo folder name, etag, path) for every partial in the HF cache.
+
+    One directory listing per repo's `blobs/`, never a recursive walk: that is
+    the only place either writer puts one. Repo folders only, by prefix, so the
+    state dir and anything else sharing the root are never looked into.
+    """
+    root = Path(settings.cache_dir)
+    try:
+        with os.scandir(root) as it:
+            repos = sorted(e.name for e in it
+                           if e.name.startswith(_REPO_PREFIXES) and e.is_dir(follow_symlinks=False))
+    except OSError:
+        return
+    for folder in repos:
+        try:
+            with os.scandir(root / folder / "blobs") as it:
+                names = [e.name for e in it
+                         if e.name.endswith(PARTIAL_SUFFIX) and e.is_file(follow_symlinks=False)]
+        except OSError:
+            continue
+        for name in sorted(names):
+            yield folder, _partial_etag(name), root / folder / "blobs" / name
+
+
+def partial_bytes() -> int:
+    """Bytes held by every partial in the HF cache right now, owned or not."""
+    total = 0
+    for _folder, _etag, path in iter_partials():
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def owns_partial(folder: str, etag: str) -> bool:
+    """Whether a download in THIS process owns that blob's partial.
+
+    Two writers: a JobManager job (hf_hub_download or snapshot_download writes
+    `.incomplete`) and the tier fill (`.tier.incomplete`, or `.incomplete`
+    under stream read mode). Read from the sweep's worker thread.
+    """
+    from . import jobs, tier  # both import this module
+
+    return jobs.manager.owns_partial(folder, etag) or tier.owns_partial(folder, etag)
+
+
+def sweep_hf_partials(max_age_s: float | None = None, dry_run: bool = False,
+                      stop=None) -> dict:
+    """Remove HF-cache partials that no download owns any more.
+
+    A partial is removed only when ALL THREE guards agree it is dead:
+
+    1. no download in THIS process owns it (owns_partial);
+    2. no process holds huggingface_hub's own lock for it. Every writer holds
+       `.locks/<repo>/<etag>.lock` for the life of the partial and the kernel
+       drops it when the writer dies, which is what reaches a second process
+       sharing this cache. The sweep takes that lock itself, non-blocking, and
+       deletes only while holding it, so no download can start on the file in
+       between;
+    3. it has not been written for XHC_HF_PARTIAL_MAX_AGE -- the backstop for a
+       filesystem where the lock is not honoured.
+
+    `stop` is polled between files so a shutdown can end the sweep promptly.
+    Returns what it saw as well as what it did: `scanned` and the `kept_*`
+    counts make a zero `removed` distinguishable from "found nothing", and
+    `kept_bytes` is what partials still hold on disk after the sweep.
+    """
+    age = settings.hf_partial_max_age_s if max_age_s is None else max_age_s
+    res = {"scanned": 0, "removed": 0, "freed_bytes": 0, "kept_owned": 0,
+           "kept_locked": 0, "kept_young": 0, "kept_bytes": 0, "max_age_s": age,
+           "dry_run": dry_run, "stopped": False}
+    for folder, etag, path in iter_partials():
+        if stop is not None and stop():
+            res["stopped"] = True
+            break
+        res["scanned"] += 1
+        _consider_partial(folder, etag, path, age, dry_run, res)
+    if res["removed"]:
+        log.info("HF partial sweep: %s %d stale partial download(s), %d bytes "
+                 "(kept %d owned, %d locked, %d younger than %.0fs; %d bytes still in partials)",
+                 "would remove" if dry_run else "removed", res["removed"], res["freed_bytes"],
+                 res["kept_owned"], res["kept_locked"], res["kept_young"], age,
+                 res["kept_bytes"])
+    return res
+
+
+def _keep(res: dict, why: str, size: int) -> None:
+    res[why] += 1
+    res["kept_bytes"] += size
+
+
+def _consider_partial(folder: str, etag: str, path: Path, age: float,
+                      dry_run: bool, res: dict) -> None:
+    try:
+        st = path.stat()
+    except OSError:
+        return  # renamed into place or removed since the listing
+    if owns_partial(folder, etag):
+        _keep(res, "kept_owned", st.st_size)
+        return
+    if time.time() - st.st_mtime < age:
+        _keep(res, "kept_young", st.st_size)
+        return
+    lock = hub_lock_path(folder, etag)
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except OSError:
+        # Cannot take part in the lock protocol (read-only, permissions): a
+        # holder could exist that this cannot see, so keep it.
+        _keep(res, "kept_locked", st.st_size)
+        return
+    try:
+        _remove_if_unlocked(fd, lock, folder, etag, path, age, dry_run, res)
+    finally:
+        os.close(fd)  # releases the flock, if taken
+
+
+def _remove_if_unlocked(fd: int, lock: Path, folder: str, etag: str, path: Path,
+                        age: float, dry_run: bool, res: dict) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            _keep(res, "kept_locked", size)
+            return
+        # flock unsupported on this filesystem: the age guard is the guard.
+    else:
+        # A lock on an inode that was unlinked, or that is no longer the file at
+        # that path, excludes nobody (filelock drops such a lock for the same
+        # reason), so it proves nothing about the real holder.
+        try:
+            fst, cur = os.fstat(fd), os.stat(lock)
+        except OSError:
+            _keep(res, "kept_locked", size)
+            return
+        if fst.st_nlink == 0 or (fst.st_ino, fst.st_dev) != (cur.st_ino, cur.st_dev):
+            _keep(res, "kept_locked", size)
+            return
+    # Under the lock no download can start on this blob; re-check the rest.
+    if owns_partial(folder, etag):
+        _keep(res, "kept_owned", size)
+        return
+    try:
+        st = path.stat()
+    except OSError:
+        return  # renamed into place since the listing
+    idle = time.time() - st.st_mtime
+    if idle < age:
+        _keep(res, "kept_young", st.st_size)
+        return
+    if not dry_run:
+        try:
+            path.unlink()
+        except OSError:
+            _keep(res, "kept_locked", st.st_size)
+            return
+    res["removed"] += 1
+    res["freed_bytes"] += st.st_size
+    log.info("HF partial sweep: %s stale partial %s/blobs/%s (%d bytes, idle %.0fs, no owner)",
+             "would remove" if dry_run else "removed", folder, path.name, st.st_size, idle)
+
+
+def last_partial_sweep() -> dict | None:
+    """The most recent sweep's result with its trigger and time, or None."""
+    return _last_partial_sweep
+
+
+def _record_sweep(res: dict, trigger: str) -> dict:
+    global _last_partial_sweep  # noqa: PLW0603 - module-level status
+    _last_partial_sweep = {**res, "trigger": trigger, "at": time.time()}
+    return res
+
+
+async def sweep_partials_async(trigger: str) -> dict:
+    """Run the sweep in a worker thread; a cancel also stops the thread.
+
+    Cancelling the await does not stop a thread, so the thread is told to stop
+    as well -- otherwise a shutdown would leave it walking the cache.
+    """
+    stop = threading.Event()
+    try:
+        res = await asyncio.to_thread(sweep_hf_partials, stop=stop.is_set)
+    except asyncio.CancelledError:
+        stop.set()
+        raise
+    return _record_sweep(res, trigger)
+
+
 # --------------------------------------------------------------------------
 # pins
 # --------------------------------------------------------------------------
@@ -298,6 +530,10 @@ class CacheView:
     warnings: list[str]
     scan_duration_s: float = 0.0
     nb_files: int = 0
+    # Bytes in `blobs/*.incomplete` partials, live or stale. NOT in
+    # size_on_disk, which is scan_cache_dir's figure and counts only blobs a
+    # snapshot links to; kept separate so muninn_cache_bytes keeps its meaning.
+    partial_bytes: int = 0
 
     @property
     def ttl_s(self) -> float:
@@ -361,6 +597,7 @@ def _scan_sync() -> CacheView:
         if f"/{_STATE_DIR}" not in str(w)
         and not any(str(w).rstrip().endswith(f"/{n}") for n in _BENIGN_CACHE_ENTRIES)
     ]
+    in_partials = partial_bytes()
     duration = time.time() - started
     view = CacheView(
         scanned_at=time.time(),
@@ -369,6 +606,7 @@ def _scan_sync() -> CacheView:
         warnings=warnings,
         scan_duration_s=round(duration, 3),
         nb_files=sum(r.nb_files for r in repos),
+        partial_bytes=in_partials,
     )
     if duration > 5:
         log.warning(
@@ -453,8 +691,15 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
     low = int(capacity * settings.low_water)
     high = int(capacity * settings.high_water)
 
+    # Stale partials first: they are garbage, and reclaiming them may make
+    # evicting real data unnecessary. What survives the sweep -- partials a
+    # download owns or that are too young to judge -- is COUNTED as used: those
+    # bytes are on disk inside this cache's budget, and an owned one is about
+    # to become a blob. scan_cache_dir cannot see them at all.
+    partials = _record_sweep(sweep_hf_partials(), "evict")
     info = scan_cache_dir(settings.cache_dir)
-    used = info.size_on_disk
+    blob_bytes = info.size_on_disk
+    used = blob_bytes + partials["kept_bytes"]
 
     if used <= high and used + target_free_bytes <= capacity:
         # UNDER BUDGET IS NOT THE SAME AS HAVING ROOM, and on a shared
@@ -487,6 +732,9 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
             "freed": 0,
             "used_before": used,
             "used_after": used,
+            "blob_bytes": blob_bytes,
+            "partial_bytes": partials["kept_bytes"],
+            "partials": partials,
             "reason": "under high water",
         }
 
@@ -548,6 +796,11 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
         "freed": freed,
         "used_before": used,
         "used_after": used - freed,
+        # used_* = blob_bytes + partial_bytes. Stale partials the sweep removed
+        # are in partials.freed_bytes, not in `freed` (they were never blobs).
+        "blob_bytes": blob_bytes,
+        "partial_bytes": partials["kept_bytes"],
+        "partials": partials,
         "goal": goal,
         "reached_goal": (used - freed) <= goal,
         "protected_bytes": protected_bytes,
@@ -558,7 +811,7 @@ def _evict_sync(target_free_bytes: int = 0) -> dict:
 
 async def evict(target_free_bytes: int = 0) -> dict:
     result = await asyncio.to_thread(_evict_sync, target_free_bytes)
-    if result.get("freed"):
+    if result.get("freed") or (result.get("partials") or {}).get("removed"):
         invalidate_view()
     return result
 
@@ -611,11 +864,32 @@ def delete_repo_sync(repo_type: str, repo_id: str) -> dict:
     return {"deleted": True, "freed": freed, "revisions": commits}
 
 
+async def _sweep_partials_logged(trigger: str) -> dict | None:
+    try:
+        res = await sweep_partials_async(trigger)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("%s sweep of stale HF partial downloads failed", trigger)
+        return None
+    if res["removed"]:
+        invalidate_view()
+    return res
+
+
 async def eviction_loop() -> None:
-    """Background sweep so we never wait for a miss to discover we are full."""
+    """Background sweep so we never wait for a miss to discover we are full.
+
+    Each interval also reclaims stale partial downloads, and so does startup
+    (once, before the first interval): a process killed mid-download left
+    partials that nothing else will ever look at.
+    """
+    await _sweep_partials_logged("startup")
     while True:
+        shutdown.reraise_if_cancelled()
         try:
             await asyncio.sleep(settings.evict_interval_s)
+            swept = await _sweep_partials_logged("interval")
             stats = disk_stats()
             # Deliberately NOT force=True. evict() re-scans authoritatively
             # before deleting anything, so forcing here would pay for two full
@@ -623,8 +897,13 @@ async def eviction_loop() -> None:
             # slightly stale view answers fine. Worst case we defer an eviction
             # by one interval.
             view = await get_view()
-            if view.size_on_disk > stats["capacity"] * settings.high_water:
-                log.info("high-water exceeded (%d bytes used), evicting", view.size_on_disk)
+            # Partials still on disk after the sweep count against the budget:
+            # scan_cache_dir cannot see them, and they use the disk all the same.
+            in_partials = swept["kept_bytes"] if swept is not None else view.partial_bytes
+            used = view.size_on_disk + in_partials
+            if used > stats["capacity"] * settings.high_water:
+                log.info("high-water exceeded (%d bytes used, %d of them in partial downloads), "
+                         "evicting", used, in_partials)
                 await evict()
         except asyncio.CancelledError:
             raise

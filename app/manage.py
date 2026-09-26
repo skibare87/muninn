@@ -99,6 +99,12 @@ async def status() -> dict:
             "high_water": settings.high_water,
             "low_water": settings.low_water,
             "nb_files": view.nb_files,
+            # Bytes in `blobs/*.incomplete` partial downloads, live or stale.
+            # Not in size_on_disk (scan_cache_dir cannot see them); eviction
+            # counts them against the budget. `partials` is the last sweep of
+            # stale ones (README "Pinning vs. eviction"), None before the first.
+            "partial_bytes": view.partial_bytes,
+            "partials": cachefs.last_partial_sweep(),
             "scanned_at": view.scanned_at,
             # Scan cost tracks file count, not bytes. If this creeps up, that is
             # the thing to watch -- see README "Scaling".

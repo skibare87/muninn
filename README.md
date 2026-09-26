@@ -2539,19 +2539,46 @@ failure mode for a fleet rollout: better to run hot on disk than to evict the
 model every node is about to request. Pin the current working set; let
 experiments age out.
 
-**Known gap: `.incomplete` files in the Hugging Face cache are not swept.** The Docker
-side reclaims stale partial downloads (see *Garbage collection is mark-and-sweep*); the
-Hugging Face side does not yet. From reading `huggingface_hub` 0.34.4 (not from a
-measured kill): it downloads into `blobs/<etag>.incomplete` and renames on completion, so
-a process killed mid-file leaves that file behind. It is reclaimed only if the same file is
-requested again (the HTTP path resumes by appending to it) or when the whole repo is
-deleted or evicted (removing a repo's last revision removes the repo folder). Evicting
-some revisions leaves it in place. `scan_cache_dir()` counts only blobs a snapshot links
-to, so these bytes are invisible to eviction's accounting while still using the disk.
-Muninn's own tier fill writes `blobs/<etag>.tier.incomplete`, a name `huggingface_hub`
-never resumes, so after a kill that file lasts until the repo is removed. To reclaim the
-space by hand, stop the service and delete `*.incomplete` under the cache's `blobs/`
-directories.
+**Partial downloads left by a killed process are swept automatically.** `huggingface_hub`
+downloads into `blobs/<etag>.incomplete` and renames it on completion; Muninn's tier fill
+writes `blobs/<etag>.tier.incomplete`. Kill the process mid-file (measured with `SIGKILL`,
+on the plain-HTTP path and on a real Xet download) and it leaves the partial, a 0-byte
+`.locks/<repo>/<etag>.lock`, the `refs/` entry and an empty `snapshots/<commit>/`. The
+plain-HTTP path resumes that partial if the same file is requested again. The Xet path
+does not: it rewrites the file from the start. Nothing resumes a `.tier.incomplete`.
+`scan_cache_dir()` counts only blobs a snapshot links to, so it cannot see partial bytes.
+
+The eviction loop sweeps partials at startup (once, before the first interval) and then
+every `XHC_EVICT_INTERVAL`. `POST /_cache/evict` sweeps before it measures. A partial is
+removed only when **all three** of these hold:
+
+1. no download in this process owns it. That means no ingest job for the blob (a prewarm,
+   or a file job with no known ETag, owns every partial in its repo) and no tier fill;
+2. no process holds `huggingface_hub`'s own lock for it, `.locks/<repo>/<etag>.lock`.
+   Every writer (the hub and the tier fill) holds that `flock` for the life of the
+   partial, and the kernel drops it when the writer dies, so a second process sharing
+   the cache is seen too. The sweep takes the lock itself, without blocking, and deletes
+   only while holding it, so no download can start on the file in between. Lock files
+   are left in place: the hub creates and keeps them;
+3. it has not been written for `XHC_HF_PARTIAL_MAX_AGE` seconds (default `21600`, six
+   hours). This is the backstop for a filesystem that does not honour `flock`. It is also
+   how long a plain-HTTP partial keeps its resume value. It is a separate setting from
+   `XHC_DOCKER_PARTIAL_MAX_AGE`, with the same default, for that reason.
+
+Each removal is logged with its name, size and idle time, and a summary line gives the
+totals. `/_cache/status` shows `cache.partial_bytes` (bytes in partials right now, live or
+stale) and `cache.partials` (the last sweep: `trigger`, `at`, `scanned`, `removed`,
+`freed_bytes`, `kept_owned`, `kept_locked`, `kept_young`, `kept_bytes`, `max_age_s`). A
+`removed: 0` can therefore be told apart from "found nothing to look at".
+
+**Partials count against the capacity budget.** Eviction's `used` is the blob bytes
+`scan_cache_dir()` reports **plus** the partial bytes still on disk after the sweep. Those
+partials are owned by a download or too young to judge, and an owned one is about to
+become a blob. The `POST /_cache/evict` result breaks the figure down as `blob_bytes` and
+`partial_bytes`, and carries the sweep's `partials` object. Bytes the sweep removed are in
+`partials.freed_bytes`, not in `freed`, which counts evicted revisions. `size_on_disk` and
+`muninn_cache_bytes` still mean blob bytes only. `disk.fs_used` is the filesystem's own
+figure and always included partials.
 
 ## Sizing memory for ingest
 
@@ -2607,6 +2634,7 @@ choosing it.
 | `XHC_CACHE_MAX_SIZE` | filesystem size | eviction target, e.g. `70T`. Binary units. |
 | `XHC_HIGH_WATER` / `XHC_LOW_WATER` | `0.90` / `0.75` | evict when above high, down to low |
 | `XHC_EVICT_INTERVAL` | `900` | background sweep, seconds |
+| `XHC_HF_PARTIAL_MAX_AGE` | `21600` | seconds a `blobs/*.incomplete` partial must go unwritten before the sweep may remove it, and then only if no download owns it and no process holds the hub's lock for it. See *Pinning vs. eviction* |
 | `XHC_MISS_POLICY` | `stream` | `stream` \| `redirect` \| `wait` |
 | `XHC_BLOCK_CLIENT_XET` | `1` | 404 the Xet token endpoints so clients can't bypass the cache |
 | `XHC_HF_VERIFY` | `1` | hash each ingested HF file against its ETag and refuse a mismatch |

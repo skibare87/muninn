@@ -245,6 +245,18 @@ class Settings:
     high_water: float = 0.90
     low_water: float = 0.75
     evict_interval_s: int = 900
+    # A `blobs/<etag>.incomplete` (or `.tier.incomplete`) left in the HF cache
+    # by a killed download is removed only once nothing owns it (no job or tier
+    # fill in this process, no process holding huggingface_hub's own per-blob
+    # lock) AND it has not been written for this long. A separate knob from
+    # XHC_DOCKER_PARTIAL_MAX_AGE because the trade differs: an HF partial from
+    # the plain-HTTP path is RESUMED by the next request for that file, so the
+    # age is also how long that resume value is kept. The xet path and the tier
+    # fill never resume (measured: hf_xet rewrites the file from offset 0).
+    # Same six-hour default: the age is the backstop for a filesystem that does
+    # not honour the lock, and six hours is far past any silence a live
+    # download has.
+    hf_partial_max_age_s: float = 6 * 3600.0
     # Where durable state (pins, orphan marks, runtime policy) lives. Unset:
     # inside each cache tree, as `<cache>/.xhc/` and `<docker dir>/.xhc/`.
     # Set: `$XHC_STATE_DIR/hf/` and `$XHC_STATE_DIR/oci/`, so blobs can sit on
@@ -758,6 +770,8 @@ class Settings:
             high_water=high,
             low_water=low,
             evict_interval_s=_env_int("XHC_EVICT_INTERVAL", 900),
+            hf_partial_max_age_s=_env_float("XHC_HF_PARTIAL_MAX_AGE",
+                                            cls.hf_partial_max_age_s),
             state_dir=state_dir,
             miss_policy=miss_policy,
             block_client_xet=_env_bool("XHC_BLOCK_CLIENT_XET", True),
