@@ -574,6 +574,9 @@ class Settings:
     # any silence a LIVE download can have: registry reads have no read
     # timeout, so a stalled upstream can hold one open without a byte for a
     # long time. Six hours is far past that and still reclaims within a day.
+    # The same age expires an idle push upload session and reclaims its staging
+    # file under `_uploads/` (ocipush): one age, so a session never outlives
+    # the sweep's idea of when its file is dead.
     docker_partial_max_age_s: float = 6 * 3600.0
 
     # --- server --------------------------------------------------------------

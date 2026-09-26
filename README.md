@@ -817,6 +817,44 @@ considered. Any other file is left alone. These temps count in the `partials` to
 are also broken out under `partials.writes` with the same fields, so a reclaimed write can
 be told apart from a reclaimed download.
 
+**Abandoned push uploads are reclaimed on the same rule, and on the same age.** A push
+stages each blob in `<XHC_DOCKER_DIR>/_uploads/<upstream>/<uuid>` between the `POST` that
+opens the session and the `PUT` that lands it. A client that never sends the `PUT` (a
+cancelled push, a CI runner killed mid-layer), or a process that dies mid-upload, used to
+leave that file there permanently, because it sits outside every tree the GC walks. Up to
+v0.9.30 the session itself also stayed in memory for the life of the process. Now:
+
+- **a session expires** once it has gone `XHC_DOCKER_PARTIAL_MAX_AGE` without a request and
+  nothing is running inside it. Expiry deletes its staging file. The next request on it gets
+  `404 BLOB_UPLOAD_UNKNOWN`, which is the OCI answer for a session the registry no longer
+  has, and a docker client restarts the upload. Expiry counts idle time, not total time, so
+  an upload that keeps sending chunks never expires. A `PUT` still pushing upstream in
+  `proxy` mode counts as activity for as long as it runs.
+- **a staging file is removed** by the partial sweep only when no live session in this
+  process owns it, no process holds its lock (taken while a chunk is being written), and it
+  has been idle for `XHC_DOCKER_PARTIAL_MAX_AGE`. Only uuid-named files are considered.
+  These are broken out under `partials.uploads`.
+
+The two share one age on purpose. If a session could stay alive longer than the sweep waits,
+the sweep could delete the file of a session running in another process. As a second
+guard, a session checks before every chunk and before landing that its staging file exists
+and is exactly as long as what it has written. If not, the session is dropped with
+`BLOB_UPLOAD_UNKNOWN`. Before this check, a staging file removed mid-upload was silently
+recreated empty, and the upload finished with a correct digest over bytes that were never
+all on disk.
+
+Six hours is far longer than a live session is ever idle: a docker client sends its next
+`PATCH` or `PUT` within seconds. It is also short enough that an abandoned upload's bytes go
+within one GC interval of it.
+
+**The store-forward pending area is swept at startup in both layouts.** A process killed
+while writing an obligation leaves a `.writing` temp (or, with `XHC_STATE_DIR` set, a
+`.partial` or `.linking` copy of held bytes). Up to v0.9.30 these were removed only when
+`XHC_STATE_DIR` was set, so the default `<XHC_DOCKER_DIR>/_pending/` kept them for good. Now
+startup removes them from `<XHC_DOCKER_DIR>/_pending/` always, and from the state dir's
+pending area when it is set. It runs before the first request is served, so no write in the
+process can own them yet.
+
 ### `XHC_DOCKER_TAG_TTL` has three regimes, and `0` is the surprising one
 
 | value | meaning |
@@ -989,7 +1027,7 @@ different `pin` value is a different prewarm).
 | `XHC_ALLOW_IMAGES` / `XHC_DENY_IMAGES` | unset | globs over `<upstream>/<repo>` |
 | `XHC_DOCKER_MAX_BLOB_BYTES` | unset | refuse an oversized layer before bytes move |
 | `XHC_DOCKER_MIN_FREE` | `1G` | below this much free space, a miss is **proxied to the client uncached** instead of ingested; `0` disables |
-| `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob, or a manifest or tag write temp (`.part<pid>`), must go unwritten before GC may remove it, and then only if nothing in this process owns it and no process holds its lock. See *Garbage collection is mark-and-sweep* |
+| `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob, a manifest or tag write temp (`.part<pid>`), or a push upload's staging file must go unwritten before GC may remove it, and then only if nothing in this process owns it and no process holds its lock. Also how long a push upload session may sit idle before it expires. See *Garbage collection is mark-and-sweep* |
 | `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
 
 > **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing
@@ -1106,7 +1144,9 @@ A pending push is three things: the **record** of what is owed (upstream, reposi
 digest, and for a manifest the tag it goes to), the **bytes** (the blob, or the manifest
 body), and the upstream **credentials**. The credentials come from `XHC_REGISTRY_AUTH_FILE`,
 so they survive whatever your configuration survives. An upload the client never finished
-was never answered `201`, and is not kept: the client retries it.
+was never answered `201`, and is not kept: the client retries it. Its session expires, and
+its staged bytes are reclaimed, after `XHC_DOCKER_PARTIAL_MAX_AGE` idle (see
+*Garbage collection is mark-and-sweep*).
 
 | | `XHC_STATE_DIR` unset | `XHC_STATE_DIR` set |
 |---|---|---|

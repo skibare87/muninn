@@ -1062,8 +1062,8 @@ async def blob_upload_start(name: str, request: Request) -> Response:
     digest = request.query_params.get("digest")
     if digest:
         # Single-POST monolithic upload: body and digest in one request.
-        await ocipush.append(up, await request.body())
         try:
+            await ocipush.append(up, await request.body())
             await ocipush.finalise_blob(up, digest)
         except ocipush.PushError as exc:
             return _err(exc.status, exc.code, exc.message)
@@ -1085,8 +1085,11 @@ async def blob_upload_chunk(name: str, uuid: str, request: Request) -> Response:
         up = ocipush.get(uuid, _key_id(request))
     except ocipush.PushError as exc:
         return _err(exc.status, exc.code, exc.message)
-    async for chunk in request.stream():
-        await ocipush.append(up, chunk)
+    try:
+        async for chunk in request.stream():
+            await ocipush.append(up, chunk)
+    except ocipush.PushError as exc:
+        return _err(exc.status, exc.code, exc.message)
     return Response(status_code=202, headers={
         "location": f"/v2/{name}/blobs/uploads/{uuid}",
         "docker-upload-uuid": uuid,
@@ -1105,9 +1108,9 @@ async def blob_upload_finish(name: str, uuid: str, request: Request) -> Response
         up = ocipush.get(uuid, _key_id(request))
     except ocipush.PushError as exc:
         return _err(exc.status, exc.code, exc.message)
-    async for chunk in request.stream():
-        await ocipush.append(up, chunk)
     try:
+        async for chunk in request.stream():
+            await ocipush.append(up, chunk)
         await ocipush.finalise_blob(up, digest)
     except ocipush.PushError as exc:
         return _err(exc.status, exc.code, exc.message)

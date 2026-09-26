@@ -27,6 +27,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -388,6 +389,9 @@ def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dic
     is the in-process write table, and the writer holds the lock until its
     rename. They are counted in the top-level totals and broken out under
     `writes`, so a reader can tell a reclaimed download from a reclaimed write.
+
+    And the staging files of push sessions that will never finish, under
+    `_uploads/`, broken out under `uploads` (see _sweep_uploads).
     """
     from . import ocicompat  # ocicompat imports this module
 
@@ -395,6 +399,8 @@ def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dic
     res = _new_counts(age)
     writes = _new_counts(age)
     res["writes"] = writes
+    uploads = _new_counts(age)
+    res["uploads"] = uploads
     r = ocistore.root()
     if not r.is_dir():
         return res
@@ -420,15 +426,47 @@ def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dic
                     writes["scanned"] += 1
                     _consider_partial(path, up.name, fn, age, dry_run, writes,
                                       lambda _u, _d, p=path: ocistore.owns_write(p))
-    for k in ("scanned", "removed", "freed_bytes", "kept_owned", "kept_locked", "kept_young"):
-        res[k] += writes[k]
+    _sweep_uploads(age, dry_run, uploads)
+    for part in (writes, uploads):
+        for k in ("scanned", "removed", "freed_bytes", "kept_owned", "kept_locked",
+                  "kept_young"):
+            res[k] += part[k]
     if res["removed"]:
-        log.info("docker GC: %s %d stale partial(s), %d of them write temps, %d bytes "
-                 "(kept %d owned, %d locked, %d younger than %.0fs)",
+        log.info("docker GC: %s %d stale partial(s), %d of them write temps and %d "
+                 "abandoned uploads, %d bytes (kept %d owned, %d locked, %d younger "
+                 "than %.0fs)",
                  "would remove" if dry_run else "removed", res["removed"],
-                 writes["removed"], res["freed_bytes"], res["kept_owned"], res["kept_locked"],
-                 res["kept_young"], age)
+                 writes["removed"], uploads["removed"], res["freed_bytes"],
+                 res["kept_owned"], res["kept_locked"], res["kept_young"], age)
     return res
+
+
+# A staging file is named by the session's uuid4 and nothing else.
+_UPLOAD_NAME_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _sweep_uploads(age: float, dry_run: bool, res: dict) -> None:
+    """Staging files of push sessions nobody will finish.
+
+    `<docker dir>/_uploads/<upstream>/<uuid>` is written by PATCH and renamed
+    into the store by PUT. A session the client abandons, or one alive when the
+    process died, leaves it behind -- outside every tree the GC walks. Removed
+    on the same three guards as a partial download: no live session in this
+    process owns it (ocipush.owns_upload), no process holds its lock (taken
+    while a chunk is written), and idle past XHC_DOCKER_PARTIAL_MAX_AGE -- the
+    age at which ocipush expires an idle session, so the two agree on when an
+    upload is dead. Only uuid-named files are considered.
+    """
+    base = ocipush.uploads_root()
+    if not base.is_dir():
+        return
+    for up_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        for path in sorted(up_dir.iterdir()):
+            if not _UPLOAD_NAME_RE.match(path.name) or not path.is_file():
+                continue
+            res["scanned"] += 1
+            _consider_partial(path, up_dir.name, path.name, age, dry_run, res,
+                              lambda _u, _d, p=path: ocipush.owns_upload(p))
 
 
 def _consider_partial(path: Path, upstream: str, digest: str, age: float,
@@ -585,6 +623,10 @@ async def gc_loop() -> None:
             await asyncio.sleep(settings.evict_interval_s)
             if not settings.docker_enabled:
                 continue
+            # In the loop, not the worker thread: sessions are mutated here.
+            # Before collect, so an expired session's staging file is already
+            # gone and the partial sweep does not count it.
+            ocipush.expire_sessions()
             res = await asyncio.to_thread(collect)
             if res.get("refused"):
                 log.error("docker GC refused: %s", res.get("reason"))

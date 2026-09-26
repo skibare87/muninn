@@ -107,6 +107,13 @@ class Upload:
     # None means the session was opened with per-key authz off, in which case
     # there is no key to bind to and nothing to compare.
     key_id: str | None = None
+    # When a request last touched this session (monotonic), and how many
+    # operations are inside it right now. A session is expired only when BOTH
+    # say it is dead: idle past XHC_DOCKER_PARTIAL_MAX_AGE and nothing running.
+    # `active` is what stops a proxy-mode finalise -- a long upstream push that
+    # writes nothing here -- from being expired out from under itself.
+    last_active: float = field(default_factory=time.monotonic)
+    active: int = 0
 
     @property
     def computed(self) -> str:
@@ -425,17 +432,32 @@ def _migrate_legacy() -> None:
 def _sweep_strays() -> None:
     """Held bytes with no obligation are a push that was never acknowledged
     (the hold is written before the record) or one already delivered whose
-    cleanup was interrupted. Either way nothing is owed; reclaim the space."""
-    if not _durable():
-        return
-    d = _obligations_dir()
-    for p in d.iterdir():
-        stray = p.name.endswith(_TMP_SUFFIXES) or (
-            p.name.endswith(_HELD_SUFFIX)
-            and not (d / (p.name[: -len(_HELD_SUFFIX)] + ".json")).exists())
-        if stray:
-            log.info("removing %s from the pending area: nothing is owed for it", p.name)
-            p.unlink(missing_ok=True)
+    cleanup was interrupted. Either way nothing is owed; reclaim the space.
+
+    BOTH LAYOUTS. This used to return at once unless XHC_STATE_DIR was set, so
+    the `.writing` temps `_write_durable` leaves in `<docker dir>/_pending` when
+    killed between write and rename -- the DEFAULT layout -- were never
+    reclaimed by anything. The legacy directory is also swept when the state
+    dir IS set: migration moves its markers but not a temp left beside them.
+
+    Called only from recover(), at startup and before any request is served,
+    so no write in this process can own a temp yet. A pending area is not
+    shared between processes (each would forward every obligation in it), so
+    no other writer is assumed either.
+    """
+    dirs = [_legacy_obligations_dir()]
+    if _durable():
+        dirs.append(_obligations_dir())
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            stray = p.name.endswith(_TMP_SUFFIXES) or (
+                p.name.endswith(_HELD_SUFFIX)
+                and not (d / (p.name[: -len(_HELD_SUFFIX)] + ".json")).exists())
+            if stray:
+                log.info("removing %s from %s: nothing is owed for it", p.name, d)
+                p.unlink(missing_ok=True)
 
 
 def recover() -> list[dict]:
@@ -527,10 +549,47 @@ async def resume() -> None:
                 _forward_later(ref, rec["digest"], key))
 
 
+# --- upload sessions: in memory, and bounded -----------------------------------
+#
+# A session is opened by POST and lives until its PUT lands it or fails its
+# digest. A client that opens one and never comes back -- a cancelled push, a
+# CI runner killed mid-layer, a network that dropped -- used to leave the session
+# in `_sessions` FOR THE LIFE OF THE PROCESS and its staging file under
+# `_uploads/` forever: nothing expired the one, and the GC walk never looked at
+# the other. After a restart the table is empty and the file was simply orphaned.
+#
+# Now both are reclaimed on the rule the docker GC already uses for a stale
+# `.incomplete` download, and on the SAME age, XHC_DOCKER_PARTIAL_MAX_AGE:
+#
+#   * the session expires once it has been idle that long with nothing running
+#     inside it (expire_sessions() from the GC loop, and lazily in get());
+#     expiry discards its staging file;
+#   * the GC's partial sweep removes a staging file only if no live session in
+#     this process owns it (owns_upload), no process holds its lock (held while
+#     a chunk is being written), and it has been idle that long.
+#
+# ONE AGE FOR BOTH IS THE POINT. If a session could outlive the sweep's age, the
+# sweep would be entitled to delete the file of a session it cannot see (one in
+# another process), and that session's next chunk would land in a file missing
+# its beginning. append() also refuses that case structurally: the staging file
+# must exist and be exactly `offset` bytes long, or the session is dropped.
+#
+# WHY SIX HOURS IS NOT TOO LONG: a docker client sends its next PATCH or PUT
+# within seconds of the last; nothing in the protocol pauses for hours. The age
+# only has to exceed any silence a LIVE session can have, which it does by a
+# wide margin, and it bounds an abandoned upload to one GC interval past it.
+# And not too short: a session held a little longer costs a hash state and a
+# path in memory, while one expired early fails a push that was still going.
+
+
 def _staging(upstream: str) -> Path:
     d = Path(settings.docker_dir) / "_uploads" / upstream.replace("/", "_")
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def uploads_root() -> Path:
+    return Path(settings.docker_dir) / "_uploads"
 
 
 def begin(ref: registry.Ref, key_id: str | None = None) -> Upload:
@@ -539,6 +598,40 @@ def begin(ref: registry.Ref, key_id: str | None = None) -> Upload:
     up.path.touch()
     _sessions[u] = up
     return up
+
+
+def owns_upload(path: Path) -> bool:
+    """True while a session in THIS process has `path` as its staging file.
+
+    Read from the GC's worker thread; a dict lookup needs no lock. A uuid is
+    never reused, so once this answers False for a path it can never answer
+    True again -- the sweep cannot race a session back into existence.
+    """
+    up = _sessions.get(path.name)
+    return up is not None and up.path == path
+
+
+def _expired(up: Upload, now: float) -> bool:
+    return up.active == 0 and now - up.last_active >= settings.docker_partial_max_age_s
+
+
+def _expire(up: Upload, idle: float) -> None:
+    log.info("expiring upload session %s for %s/%s: idle %.0fs, past "
+             "XHC_DOCKER_PARTIAL_MAX_AGE (%.0fs); %d bytes discarded", up.uuid,
+             up.ref.upstream, up.ref.repo, idle, settings.docker_partial_max_age_s,
+             up.offset)
+    discard(up)
+
+
+def expire_sessions() -> int:
+    """Drop every session idle past XHC_DOCKER_PARTIAL_MAX_AGE, with its
+    staging file. Runs in the event loop (the GC loop), where sessions are
+    mutated, never from the GC's worker thread. Returns how many expired."""
+    now = time.monotonic()
+    gone = [up for up in list(_sessions.values()) if _expired(up, now)]
+    for up in gone:
+        _expire(up, now - up.last_active)
+    return len(gone)
 
 
 def get(uuid: str, key_id: str | None = None) -> Upload:
@@ -552,13 +645,45 @@ def get(uuid: str, key_id: str | None = None) -> Upload:
     request carrying a key still gets it: that combination only arises if authz
     was switched on mid-upload, and failing a push in flight is the wrong answer
     to a configuration change.
+
+    An EXPIRED session is BLOB_UPLOAD_UNKNOWN too, whether the GC loop already
+    dropped it or this is the first request to notice: the spec's answer for a
+    session the registry no longer has, which a docker client handles by
+    starting the upload again.
     """
     up = _sessions.get(uuid)
     if up is None:
         raise PushError(404, "BLOB_UPLOAD_UNKNOWN", f"no upload session {uuid}")
     if up.key_id is not None and up.key_id != key_id:
         raise PushError(404, "BLOB_UPLOAD_UNKNOWN", f"no upload session {uuid}")
+    now = time.monotonic()
+    if _expired(up, now):
+        _expire(up, now - up.last_active)
+        raise PushError(404, "BLOB_UPLOAD_UNKNOWN",
+                        f"upload session {uuid} expired after "
+                        f"{settings.docker_partial_max_age_s:.0f}s idle; start it again")
+    up.last_active = now
     return up
+
+
+def _lost(up: Upload, why: str) -> PushError:
+    """The staging file is not what this session wrote: drop the session rather
+    than append to, or land, bytes that are not the ones it hashed."""
+    log.error("upload session %s for %s/%s: %s; dropping the session", up.uuid,
+              up.ref.upstream, up.ref.repo, why)
+    discard(up)
+    return PushError(404, "BLOB_UPLOAD_UNKNOWN",
+                     f"upload session {up.uuid} lost its staged data ({why}); "
+                     "start it again")
+
+
+def _check_staging(up: Upload) -> None:
+    try:
+        size = up.path.stat().st_size
+    except FileNotFoundError:
+        raise _lost(up, "its staging file is gone") from None
+    if size != up.offset:
+        raise _lost(up, f"its staging file is {size} bytes, {up.offset} were written")
 
 
 async def append(up: Upload, chunk: bytes) -> None:
@@ -573,13 +698,38 @@ async def append(up: Upload, chunk: bytes) -> None:
 
     Reopening per chunk rather than holding a handle is deliberate: an upload
     session can be abandoned at any point, and a handle held across awaits is a
-    file descriptor leaked per abandoned push.
-    """
-    def _write():
-        with up.path.open("ab") as fh:
-            fh.write(chunk)
+    file descriptor leaked per abandoned push. The writer's lock
+    (ocistore.hold_partial) is therefore held per chunk, while bytes are being
+    written; between chunks the in-process session table and the idle age are
+    what keep the GC's sweep off the file.
 
-    await asyncio.to_thread(_write)
+    The file is opened WITHOUT create and must be exactly `offset` bytes long.
+    Mode "ab" would silently recreate a file removed underneath the session,
+    and the upload would then finish with a correct digest over bytes that were
+    never all written -- landed as a blob under a name it does not hash to.
+    Raises PushError (BLOB_UPLOAD_UNKNOWN) instead.
+    """
+    def _write() -> str | None:
+        try:
+            fd = os.open(up.path, os.O_WRONLY | os.O_APPEND)
+        except FileNotFoundError:
+            return "its staging file is gone"
+        with os.fdopen(fd, "ab") as fh:
+            ocistore.hold_partial(fh)
+            size = os.fstat(fd).st_size
+            if size != up.offset:
+                return f"its staging file is {size} bytes, {up.offset} were written"
+            fh.write(chunk)
+        return None
+
+    up.active += 1
+    try:
+        why = await asyncio.to_thread(_write)
+    finally:
+        up.active -= 1
+        up.last_active = time.monotonic()
+    if why is not None:
+        raise _lost(up, why)
     up.digest.update(chunk)
     up.offset += len(chunk)
 
@@ -777,7 +927,20 @@ def _with_digest(url: str, digest: str) -> str:
 
 
 async def finalise_blob(up: Upload, claimed: str) -> None:
-    """Verify, forward, and cache. Raises PushError; the caller answers."""
+    """Verify, forward, and cache. Raises PushError; the caller answers.
+
+    Counted as activity for its whole length, so a proxy-mode upstream push
+    that outlasts XHC_DOCKER_PARTIAL_MAX_AGE cannot expire its own session."""
+    up.active += 1
+    try:
+        await _finalise_blob(up, claimed)
+    finally:
+        up.active -= 1
+        up.last_active = time.monotonic()
+
+
+async def _finalise_blob(up: Upload, claimed: str) -> None:
+    _check_staging(up)
     if up.computed != claimed:
         discard(up)
         raise PushError(400, "DIGEST_INVALID",
