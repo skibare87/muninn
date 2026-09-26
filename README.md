@@ -2410,10 +2410,11 @@ A local fault (a full disk, a parse error) is never read as "unreachable".
 > ⚠ **Without a valid Hub token, a deleted repo does not look deleted.** Measured
 > on the public Hub: an anonymous request for a repo that does not exist gets
 > **401**, not 404, the same answer as a repo you may not read. Muninn does not
-> restore on 401, so a cache running without a valid `XHC_HF_TOKEN` survives an
+> restore on 401, so a cache running without a valid `HF_TOKEN` survives an
 > **outage** but cannot tell a deletion from a refusal, and does not restore
-> after one. With a valid token the Hub is expected to answer 404 for a deleted
-> repo; that has not been measured from here.
+> after one. With a valid token the Hub answers **404 `RepoNotFound`** for a repo
+> that does not exist, and Muninn restores (measured on the public Hub, with a
+> valid fine-grained token and without one, for the same nonexistent repo).
 >
 > The reverse also holds, and it is a limit rather than a bug: with a token, a
 > private repo whose access was removed may answer 404 just as a deleted one
