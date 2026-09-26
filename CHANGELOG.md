@@ -9,6 +9,42 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.32 — 2026-09-26
+
+v0.9.32 -- optional, rule-gated writes to the Hugging Face Hub
+
+Off by default. With XHC_HF_WRITES unset, Muninn stays read-only toward the Hub
+and every write is a local 405, as it has been since v0.9.18. One further hole
+is closed in that default: a request for `xet-write-token`, which obtains a CAS
+write credential for the cache's Hub account, is now a local 405 whatever
+XHC_BLOCK_CLIENT_XET is set to. Previously, with the block off, any holder of
+pull access could obtain one.
+
+With XHC_HF_WRITES=on:
+  - A write is forwarded with the cache's HF token only if the caller is
+    granted `push` on that repo, e.g. `models/myorg/* pull+push`. It is checked
+    at the same per-repo decision point as pulls, with key scopes narrowing it
+    the same way. A bare `*` never grants a Hub write; writes must be named.
+  - Destructive operations need an extra `delete` grant (`pull+push+delete`):
+    repo delete, repo move (from the source), branch and tag delete, history
+    squash, permanent LFS deletion, and any commit containing a deletedFile or
+    deletedFolder line. Commits are inspected as they stream, bounded by
+    XHC_HF_WRITE_MAX_BODY (413 above it), and exactly the inspected bytes are
+    forwarded.
+  - Every write, forwarded or refused, is logged with its key, principal,
+    repo, whether it deletes, and the result. muninn_hf_writes_total counts
+    them by result.
+  - After a successful write, the cached refs for that repo are dropped, so a
+    pull sees the new commit at once.
+  - Startup is refused with XHC_HF_AUTH=none or XHC_HF_RULES=off, because there
+    would be no grant to check.
+
+Every write appears on the Hub as the cache's own account. The cache token's
+scopes are the outer bound. LFS bytes go straight to the storage URL the Hub
+signs, so Muninn gates the batch call and the commit that names the file, not
+the byte upload itself.
+
+
 ## v0.9.31 — 2026-09-25
 
 v0.9.31 -- a push can no longer store a truncated blob under a full digest; abandoned uploads expire
