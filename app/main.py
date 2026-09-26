@@ -31,6 +31,7 @@ from . import (
     orphans,
     pushlimits,
     refs,
+    shutdown,
     statedir,
     tier,
     webauth,
@@ -195,22 +196,22 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (evictor, orphan_sweep, docker_gc, jwt_warm):
-            if task is None:
-                continue
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        # Every step is time-bounded and names itself if it overruns: a
+        # cancelled task is not guaranteed to finish (see app/shutdown.py), and
+        # a shutdown that waits on one forever is a hang with no culprit.
+        await shutdown.cancel_and_wait(
+            (evictor, orphan_sweep, docker_gc, jwt_warm), "the background loops"
+        )
         # Record the final state of anything still running. A graceful stop
         # leaves those jobs running in the ledger, so the next boot reports
         # them as interrupted -- which is what they are.
         manager.flush()
-        await tier.stop()
+        # tier.stop() bounds its own two waits; its outer bound is longer than
+        # both together, so it is only reached if stop() itself is at fault.
+        await shutdown.bounded(tier.stop(), "tier.stop()", timeout=3 * shutdown.STEP_TIMEOUT_S)
         # Every long-lived outbound client (Hub, registries, refs, orphans,
         # OIDC), on the loop that built it. See app/httpclients.py.
-        await httpclients.close_all()
+        await shutdown.bounded(httpclients.close_all(), "httpclients.close_all()")
 
 
 app = FastAPI(

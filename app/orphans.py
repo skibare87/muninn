@@ -22,7 +22,7 @@ import time
 
 import httpx
 
-from . import cachefs, httpclients
+from . import cachefs, httpclients, shutdown
 from .config import settings
 
 log = logging.getLogger("xhc.orphans")
@@ -145,6 +145,9 @@ async def orphan_loop() -> None:
     # Don't stampede the Hub API on boot, and let the first cache scan settle.
     await asyncio.sleep(min(120, settings.orphan_check_interval_s))
     while True:
+        # The sweep is Hub HTTP, where a cancel can be swallowed; see
+        # app/shutdown.py.
+        shutdown.reraise_if_cancelled()
         try:
             result = await check_all(force_rescan=True)
             log.info(
@@ -157,4 +160,6 @@ async def orphan_loop() -> None:
             raise
         except Exception:
             log.exception("orphan sweep failed; continuing")
+        # Before the sleep too, or a swallowed cancel costs a whole interval.
+        shutdown.reraise_if_cancelled()
         await asyncio.sleep(settings.orphan_check_interval_s)

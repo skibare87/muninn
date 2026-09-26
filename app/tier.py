@@ -52,7 +52,7 @@ from urllib.parse import quote, urlparse
 import filelock
 import httpx
 
-from . import cachefs, metrics, ocistore, s3client
+from . import cachefs, metrics, ocistore, s3client, shutdown
 from .config import settings
 
 log = logging.getLogger("xhc.tier")
@@ -896,6 +896,9 @@ async def drain() -> None:
 async def _worker() -> None:
     q = _ensure_queue()
     while True:
+        # A cancel swallowed inside an upload (see app/shutdown.py) would send
+        # this worker back to q.get(), where nothing will ever wake it.
+        shutdown.reraise_if_cancelled()
         item = await q.get()
         try:
             if _s.healthy_event is not None:
@@ -1145,14 +1148,19 @@ async def _loop() -> None:
     t = cfg()
     next_reconcile = 0.0
     while True:
+        shutdown.reraise_if_cancelled()
         if not _s.healthy:
             await probe()
             if not _s.healthy:
+                shutdown.reraise_if_cancelled()
                 await asyncio.sleep(REPROBE_S)
                 continue
         if t.write and t.reconcile_interval_s > 0 and time.time() >= next_reconcile:
             await reconcile()
             next_reconcile = time.time() + t.reconcile_interval_s
+        # Before sleeping as well as at the top: a cancel swallowed by the
+        # probe or the reconcile would otherwise cost a whole interval.
+        shutdown.reraise_if_cancelled()
         await asyncio.sleep(min(REPROBE_S, t.reconcile_interval_s or REPROBE_S))
 
 
@@ -1185,17 +1193,14 @@ async def start() -> None:
 
 
 async def stop() -> None:
-    for task in _s.tasks:
-        task.cancel()
-    for task in _s.tasks:
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+    # Bounded, so that a task which does not finish when cancelled cannot stop
+    # the rest of this function running: the discards below are what keep a
+    # later start() from inheriting this loop's state.
+    await shutdown.cancel_and_wait(_s.tasks, "the tier's upload workers and probe loop")
     _s.tasks.clear()
     if _s.http is not None:
-        await _s.http.aclose()
-        _s.http = None
+        http, _s.http = _s.http, None
+        await shutdown.bounded(http.aclose(), "closing the tier's HTTP client")
     # Everything below is bound to THIS event loop, and a second start() in the
     # same process runs on another. Before this, a restart kept an S3 client
     # wrapping the httpx client closed just above, and upload workers waiting
