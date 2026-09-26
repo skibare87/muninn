@@ -137,7 +137,7 @@
 
     <div id="admin" hidden>
       <h2>Users</h2>
-      <p class="muted">An allowlist is one rule per line: a pattern, then <code>pull</code>, <code>push</code> or <code>pull+push</code>. <code>*</code> matches anything including slashes, so <code>* pull+push</code> is unrestricted. Patterns match <code>upstream/repository</code> and never the tag. Hugging Face repositories are <code>models/org/name</code>, <code>datasets/org/name</code> or <code>spaces/org/name</code> (the same shape as <code>XHC_ALLOW_REPOS</code>), pull only, so <code>models/myorg/* pull</code> grants one organisation's models. Only a bare <code>*</code> grants on both surfaces.</p>
+      <p class="muted">An allowlist is one rule per line: a pattern, then <code>pull</code>, <code>push</code> or <code>pull+push</code>. <code>*</code> matches anything including slashes, so <code>* pull+push</code> is unrestricted. Patterns match <code>upstream/repository</code> and never the tag. Hugging Face repositories are <code>models/org/name</code>, <code>datasets/org/name</code> or <code>spaces/org/name</code> (the same shape as <code>XHC_ALLOW_REPOS</code>), so <code>models/myorg/* pull</code> grants one organisation's models. They take <code>push</code>, and <code>+delete</code> for destructive writes, only when the cache runs with <code>XHC_HF_WRITES=on</code>. Only a bare <code>*</code> grants on both surfaces, and it never grants a write to the Hub.</p>
       <div id="users"></div>
     </div>
 
@@ -206,9 +206,24 @@
     }));
   }
 
+  // Verbs are a set joined by '+': pull, push, delete, in any order. The
+  // round trip matters: a rule shown here is edited and saved back, so a verb
+  // this page failed to render would be silently dropped on the next save.
   function ruleLine(r) {
-    var verbs = (r.pull ? 'pull' : '') + (r.push ? (r.pull ? '+push' : 'push') : '');
+    var verbs = ['pull', 'push', 'delete'].filter(function (v) { return r[v]; }).join('+');
     return r.pattern + ' ' + (verbs || 'nothing');
+  }
+
+  // {pull, push, delete} from the verb text, or null for anything not
+  // understood -- refused, never defaulted. The server checks the combination.
+  function parseVerbs(verbs) {
+    if (verbs === '') return { pull: true, push: false, delete: false };
+    var parts = verbs.split('+'), seen = {};
+    for (var i = 0; i < parts.length; i++) {
+      if (!/^(pull|push|delete)$/.test(parts[i]) || seen[parts[i]]) return null;
+      seen[parts[i]] = true;
+    }
+    return { pull: !!seen.pull, push: !!seen.push, delete: !!seen.delete };
   }
 
   function renderKeys(data) {
@@ -279,13 +294,11 @@
           item = item.trim();
           if (!item) return;
           var parts = item.split(/\s+/);
-          var verbs = (parts[1] || '').toLowerCase();
-          if (parts.length > 2 || (verbs && !/^(pull|push|pull\+push|push\+pull)$/.test(verbs))) {
+          var v = parseVerbs((parts[1] || '').toLowerCase());
+          if (parts.length > 2 || v === null) {
             bad = item; return;
           }
-          rules.push({ pattern: parts[0],
-                       pull: verbs === '' || verbs.indexOf('pull') >= 0,
-                       push: verbs.indexOf('push') >= 0 });
+          rules.push({ pattern: parts[0], pull: v.pull, push: v.push, delete: v.delete });
         });
         if (bad !== null) { showError('Could not parse: ' + bad); return; }
         // "*" means no limit. Stored as no limit, because that is what it
@@ -345,20 +358,16 @@
         line = line.trim();
         if (!line) return;
         var parts = line.split(/\s+/);
-        var verbs = (parts[1] || '').toLowerCase();
+        var v = parseVerbs((parts[1] || '').toLowerCase());
         // Refuse a line whose verbs are not understood rather than defaulting.
         // A typo that quietly narrows a grant is a support ticket; one that
         // quietly WIDENS it is an incident.
-        if (parts.length > 2 || (verbs && !/^(pull|push|pull\+push|push\+pull)$/.test(verbs))) {
+        if (parts.length > 2 || v === null) {
           bad = line; return;
         }
-        rules.push({
-          pattern: parts[0],
-          pull: verbs === '' || verbs.indexOf('pull') >= 0,
-          push: verbs.indexOf('push') >= 0
-        });
+        rules.push({ pattern: parts[0], pull: v.pull, push: v.push, delete: v.delete });
       });
-      if (bad !== null) { showError('Could not parse: ' + bad + '   — use: <pattern> pull|push|pull+push'); return; }
+      if (bad !== null) { showError('Could not parse: ' + bad + '   — use: <pattern> pull|push|pull+push, adding +delete for Hugging Face deletes'); return; }
       api('PUT', '/_console/users/' + encodeURIComponent(user.subject) + '/allowlist',
           { rules: rules }).then(function () { clearError(); return loadUsers(); })
         .then(loadKeys).catch(showError);

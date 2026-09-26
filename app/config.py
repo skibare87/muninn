@@ -30,6 +30,12 @@ XET_ENV_KEYS = (
 )
 
 
+class HfWritesConfigError(ValueError):
+    """XHC_HF_WRITES=on combined with settings under which no write could ever be
+    authorised. A ValueError, like every other refused setting, so startup fails
+    the same way; its own type so the refusal is identifiable, not just its text."""
+
+
 def parse_size(value: str | None, default: int | None = None) -> int | None:
     """Parse '70T', '500GB', '1024' into bytes. Units are binary (1T = 2**40)."""
     if value is None or value.strip() == "":
@@ -344,6 +350,25 @@ class Settings:
     # switch, which is the failure a rule system exists to prevent. The refusal
     # is loud (a 403 naming the key and the repo), and `off` is one variable.
     hf_rules: str = "enforce"
+    # Writes toward the Hugging Face Hub (app/hfwrites.py). OFF BY DEFAULT, and
+    # off means exactly the read-only behaviour since v0.9.18: every write is a
+    # local 405.
+    #
+    #   off  nothing but GET, HEAD and the read-only paths-info POST goes upstream
+    #   on   a named set of repository writes is forwarded WITH THE CACHE'S HF
+    #        TOKEN, each only when the caller's rules grant `push` (and, for a
+    #        destructive one, `delete`) on the target repository
+    #
+    # `on` REQUIRES XHC_HF_AUTH=key AND XHC_HF_RULES=enforce, and refuses to start
+    # otherwise: without a credential there is nobody to hold a grant, and without
+    # rules there is no grant to check, so either combination could only mean
+    # "forward every write as the cache", which is what the 405 exists to stop.
+    hf_writes: str = "off"
+    # The largest write body Muninn will read, inspect and forward. A commit
+    # carries LFS POINTERS, not LFS bytes (those go through preupload and the LFS
+    # batch), but small files travel inline as base64, so a commit of many small
+    # files can be large. Over the bound is a 413 -- never forwarded uninspected.
+    hf_write_max_body: int = 64 * 1024 * 1024
     # Workload identity: signed JWTs from these OIDC issuers authenticate as a
     # principal in XHC_AUTHZ_DB, on /v2 and (with XHC_HF_AUTH=key) on the
     # Hugging Face surface. JSON; see app/jwtconfig.py for the shape and
@@ -734,6 +759,28 @@ class Settings:
         hf_rules = (os.environ.get("XHC_HF_RULES") or cls.hf_rules).strip().lower()
         if hf_rules not in ("enforce", "off"):
             raise ValueError(f"XHC_HF_RULES must be enforce|off, got {hf_rules!r}")
+        hf_writes = (os.environ.get("XHC_HF_WRITES") or cls.hf_writes).strip().lower()
+        if hf_writes not in ("off", "on"):
+            raise ValueError(f"XHC_HF_WRITES must be off|on, got {hf_writes!r}")
+        # Fails on the ARGUMENTS, and both are input that can never be valid:
+        # a write is forwarded only on a per-repo grant, and these two settings
+        # remove, respectively, the caller and the grant.
+        if hf_writes == "on" and hf_auth != "key":
+            raise HfWritesConfigError(
+                "XHC_HF_WRITES=on needs XHC_HF_AUTH=key: writes go to the Hub as this "
+                "cache's account, and an unauthenticated surface has no caller to "
+                "grant them to. Refusing to start rather than forwarding anyone's writes."
+            )
+        if hf_writes == "on" and hf_rules != "enforce":
+            raise HfWritesConfigError(
+                "XHC_HF_WRITES=on needs XHC_HF_RULES=enforce: a write is forwarded "
+                "only when a key's rules grant push on the repository, and with rules "
+                "off there is no grant to check."
+            )
+        hf_write_max_body = parse_size(os.environ.get("XHC_HF_WRITE_MAX_BODY"),
+                                       cls.hf_write_max_body)
+        if not hf_write_max_body or hf_write_max_body <= 0:
+            raise ValueError("XHC_HF_WRITE_MAX_BODY must be a positive size")
         # Fails on the ARGUMENTS: asking for key auth with no key store would
         # start a server whose HF surface refuses everyone, which is a worse
         # outcome than the one being guarded against.
@@ -785,6 +832,8 @@ class Settings:
             authz_db=os.environ.get("XHC_AUTHZ_DB") or None,
             hf_auth=hf_auth,
             hf_rules=hf_rules,
+            hf_writes=hf_writes,
+            hf_write_max_body=hf_write_max_body,
             jwt_issuers=jwt_issuers,
             jwt_cache_ttl_s=jwt_cache_ttl_s,
             docs_enabled=_env_bool("XHC_DOCS", cls.docs_enabled),

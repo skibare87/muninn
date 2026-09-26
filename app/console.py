@@ -40,6 +40,7 @@ class RuleIn(BaseModel):
     pattern: str = Field(..., max_length=512)
     pull: bool = True
     push: bool = False
+    delete: bool = False
 
 
 class AllowlistIn(BaseModel):
@@ -58,7 +59,8 @@ def _checked(rules: list[RuleIn]) -> list[authz.Rule]:
     the API and silently stored by the console.
     """
     try:
-        return [authz.check_rule(authz.Rule(r.pattern, r.pull, r.push)) for r in rules]
+        return [authz.check_rule(authz.Rule(r.pattern, r.pull, r.push, r.delete))
+                for r in rules]
     except authz.RuleSyntaxError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

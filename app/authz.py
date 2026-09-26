@@ -39,7 +39,10 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Literal
 
-Operation = Literal["pull", "push"]
+# `delete` exists only on the Hugging Face surface, and only with XHC_HF_WRITES=on:
+# it is what a destructive write (a deleted file, branch, tag or repository, a
+# history squash, an LFS purge) needs IN ADDITION to push. See check_rule.
+Operation = Literal["pull", "push", "delete"]
 # Which surface a reference belongs to. A rule is written in one flat pattern
 # space, but it grants on exactly one surface -- see "THE HUGGING FACE
 # NAMESPACE" below -- except a bare `*`, which grants on both.
@@ -58,11 +61,14 @@ class Rule:
     A rule with neither pull nor push is inert rather than an error: it is what a
     UI produces when someone unchecks both boxes, and refusing it would turn a
     harmless no-op into a failed save.
+
+    `delete` is a separate grant, never implied by push: see check_rule.
     """
 
     pattern: str
     pull: bool = True
     push: bool = False
+    delete: bool = False
 
     def grants(
         self, operation: Operation, reference: str, surface: Surface = "registry"
@@ -70,6 +76,16 @@ class Rule:
         if operation == "pull" and not self.pull:
             return False
         if operation == "push" and not self.push:
+            return False
+        if operation == "delete" and not self.delete:
+            return False
+        # A BARE `*` NEVER GRANTS A WRITE ON THE HUGGING FACE SURFACE. It still
+        # grants pull there. `* pull+push` was written, by everyone who has one,
+        # before writes toward the Hub existed, and meant registry push; turning
+        # on XHC_HF_WRITES must not silently give each of them the power to
+        # commit to the Hub as this cache. A Hub write has to be named:
+        # `models/<org>/* pull+push`.
+        if surface == "hf" and operation != "pull" and self.pattern.strip() == "*":
             return False
         # The surface decides which patterns may even be tried. Without this, a
         # registry whose default upstream were named `models` would produce
@@ -201,7 +217,8 @@ def decide(
 #     models/<org>/<name>     datasets/<org>/<name>     spaces/<org>/<name>
 #
 # (or `models/<name>` for a canonical id with no org, such as `gpt2`), verb
-# `pull`. One shape across the ingest allowlist and the per-key rules.
+# `pull` -- and, with XHC_HF_WRITES=on, `push` and `delete` (app/hfwrites.py).
+# One shape across the ingest allowlist and the per-key rules.
 #
 # WHY IT CANNOT BE CONFUSED WITH A REGISTRY REFERENCE. A registry reference
 # always begins with a HOST: a segment with a dot or a port, `localhost`, or the
@@ -256,22 +273,45 @@ def hf_reference(repo_type: str, repo_id: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# RULE TEXT. One rule per line: `<pattern> [pull|push|pull+push]`, verbs
-# defaulting to pull. A Hugging Face pattern takes `pull` only. This is the
-# syntax the console's allowlist and scope
+# RULE TEXT. One rule per line: `<pattern> [verbs]`, where verbs are `pull`,
+# `push` and `delete` joined by `+` in any order, defaulting to pull:
+#
+#     docker.io/library/*    pull
+#     ghcr.io/myorg/*        pull+push
+#     models/myorg/*         pull+push           (needs XHC_HF_WRITES=on)
+#     models/myorg/scratch-* pull+push+delete    (needs XHC_HF_WRITES=on)
+#
+# WHY `+delete` AND NOT A NEW SYNTAX. The grammar was already a set of verbs
+# joined by `+`; `pull+push` and `push+pull` were two spellings of one set. A
+# third member of the set is the smallest extension that keeps every existing
+# rule meaning what it meant, and it puts the destructive grant in the same
+# visible place as the others -- on the rule line, where a reviewer reads it --
+# rather than in a separate switch that changes what `push` means. Order is
+# free and a repeated verb is refused, so a set is exactly what it looks like.
+#
+# This is the syntax the console's allowlist and scope
 # fields accept, and until headless provisioning existed it was parsed ONLY in
 # the browser -- the server took structured JSON. The CLI and /_cache/authz
 # both need text, so the grammar lives here, once, and both call it.
 # ---------------------------------------------------------------------------
 
-_VERBS = {
-    "": (True, False),
-    "pull": (True, False),
-    "push": (False, True),
-    "pull+push": (True, True),
-    "push+pull": (True, True),
-}
+_VERB_NAMES = ("pull", "push", "delete")
 MAX_PATTERN_LEN = 512
+_USAGE = ("use '<pattern> pull|push|pull+push', adding '+delete' for destructive "
+          "writes to Hugging Face repositories")
+
+
+def _parse_verbs(text: str) -> tuple[bool, bool, bool] | None:
+    """(pull, push, delete) from `pull+push+delete` in any order, or None.
+
+    Empty is pull. An unknown or repeated verb is None, never a default.
+    """
+    if text == "":
+        return True, False, False
+    parts = text.split("+")
+    if any(p not in _VERB_NAMES for p in parts) or len(set(parts)) != len(parts):
+        return None
+    return "pull" in parts, "push" in parts, "delete" in parts
 
 
 class RuleSyntaxError(ValueError):
@@ -288,15 +328,26 @@ def parse_rule(line: str) -> Rule:
     parts = line.split()
     if not parts:
         raise RuleSyntaxError(f"empty rule {line!r}")
-    verbs = parts[1].lower() if len(parts) > 1 else ""
-    if len(parts) > 2 or verbs not in _VERBS:
-        raise RuleSyntaxError(
-            f"could not parse rule {line!r}: use '<pattern> pull|push|pull+push'"
-        )
+    verbs = _parse_verbs(parts[1].lower() if len(parts) > 1 else "")
+    if len(parts) > 2 or verbs is None:
+        raise RuleSyntaxError(f"could not parse rule {line!r}: {_USAGE}")
     if len(parts[0]) > MAX_PATTERN_LEN:
         raise RuleSyntaxError(f"rule pattern longer than {MAX_PATTERN_LEN} characters")
-    pull, push = _VERBS[verbs]
-    return check_rule(Rule(parts[0], pull=pull, push=push))
+    pull, push, delete = verbs
+    return check_rule(Rule(parts[0], pull=pull, push=push, delete=delete))
+
+
+def hf_writes_enabled() -> bool:
+    """XHC_HF_WRITES, read lazily for the same reason _is_registry_host is."""
+    from .config import settings
+
+    return settings.hf_writes == "on"
+
+
+def rule_verbs(rule: Rule) -> str:
+    """The canonical verb text for a rule, e.g. `pull+push+delete`."""
+    return "+".join(v for v, on in (("pull", rule.pull), ("push", rule.push),
+                                    ("delete", rule.delete)) if on)
 
 
 def check_rule(rule: Rule) -> Rule:
@@ -307,10 +358,14 @@ def check_rule(rule: Rule) -> Rule:
     have to refuse the same things. NO SILENT NEVER-MATCH: a rule that is
     stored but can never grant is believed by whoever typed it.
 
-      `*`                          valid, both surfaces
-      models|datasets|spaces/...   valid, pull only; `push` refused (Muninn never
-                                   pushes to the Hub); a bare type with no repo
-                                   part refused
+      `*`                          valid, both surfaces; never grants a WRITE
+                                   on Hugging Face (see Rule.grants)
+      models|datasets|spaces/...   valid; `push` only with XHC_HF_WRITES=on,
+                                   refused otherwise because it could never
+                                   take effect; a bare type with no repo part
+                                   refused
+      ... delete                   only on a Hugging Face pattern, only with
+                                   push, only with XHC_HF_WRITES=on
       hf/...                       refused, pointing at models/...
       first segment is a host      valid registry rule (dot, port, localhost,
                                    a Docker Hub alias, or the default upstream)
@@ -322,14 +377,30 @@ def check_rule(rule: Rule) -> Rule:
                                    never match either surface
     """
     pattern = rule.pattern.strip()
+    first = _first_segment(pattern)
+    if rule.delete:
+        # Checked before anything else, `*` included: a delete grant that can
+        # never be exercised is believed by whoever typed it.
+        if first not in HF_TYPES:
+            raise RuleSyntaxError(
+                f"rule {rule.pattern!r} grants delete, which applies only to Hugging "
+                "Face repositories: write it on 'models/...', 'datasets/...' or "
+                "'spaces/...'"
+            )
+        if not rule.push:
+            raise RuleSyntaxError(
+                f"rule {rule.pattern!r} grants delete without push. A destructive "
+                "write needs both: write it as '<pattern> pull+push+delete'"
+            )
     if pattern == "*":
         return rule
-    first = _first_segment(pattern)
     if first in HF_TYPES:
-        if rule.push:
+        if rule.push and not hf_writes_enabled():
             raise RuleSyntaxError(
-                f"rule {rule.pattern!r} grants push on the Hugging Face surface, which "
-                "is pull-only: write it as '<pattern> pull'"
+                f"rule {rule.pattern!r} grants {rule_verbs(rule)} on the Hugging Face "
+                "surface, which is pull-only while XHC_HF_WRITES=off: enable "
+                "XHC_HF_WRITES=on to forward writes to the Hub, or write it as "
+                "'<pattern> pull'"
             )
         rest = pattern.split("/", 1)[1] if "/" in pattern else ""
         if not rest:

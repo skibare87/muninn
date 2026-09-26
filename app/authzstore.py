@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS rules (
     key_id  TEXT NOT NULL REFERENCES keys(key_id) ON DELETE CASCADE,
     pattern TEXT NOT NULL,
     pull    INTEGER NOT NULL DEFAULT 1,
-    push    INTEGER NOT NULL DEFAULT 0
+    push    INTEGER NOT NULL DEFAULT 0,
+    can_delete INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS rules_by_key ON rules(key_id);
 CREATE TABLE IF NOT EXISTS principal_rules (
@@ -86,7 +87,8 @@ CREATE TABLE IF NOT EXISTS principal_rules (
     subject TEXT NOT NULL REFERENCES principals(subject) ON DELETE CASCADE,
     pattern TEXT NOT NULL,
     pull    INTEGER NOT NULL DEFAULT 1,
-    push    INTEGER NOT NULL DEFAULT 0
+    push    INTEGER NOT NULL DEFAULT 0,
+    can_delete INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS principal_rules_by_subject ON principal_rules(subject);
 """
@@ -111,6 +113,31 @@ CREATE INDEX IF NOT EXISTS principal_rules_by_subject ON principal_rules(subject
 # Narrowing also removes the escalation hazard the union carried: a key can no
 # longer inherit authority its own scope withheld, so letting a holder narrow
 # their OWN key is safe in a way widening never was.
+
+
+# THE `delete` GRANT, added after both tables existed. A database created by an
+# older version lacks the column, so it is ADDED on open (ALTER TABLE ... ADD
+# COLUMN, default 0) rather than required. Consequences, both deliberate:
+#
+#   * an old database opens unchanged and every existing rule grants exactly what
+#     it did, because 0 is "no delete";
+#   * an OLDER binary opening a migrated database still works -- it names its
+#     columns on insert and reads by name -- and any rule it rewrites loses its
+#     delete grant, which is the safe direction for a downgrade to fail in.
+#
+# Named `can_delete` rather than `delete`, which is an SQL keyword.
+_RULE_TABLES = ("rules", "principal_rules")
+
+
+def _migrate(c: sqlite3.Connection) -> None:
+    for table in _RULE_TABLES:
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+        if "can_delete" not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN can_delete INTEGER NOT NULL DEFAULT 0")
+
+
+def _rule(r: sqlite3.Row) -> Rule:
+    return Rule(r["pattern"], bool(r["pull"]), bool(r["push"]), bool(r["can_delete"]))
 
 
 def hash_secret(secret: str) -> str:
@@ -154,6 +181,7 @@ class AuthzStore:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as c:
             c.executescript(_SCHEMA)
+            _migrate(c)
 
     def _connect(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.path, timeout=10)
@@ -411,8 +439,9 @@ class AuthzStore:
                 (key_id, hash_secret(secret), principal, label, _now()),
             )
             c.executemany(
-                "INSERT INTO rules(key_id,pattern,pull,push) VALUES (?,?,?,?)",
-                [(key_id, r.pattern, int(r.pull), int(r.push)) for r in scope],
+                "INSERT INTO rules(key_id,pattern,pull,push,can_delete) VALUES (?,?,?,?,?)",
+                [(key_id, r.pattern, int(r.pull), int(r.push), int(r.delete))
+                 for r in scope],
             )
         self._invalidate()
 
@@ -424,8 +453,9 @@ class AuthzStore:
         with self._connect() as c:
             c.execute("DELETE FROM rules WHERE key_id=?", (key_id,))
             c.executemany(
-                "INSERT INTO rules(key_id,pattern,pull,push) VALUES (?,?,?,?)",
-                [(key_id, r.pattern, int(r.pull), int(r.push)) for r in rules],
+                "INSERT INTO rules(key_id,pattern,pull,push,can_delete) VALUES (?,?,?,?,?)",
+                [(key_id, r.pattern, int(r.pull), int(r.push), int(r.delete))
+                 for r in rules],
             )
         self._invalidate()
 
@@ -459,10 +489,10 @@ class AuthzStore:
     def get_principal_rules(self, subject: str) -> list[Rule]:
         with self._connect() as c:
             return [
-                Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
+                _rule(r)
                 for r in c.execute(
-                    "SELECT pattern, pull, push FROM principal_rules WHERE subject=?"
-                    " ORDER BY id", (subject,)
+                    "SELECT pattern, pull, push, can_delete FROM principal_rules"
+                    " WHERE subject=? ORDER BY id", (subject,)
                 )
             ]
 
@@ -482,12 +512,24 @@ class AuthzStore:
                 raise KeyError(f"no such principal: {subject}")
             c.execute("DELETE FROM principal_rules WHERE subject=?", (subject,))
             c.executemany(
-                "INSERT INTO principal_rules(subject, pattern, pull, push)"
-                " VALUES (?,?,?,?)",
-                [(subject, r.pattern, int(r.pull), int(r.push)) for r in rules],
+                "INSERT INTO principal_rules(subject, pattern, pull, push, can_delete)"
+                " VALUES (?,?,?,?,?)",
+                [(subject, r.pattern, int(r.pull), int(r.push), int(r.delete))
+                 for r in rules],
             )
             c.commit()
         self._invalidate()
+
+    def all_rules(self) -> list[tuple[str, str, Rule]]:
+        """Every stored rule as (table, owner, rule): 'principal' rules are
+        grants, 'key' rules are narrowings. For startup reporting, not for
+        authorisation -- that reads the cached snapshot."""
+        with self._connect() as c:
+            out = [("principal", r["subject"], _rule(r))
+                   for r in c.execute("SELECT * FROM principal_rules ORDER BY id")]
+            out += [("key", r["key_id"], _rule(r))
+                    for r in c.execute("SELECT * FROM rules ORDER BY id")]
+        return out
 
     # ---------------- the read path ----------------
 
@@ -510,14 +552,10 @@ class AuthzStore:
         with self._connect() as c:
             rules: dict[str, list[Rule]] = {}
             for r in c.execute("SELECT * FROM rules"):
-                rules.setdefault(r["key_id"], []).append(
-                    Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
-                )
+                rules.setdefault(r["key_id"], []).append(_rule(r))
             by_principal: dict[str, list[Rule]] = {}
             for r in c.execute("SELECT * FROM principal_rules"):
-                by_principal.setdefault(r["subject"], []).append(
-                    Rule(r["pattern"], bool(r["pull"]), bool(r["push"]))
-                )
+                by_principal.setdefault(r["subject"], []).append(_rule(r))
             # A key whose PRINCIPAL is disabled is itself unusable. Enforced in the
             # query rather than at the call site, so no caller can forget it.
             loaded = {

@@ -643,6 +643,9 @@ ENV_TO_SETTING = [
     # the gated case is exercised in test_hf_auth.py.
     ("XHC_HF_AUTH", "none", "hf_auth", "none"),
     ("XHC_HF_RULES", "off", "hf_rules", "off"),
+    # `on` needs XHC_HF_AUTH=key (and so XHC_AUTHZ_DB): in ENV_GROUPS below.
+    ("XHC_HF_WRITES", "off", "hf_writes", "off"),
+    ("XHC_HF_WRITE_MAX_BODY", "8M", "hf_write_max_body", 8 * 1024**2),
     ("XHC_DOCS", "0", "docs_enabled", False),
     # --- docker / OCI (0.5.0) ---
     ("XHC_DOCKER_ENABLED", "0", "docker_enabled", False),
@@ -727,6 +730,11 @@ ENV_GROUPS = [
         },
         {"jwt_issuers": (IssuerConfig(issuer="https://k8s.example", audiences=("muninn",),
                                       subject_template="k8s:{sub}"),)},
+    ),
+    (
+        # Hub writes: only with key auth and enforced rules (the default).
+        {"XHC_HF_WRITES": "on", "XHC_HF_AUTH": "key", "XHC_AUTHZ_DB": "/srv/authz.db"},
+        {"hf_writes": "on", "hf_auth": "key", "hf_rules": "enforce"},
     ),
     (
         {

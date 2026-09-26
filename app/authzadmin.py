@@ -57,7 +57,13 @@ class Invalid(ProvisionError):
 
 
 def rule_out(rule: authz.Rule) -> dict:
-    return {"pattern": rule.pattern, "pull": rule.pull, "push": rule.push}
+    """`delete` appears only when granted. It is additive: every rule that
+    existed before the grant did serialises exactly as it always has, so no
+    consumer comparing rule objects sees a change it did not ask for."""
+    out = {"pattern": rule.pattern, "pull": rule.pull, "push": rule.push}
+    if rule.delete:
+        out["delete"] = True
+    return out
 
 
 def key_out(key: authz.Key) -> dict:
