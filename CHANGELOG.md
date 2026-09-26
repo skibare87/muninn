@@ -9,6 +9,46 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.29 — 2026-09-25
+
+v0.9.29 -- a graceful stop records running jobs as interrupted; digest prewarms are protected; stale partials reclaimed
+
+GRACEFUL STOP. In the shipped image uvicorn runs as PID 1, where the kernel
+ignores default-action signals. On SIGTERM the process therefore lived on
+through asyncio teardown, which cancelled in-flight Hugging Face jobs and
+recorded them as `error: cancelled`. The next boot showed an error for work
+that was merely interrupted. As an ordinary process the default action killed
+it first, which is why this never showed outside a container.
+
+  - Shutdown now begins by marking every pending, running or verifying job
+    `interrupted`, waking its waiters and writing the ledger, all before
+    anything is cancelled. A cancel that is not a shutdown still records
+    `error: cancelled`.
+  - Streaming responses tied to an interrupted job end instead of polling a
+    file nobody writes. Waiters get 503 with Retry-After, not a 500.
+  - A second SIGTERM or Ctrl-C skips uvicorn's graceful shutdown, and in that
+    case a job may still be recorded as an error. The README says what a
+    crash, a graceful stop and a forced stop each leave behind.
+
+PROGRESS. The snapshot progress watcher looked in a folder that never exists,
+because its arguments were passed in the wrong order. Every running prewarm
+reported downloaded_bytes 0 until it finished. Fixed.
+
+DIGEST PREWARMS. An OCI prewarm by digest is now pinned by default, and the
+pin is written before the first fetch, so a GC sweep can collect it neither
+during nor after the pull. By-tag prewarms are unchanged, because the tag
+already protects them. `pin=false` opts out. The pin is an ordinary
+entry in /_cache/docker/pins, reported by the job as `pinned_as`. A job ending
+in error removes a pin it added itself. An unreadable pins file now fails the
+job; previously it was read as empty and overwritten, dropping every other pin.
+
+STALE PARTIALS. OCI .incomplete files left by a killed process are now
+reclaimed, at startup and on every GC. A file is removed only when no download
+in this process owns it, no process holds its lock (writers hold an flock for
+the file's life), and it has been idle for XHC_DOCKER_PARTIAL_MAX_AGE (default
+6 h). The GC result gains a `partials` summary.
+
+
 ## v0.9.28 — 2026-09-25
 
 v0.9.28 -- OCI prewarm jobs survive restarts, and "done" means the whole image is verified and present
