@@ -1071,6 +1071,26 @@ async def _hit_response(
     return serving.file_response(local.path, local.size, range_header, headers)
 
 
+def _raise_unless_done(job) -> None:
+    """After `await job.done.wait()`: answer for any outcome other than done.
+
+    `done` is set for three outcomes, not one. `error` is a failed ingest.
+    `interrupted` is a job the cache recorded as cut short because it is
+    shutting down (JobManager.interrupt_active): nothing is wrong with the
+    file, this process will just not finish it. Checking only for `error` let
+    that case fall through to "ingest reported success but file missing", a
+    500 describing something that did not happen.
+    """
+    if job.state == "error":
+        raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+    if job.state != "done":
+        raise HTTPException(
+            status_code=503,
+            detail=f"ingest {job.state}: this cache is shutting down; retry",
+            headers={"retry-after": "5"},
+        )
+
+
 async def serve_file(
     repo_type: str, repo_id: str, revision: str, filename: str, request: Request
 ) -> Response:
@@ -1238,8 +1258,7 @@ async def serve_file(
             settings.tier.read_mode == "verify-first" or settings.miss_policy == "wait"
         ):
             await job.done.wait()
-            if job.state == "error":
-                raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+            _raise_unless_done(job)
             local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
             if local is None:
                 raise HTTPException(
@@ -1254,8 +1273,7 @@ async def serve_file(
 
     if settings.miss_policy == "wait":
         await job.done.wait()
-        if job.state == "error":
-            raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+        _raise_unless_done(job)
         local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
         if local is None:
             raise HTTPException(status_code=500, detail="ingest reported success but file missing")
@@ -1298,8 +1316,7 @@ async def serve_file(
         # that waiting for the ingest and serving from the finished file is the
         # right trade: correct, and still one upstream fetch.
         await job.done.wait()
-        if job.state == "error":
-            raise HTTPException(status_code=502, detail=f"ingest failed: {job.error}")
+        _raise_unless_done(job)
         local = cachefs.resolve_local(repo_type, repo_id, revision, filename)
         if local is None:
             raise HTTPException(status_code=500, detail="ingest reported success but file missing")

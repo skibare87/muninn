@@ -228,11 +228,19 @@ async def tail_follow(
     incomplete: Path | None = None
 
     while pos <= last:
-        if job.state == "error":
-            log.error("ingest %s failed mid-stream: %s", job.id, job.error)
+        if job.state in ("error", "interrupted"):
             # The client already has a 2xx and some bytes; there is no in-band
             # way to signal failure. Truncating is the honest option -- the
             # length will not match and the client treats it as a failed transfer.
+            #
+            # `interrupted` too: the job was cut short by a shutdown and will
+            # never reach done, so without this the loop below would poll a
+            # file nobody is writing until the process died under it.
+            if job.state == "error":
+                log.error("ingest %s failed mid-stream: %s", job.id, job.error)
+            else:
+                log.warning("ingest %s interrupted mid-stream by shutdown; "
+                            "ending the response at byte %d", job.id, pos)
             return
 
         if incomplete is None and job.incomplete_path:
