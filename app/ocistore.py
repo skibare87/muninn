@@ -25,6 +25,7 @@ and the reason nothing here ever calls json.dumps() on a manifest.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -117,6 +118,46 @@ def verify(data: bytes, digest: str) -> None:
     got = compute_digest(data)
     if got != digest:
         raise DigestMismatch(f"expected {digest}, computed {got}")
+
+
+# -- partial blobs ----------------------------------------------------------
+#
+# A blob download writes `<digest>.incomplete` (or `.tier.incomplete`) and
+# renames it into place on a digest match. The writer holds an exclusive
+# advisory lock on that file for as long as it has it open, so the GC's
+# stale-partial sweep can tell a live download -- in this process or any other
+# sharing the directory -- from one whose process died: the kernel drops the
+# lock with the process. Advisory only; nothing else consults it.
+
+PARTIAL_SUFFIX = ".incomplete"
+
+
+def hold_partial(fh) -> bool:
+    """Take the writer's lock on an open partial file. Best-effort: a
+    filesystem without flock support returns False and the sweep falls back to
+    its age threshold."""
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        log.debug("could not lock partial %s: %s", getattr(fh, "name", fh), exc)
+        return False
+
+
+def partial_is_locked(path: Path) -> bool:
+    """True if some open file description holds the partial's lock."""
+    try:
+        with open(path, "r+b") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            except OSError:
+                return False
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
 
 
 # -- atomic writes ----------------------------------------------------------

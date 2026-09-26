@@ -23,6 +23,7 @@ pin protection inside an unattended loop.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -328,6 +329,116 @@ def sweep(marking: Marking, dry_run: bool = False) -> dict:
     return {"blobs": removed_blobs, "manifests": removed_manifests, "freed_bytes": freed}
 
 
+# ---------------------------------------------------------------------------
+# stale partial downloads
+# ---------------------------------------------------------------------------
+
+
+def _partial_digest(fn: str) -> str:
+    # `<hex>.incomplete` or `<hex>.tier.incomplete`
+    return "sha256:" + fn.split(".", 1)[0]
+
+
+def sweep_partials(max_age_s: float | None = None, dry_run: bool = False) -> dict:
+    """Remove `.incomplete` blobs that no download owns any more.
+
+    A download writes `<digest>.incomplete` (or `.tier.incomplete`) and renames
+    it into place on a digest match; a process killed mid-download leaves the
+    file behind, and mark-and-sweep never sees it because it is not a blob. A
+    partial is removed only when ALL THREE guards agree it is dead:
+
+    1. no download in THIS process owns it (ocicompat's single-flight table);
+    2. no process holds its lock -- every writer holds one for the life of the
+       file and the kernel drops it when the writer dies, which is what reaches
+       a second process sharing this directory;
+    3. it has not been written for `XHC_DOCKER_PARTIAL_MAX_AGE` -- the backstop
+       for a filesystem where the lock is not honoured (some network and FUSE
+       mounts), and so set far past any silence a live download can have.
+
+    Deleting a live partial would not corrupt anything -- its writer's rename
+    fails and the pull errors -- but it would fail a pull, so every guard is
+    conservative. Returns what it saw as well as what it did: `scanned` and the
+    three `kept_*` counts make a zero `removed` distinguishable from "found
+    nothing to look at".
+    """
+    from . import ocicompat  # ocicompat imports this module
+
+    age = settings.docker_partial_max_age_s if max_age_s is None else max_age_s
+    res = {"scanned": 0, "removed": 0, "freed_bytes": 0, "kept_owned": 0,
+           "kept_locked": 0, "kept_young": 0, "max_age_s": age}
+    r = ocistore.root()
+    if not r.is_dir():
+        return res
+    for up in sorted(p for p in r.iterdir() if p.is_dir() and not statedir.is_oci_state_entry(p)):
+        base = up / "blobs" / "sha256"
+        if not base.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(ocistore.PARTIAL_SUFFIX):
+                    continue
+                res["scanned"] += 1
+                _consider_partial(Path(dirpath) / fn, up.name, _partial_digest(fn),
+                                  age, dry_run, res, ocicompat.owns_partial)
+    if res["removed"]:
+        log.info("docker GC: %s %d stale partial download(s), %d bytes "
+                 "(kept %d owned, %d locked, %d younger than %.0fs)",
+                 "would remove" if dry_run else "removed", res["removed"],
+                 res["freed_bytes"], res["kept_owned"], res["kept_locked"],
+                 res["kept_young"], age)
+    return res
+
+
+def _consider_partial(path: Path, upstream: str, digest: str, age: float,
+                      dry_run: bool, res: dict, owns) -> None:
+    if owns(upstream, digest):
+        res["kept_owned"] += 1
+        return
+    try:
+        st = path.stat()
+    except OSError:
+        return  # renamed or removed since the walk saw it
+    if time.time() - st.st_mtime < age:
+        res["kept_young"] += 1
+        return
+    try:
+        with open(path, "r+b") as fh:
+            _remove_if_unlocked(fh, path, upstream, digest, age, dry_run, res, owns)
+    except OSError:
+        return  # could not open (gone, or not ours to write): leave it
+
+
+def _remove_if_unlocked(fh, path: Path, upstream: str, digest: str, age: float,
+                        dry_run: bool, res: dict, owns) -> None:
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        res["kept_locked"] += 1
+        return
+    except OSError:
+        pass  # locks unsupported here: the age guard is the guard
+    # Under the lock, confirm the path still names the file we locked and
+    # nothing has claimed it since the checks above.
+    now_st = path.stat()
+    fst = os.fstat(fh.fileno())
+    if (now_st.st_ino, now_st.st_dev) != (fst.st_ino, fst.st_dev):
+        return
+    if owns(upstream, digest):
+        res["kept_owned"] += 1
+        return
+    idle = time.time() - fst.st_mtime
+    if idle < age:
+        res["kept_young"] += 1
+        return
+    if not dry_run:
+        path.unlink()
+    res["removed"] += 1
+    res["freed_bytes"] += fst.st_size
+    log.info("docker GC: %s stale partial %s/%s (%d bytes, idle %.0fs, no owner)",
+             "would remove" if dry_run else "removed", upstream, path.name,
+             fst.st_size, idle)
+
+
 def collect(target_free_bytes: int = 0, dry_run: bool = False) -> dict:
     """Full GC. Sweep what is unreferenced; if still over the high-water mark,
     drop least-recently-used tags and sweep again.
@@ -353,6 +464,7 @@ def collect(target_free_bytes: int = 0, dry_run: bool = False) -> dict:
             "manifests": 0,
             "tags_dropped": 0,
             "reached_goal": False,
+            "partials": None,
         }
 
     protected_tags = set(pins)
@@ -361,6 +473,9 @@ def collect(target_free_bytes: int = 0, dry_run: bool = False) -> dict:
 
     result = sweep(mark(strict=True), dry_run=dry_run)
     result.update({"refused": False, "tags_dropped": 0, "protected_tags": len(protected_tags)})
+    # Reported separately rather than folded into freed_bytes: these were never
+    # blobs, and a reader of "blobs: 0, freed_bytes: N" would be misled.
+    result["partials"] = sweep_partials(dry_run=dry_run)
 
     cap = settings.docker_capacity_bytes
     if not cap:
@@ -411,6 +526,17 @@ async def gc_loop() -> None:
     visible rather than buried.
     """
     import asyncio
+
+    # Startup: a process killed mid-download left partials that nothing else
+    # will ever look at. The same guarded sweep GC runs every interval, run
+    # once now so a restart after a crash does not wait an interval for it.
+    if settings.docker_enabled:
+        try:
+            await asyncio.to_thread(sweep_partials)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("startup sweep of stale partial downloads failed")
 
     while True:
         try:

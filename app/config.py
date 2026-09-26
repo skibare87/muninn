@@ -555,6 +555,14 @@ class Settings:
     # this is near-certain to fail -- and failing costs more than not trying,
     # because it fails MID-STREAM after the client already has a 2xx.
     docker_min_free_bytes: int = 1 << 30
+    # A `.incomplete` blob left by a killed download is reclaimed by the docker
+    # GC only once nothing owns it (no in-process download, no process holding
+    # its lock) AND it has not been written for this long. The age is the
+    # backstop for filesystems that do not honour the lock, so it must exceed
+    # any silence a LIVE download can have: registry reads have no read
+    # timeout, so a stalled upstream can hold one open without a byte for a
+    # long time. Six hours is far past that and still reclaims within a day.
+    docker_partial_max_age_s: float = 6 * 3600.0
 
     # --- server --------------------------------------------------------------
     host: str = "0.0.0.0"
@@ -823,6 +831,8 @@ class Settings:
             docker_max_blob_bytes=parse_size(os.environ.get("XHC_DOCKER_MAX_BLOB_BYTES"), None),
             docker_min_free_bytes=parse_size(os.environ.get("XHC_DOCKER_MIN_FREE"),
                                              cls.docker_min_free_bytes),
+            docker_partial_max_age_s=_env_float("XHC_DOCKER_PARTIAL_MAX_AGE",
+                                                cls.docker_partial_max_age_s),
             host=os.environ.get("XHC_HOST", "0.0.0.0"),
             port=_env_int("XHC_PORT", 8080),
             manage_token=os.environ.get("XHC_MANAGE_TOKEN") or None,

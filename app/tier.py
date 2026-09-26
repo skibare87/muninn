@@ -335,6 +335,8 @@ async def hash_into(resp: httpx.Response, tmp: Path, flush: bool) -> tuple[str, 
     tmp.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(tmp, "wb") as fh:
+            # The OCI stale-partial sweep's ownership signal (ocistore.hold_partial).
+            ocistore.hold_partial(fh)
             async for chunk in resp.aiter_bytes(CHUNK):
                 fh.write(chunk)
                 h.update(chunk)

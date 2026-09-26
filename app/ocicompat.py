@@ -293,6 +293,9 @@ async def _write_blob(job: BlobJob, resp: httpx.Response) -> None:
     try:
         tmp.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "wb") as fh:
+            # Held until close: the GC's stale-partial sweep reads it as "a live
+            # download owns this", from any process sharing the directory.
+            ocistore.hold_partial(fh)
             async for chunk in resp.aiter_bytes(serving.CHUNK):
                 fh.write(chunk)
                 h.update(chunk)
@@ -335,6 +338,17 @@ async def _write_blob(job: BlobJob, resp: httpx.Response) -> None:
         async with _inflight_lock:
             if _inflight.get((job.upstream, job.digest)) is job:
                 _inflight.pop((job.upstream, job.digest), None)
+
+
+def owns_partial(upstream: str, digest: str) -> bool:
+    """Whether a download in THIS process owns `digest`'s partial file.
+
+    The single-flight table holds a job from before its partial is opened until
+    after it is renamed or removed, so a partial with no entry here belongs to
+    no download of ours. Read from the GC's worker thread; a dict membership
+    test needs no lock.
+    """
+    return (upstream, digest) in _inflight
 
 
 async def _finish(job: BlobJob) -> None:
