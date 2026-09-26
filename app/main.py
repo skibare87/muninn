@@ -58,6 +58,11 @@ async def lifespan(app: FastAPI):
     # raises for an unreadable ledger: job history is not protection (see
     # JobManager.load_ledger for why this is the opposite of pins).
     manager.load_ledger()
+    if settings.docker_enabled:
+        # The OCI prewarm table, on the same machinery and the same terms: a
+        # prewarm that was running comes back `interrupted`, and an unreadable
+        # ledger is set aside rather than stopping the boot.
+        ocimanage.manager.load_ledger()
     warning = memcheck.check(settings.ingest_concurrency, settings.snapshot_max_workers)
     if warning:
         log.warning(warning)
@@ -202,6 +207,15 @@ async def lifespan(app: FastAPI):
         await shutdown.cancel_and_wait(
             (evictor, orphan_sweep, docker_gc, jwt_warm), "the background loops"
         )
+        # OCI prewarms are cancelled (each loop re-raises a cancel that httpx
+        # swallowed) and recorded as `interrupted` with their progress. The step
+        # is bounded; one that overruns is abandoned, still recorded as running,
+        # and reported interrupted by the next boot.
+        if settings.docker_enabled:
+            await shutdown.bounded(
+                ocimanage.manager.stop(), "OCI prewarm shutdown",
+                timeout=2 * shutdown.STEP_TIMEOUT_S,
+            )
         # Record the final state of anything still running. A graceful stop
         # leaves those jobs running in the ledger, so the next boot reports
         # them as interrupted -- which is what they are.

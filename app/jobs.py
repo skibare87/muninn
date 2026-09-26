@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import re
@@ -28,7 +27,7 @@ from typing import Literal
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import filter_repo_objects
 
-from . import build, cachefs, manifests, metrics, statedir, tier
+from . import cachefs, ledger, manifests, metrics, statedir, tier
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
@@ -148,39 +147,28 @@ def verify_ingested(path: Path) -> str:
 # outcome is unknown -- some files may have landed -- and it is not resumed
 # automatically. See JobManager.load_ledger.
 JobState = Literal["pending", "running", "verifying", "done", "error", "interrupted"]
-ACTIVE_STATES = ("pending", "running", "verifying")
+ACTIVE_STATES = ledger.ACTIVE_STATES
 _SNAPSHOT_SAMPLE_S = 5.0
 
 # ---------------------------------------------------------------------------
-# The job ledger: jobs.json in the HF state dir.
+# The job ledger: jobs.json in the HF state dir. The machinery -- restart as
+# `interrupted`, the bound, the write throttle, fail-open on a corrupt file --
+# is app/ledger.py, shared with the OCI prewarm table. What is HF-specific is
+# the bound per kind:
 #
-# BOUND. Finished and interrupted jobs are kept up to a COUNT per kind and for
-# at most _RETENTION_S, whichever drops them first. The kinds are bounded
-# separately because they arrive at wildly different rates: every client cache
-# miss is a file job, while a snapshot job is a deliberate prewarm somebody is
-# probably polling. A single count let a client walking a 400-file repo push
-# every prewarm out of history, which is "no such job" again by another route.
-# Active jobs are never dropped. At the defaults the file stays in the low
+# The kinds are bounded separately because they arrive at wildly different
+# rates: every client cache miss is a file job, while a snapshot job is a
+# deliberate prewarm somebody is probably polling. A single count let a client
+# walking a 400-file repo push every prewarm out of history, which is "no such
+# job" again by another route. At the defaults the file stays in the low
 # hundreds of KB.
-#
-# WRITE THROTTLE. A state change (submitted, started, finished, failed) is
-# written at once unless another write happened in the last
-# _TRANSITION_COALESCE_S, in which case it is written at the end of that window
-# -- so a burst of cache misses costs at most a few writes a second, and a crash
-# loses at most that window. The one exception is a PREWARM finishing or
-# failing, which is always written immediately (see _persist). Progress alone (bytes growing on a running job) is
-# written at most every _PROGRESS_WRITE_S. Writes are temp file + os.replace,
-# so a kill mid-write leaves the previous ledger, never half of one. There is
-# no fsync: the failure this exists for is the PROCESS dying, which the page
-# cache survives; a power cut may lose the last few seconds of history.
 # ---------------------------------------------------------------------------
 LEDGER_FILE = "jobs.json"
-_LEDGER_VERSION = 1
 _HISTORY_LIMIT = 200  # finished FILE jobs kept
 _SNAPSHOT_HISTORY_LIMIT = 50  # finished SNAPSHOT (prewarm) jobs kept
-_RETENTION_S = 7 * 86400.0
-_TRANSITION_COALESCE_S = 0.5
-_PROGRESS_WRITE_S = 30.0
+_RETENTION_S = ledger.RETENTION_S
+_TRANSITION_COALESCE_S = ledger.TRANSITION_COALESCE_S
+_PROGRESS_WRITE_S = ledger.PROGRESS_WRITE_S
 
 
 @dataclass
@@ -335,232 +323,39 @@ class Job:
         return job
 
 
-class JobManager:
+class JobManager(ledger.LedgeredJobs):
+    """HF ingest jobs. The durable, bounded table is ledger.LedgeredJobs."""
+
+    LEDGER_FILE = LEDGER_FILE
+    LEDGER_LABEL = "job ledger"
+    log = log
+
     def __init__(self) -> None:
-        self._active: dict[str, Job] = {}
-        self._by_id: dict[str, Job] = {}
-        self._history: list[Job] = []
+        super().__init__()
         self._lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(settings.ingest_concurrency)
-        # asyncio only holds a weak reference to running tasks, so a
-        # fire-and-forget create_task() can be garbage-collected mid-flight --
-        # which here would silently abort an in-progress ingest that clients are
-        # streaming from. Hold strong refs until each task completes.
-        self._tasks: set[asyncio.Task] = set()
-        # Ledger bookkeeping. _ledger_ok goes False only when an unreadable
-        # ledger could not be moved aside: writing would then overwrite the
-        # only copy of it, so this process keeps its jobs in memory only.
-        self._ledger_ok = True
-        self._ledger_error: str | None = None
-        self._last_write = 0.0
-        self._flush_handle: asyncio.TimerHandle | None = None
-        self._progress_task: asyncio.Task | None = None
 
-    # -- ledger ------------------------------------------------------------
+    # -- ledger hooks --------------------------------------------------------
+    #
+    # NOT in statedir.HF_FILES, on purpose. hf_file() still copies an in-tree
+    # ledger across the first time it is resolved, so history survives an
+    # operator turning XHC_STATE_DIR on -- but a copy that FAILS raises
+    # StateDirError, which for pins rightly stops the boot. For a ledger it must
+    # not, so LedgeredJobs.load_ledger catches it.
 
     def _ledger_path(self) -> Path:
         return statedir.hf_file(LEDGER_FILE)
 
-    def load_ledger(self) -> None:
-        """Startup: restore job history from the ledger.
+    def _job_from_record(self, rec: dict) -> Job:
+        return Job.from_record(rec)
 
-        A job recorded as pending or running belonged to a process that is
-        gone. It becomes `interrupted`, stamped with this process's start time,
-        and keeps its last recorded progress. It is NOT resumed -- a prewarm
-        that OOM-killed the pod must not restart itself on every boot -- and it
-        is NOT dropped, because a poller holding its id needs an answer.
-        Re-submitting the same prewarm is the resume.
+    def _kind_limits(self) -> dict[str, int]:
+        # Read at call time, so the module constants stay the one knob.
+        return {"file": _HISTORY_LIMIT, "snapshot": _SNAPSHOT_HISTORY_LIMIT}
 
-        AN UNREADABLE LEDGER NEVER STOPS THE SERVICE. This is the deliberate
-        opposite of pins.json, which fails closed: an unreadable pins file means
-        we cannot tell what is protected, and guessing "nothing" would let
-        eviction delete the only copy of something. Losing job history protects
-        nothing and deletes nothing -- the worst outcome is the "no such job"
-        this ledger exists to reduce. Refusing to boot, or refusing cache hits,
-        over it would turn a bookkeeping loss into an outage. So: log loudly,
-        move the bad file aside as jobs.json.corrupt.<epoch> for a human to
-        read, and start a fresh ledger.
-        """
-        try:
-            # NOT in statedir.HF_FILES, on purpose. hf_file() still copies an
-            # in-tree ledger across the first time it is resolved, so history
-            # survives an operator turning XHC_STATE_DIR on -- but a copy that
-            # FAILS raises StateDirError, which for pins rightly stops the
-            # boot. For a ledger it must not, so it is caught here and the
-            # eager startup migration (which would be fatal) never sees it.
-            p = self._ledger_path()
-            exists = p.exists()
-        except (OSError, statedir.StateDirError) as exc:
-            self._ledger_ok = False
-            self._ledger_error = f"ledger location unusable: {exc}"
-            log.error("JOB LEDGER UNAVAILABLE (%s); job history is in memory only", exc)
-            return
-        if not exists:
-            return
-        try:
-            data = json.loads(p.read_text())
-            if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-                raise ValueError("ledger is not an object with a jobs list")
-            restored = [Job.from_record(r) for r in data["jobs"]]
-        except (OSError, ValueError, TypeError) as exc:
-            # UnicodeDecodeError is a ValueError, so binary garbage lands here.
-            self._quarantine(p, exc)
-            return
+    def _retention_s(self) -> float:
+        return _RETENTION_S
 
-        interrupted = 0
-        fresh = []
-        for job in restored:
-            if job.id in self._by_id:
-                continue  # already known to this process; memory wins
-            if job.state in ACTIVE_STATES:
-                job.state = "interrupted"
-                job.interrupted_at = build.PROCESS_STARTED_AT
-                interrupted += 1
-            self._by_id[job.id] = job
-            fresh.append(job)
-        self._history = sorted(self._history + fresh, key=_finished_key)
-        self._prune(time.time())
-        if interrupted:
-            log.warning(
-                "job ledger: %d job(s) were still active when the previous "
-                "process stopped; marked interrupted. Re-submit to resume.",
-                interrupted,
-            )
-        log.info("job ledger: restored %d job(s) from %s", len(self._history), p)
-        # Persist the interrupted marks now, so the ledger on disk agrees with
-        # what the API reports from the first request on.
-        self._write_ledger()
-
-    def _quarantine(self, p: Path, exc: Exception) -> None:
-        kept = p.with_name(f"{p.name}.corrupt.{int(time.time())}")
-        try:
-            os.replace(p, kept)
-        except OSError as move_exc:
-            self._ledger_ok = False
-            self._ledger_error = f"unreadable and could not be moved aside: {move_exc}"
-            log.error(
-                "JOB LEDGER %s IS UNREADABLE (%s) AND COULD NOT BE MOVED ASIDE (%s). "
-                "Serving continues; job history for this process is in memory "
-                "only, and the file is left untouched so nothing overwrites it.",
-                p, exc, move_exc,
-            )
-            return
-        self._ledger_error = f"previous ledger unreadable, preserved as {kept.name}"
-        log.error(
-            "JOB LEDGER %s IS UNREADABLE (%s). Preserved as %s and starting a "
-            "fresh ledger. Serving is unaffected; earlier job ids will answer "
-            "'no such job'.",
-            p, exc, kept,
-        )
-
-    def ledger_status(self) -> dict:
-        return {
-            "file": LEDGER_FILE,
-            "persisting": self._ledger_ok,
-            "last_write": self._last_write or None,
-            "error": self._ledger_error,
-        }
-
-    def _prune(self, now: float) -> None:
-        """Apply the bound to finished history. Active jobs are untouched."""
-        cutoff = now - _RETENTION_S
-        limits = {"file": _HISTORY_LIMIT, "snapshot": _SNAPSHOT_HISTORY_LIMIT}
-        counts = {"file": 0, "snapshot": 0}
-        keep: list[Job] = []
-        for job in reversed(self._history):  # newest first
-            if _finished_key(job) >= cutoff and counts[job.kind] < limits[job.kind]:
-                counts[job.kind] += 1
-                keep.append(job)
-            elif self._by_id.get(job.id) is job:
-                del self._by_id[job.id]
-        keep.reverse()
-        self._history = keep
-
-    def _write_ledger(self) -> None:
-        if not self._ledger_ok:
-            return
-        now = time.time()
-        self._last_write = now
-        jobs = list(self._active.values()) + self._history
-        body = {
-            "version": _LEDGER_VERSION,
-            "written_at": now,
-            "process_started_at": build.PROCESS_STARTED_AT,
-            "jobs": [j.to_record(now) for j in jobs],
-        }
-        for j in jobs:
-            if not j.restored:
-                j.updated_at = now
-        try:
-            p = self._ledger_path()
-            tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(json.dumps(body))
-            os.replace(tmp, p)
-        except (OSError, statedir.StateDirError) as exc:
-            # A full or read-only state volume must not fail an ingest. Said
-            # once per distinct error rather than once per job.
-            msg = f"could not write job ledger: {exc}"
-            if msg != self._ledger_error:
-                log.error("%s (jobs continue; history may not survive a restart)", msg)
-            self._ledger_error = msg
-
-    def _persist(self, transition: bool, urgent: bool = False) -> None:
-        """Write the ledger, throttled. See the constants at the top.
-
-        `urgent` skips the coalescing window: used for a PREWARM's outcome.
-        Losing a "running" mark to a crash only turns pending into interrupted;
-        losing a finished prewarm's outcome would report finished work as
-        interrupted and send someone to redo it. File jobs are not urgent --
-        they arrive in bursts, and the client streaming one already has its
-        answer.
-        """
-        if urgent:
-            self.flush()
-            return
-        if self._flush_handle is not None:
-            return  # a write is already scheduled and will include this change
-        window = _TRANSITION_COALESCE_S if transition else _PROGRESS_WRITE_S
-        wait = window - (time.time() - self._last_write)
-        if wait <= 0:
-            self._write_ledger()
-            return
-        if not transition:
-            return  # progress only: a later tick past the window writes it
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._write_ledger()
-            return
-        self._flush_handle = loop.call_later(wait, self._scheduled_write)
-
-    def _scheduled_write(self) -> None:
-        self._flush_handle = None
-        self._write_ledger()
-
-    def flush(self) -> None:
-        """Write now, cancelling any pending coalesced write. Used at shutdown."""
-        if self._flush_handle is not None:
-            self._flush_handle.cancel()
-            self._flush_handle = None
-        self._write_ledger()
-
-    async def _progress_loop(self) -> None:
-        """While anything is active, offer the ledger a progress write. The
-        throttle in _persist decides whether one happens."""
-        try:
-            while self._active:
-                await asyncio.sleep(_PROGRESS_WRITE_S / 3)
-                self._persist(transition=False)
-        finally:
-            self._progress_task = None
-
-    # -- lookup ------------------------------------------------------------
-
-    def get(self, job_id: str) -> Job | None:
-        return self._by_id.get(job_id)
-
-    def list(self) -> list[Job]:
-        return list(self._active.values()) + list(reversed(self._history))
 
     # -- submission --------------------------------------------------------
 
@@ -614,14 +409,9 @@ class JobManager:
                 return existing
             self._active[job.key] = job
             self._by_id[job.id] = job
-        task = asyncio.create_task(self._run(job))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._track(asyncio.create_task(self._run(job)))
         self._persist(transition=True)
-        if self._progress_task is None:
-            self._progress_task = asyncio.create_task(self._progress_loop())
-            self._tasks.add(self._progress_task)
-            self._progress_task.add_done_callback(self._tasks.discard)
+        self._ensure_progress_loop()
         return job
 
     # -- execution ---------------------------------------------------------
@@ -901,9 +691,7 @@ def _lfs_sha256(lfs) -> str | None:
     return sha if isinstance(sha, str) and _SHA256_RE.match(sha) else None
 
 
-def _finished_key(job: Job) -> float:
-    """When a job stopped being active, for ordering and retention."""
-    return job.finished_at or job.interrupted_at or job.updated_at or job.created_at
+_finished_key = ledger.finished_key  # kept for callers of the old name
 
 
 @dataclass

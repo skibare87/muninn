@@ -858,7 +858,8 @@ bearer token.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/_cache/docker/prewarm` | pull an image and its closure ahead of a rollout; returns a job |
-| `GET` | `/_cache/docker/prewarm/{id}` | poll it |
+| `GET` | `/_cache/docker/prewarm/{id}` | poll it; survives a restart as `interrupted` |
+| `GET` | `/_cache/docker/prewarm` | every prewarm job the ledger holds, running first, and the ledger's health |
 | `GET` | `/_cache/docker/images` | cached tags, with pin and orphan state |
 | `GET`/`POST`/`DELETE` | `/_cache/docker/pins` | pin an image and its blob closure |
 | `DELETE` | `/_cache/docker/images` | drop a tag; frees every layer no other tag references. `?sweep=1` reclaims now and reports the bytes, otherwise the next sweep does it |
@@ -869,6 +870,40 @@ bearer token.
 Prewarm is fire-and-forget, so nobody holds an HTTP connection open across a 30 GB pull.
 **Pass a digest rather than a tag** for anything you intend to reproduce — a tag can move
 mid-pull and assemble a tree from two commits.
+
+**Prewarm jobs move through the same states as the Hugging Face jobs**
+(`pending → running → verifying → done`, or `error`), and **`done` means verified**:
+
+- every blob fetched was hashed as it landed and renamed into place only on a match;
+- every manifest was checked against its digest before it was stored — and when the
+  prewarm asked for it **by digest**, against *that* digest, not just the one the
+  upstream's response header named;
+- `verifying` then confirms the whole closure (every manifest and blob) is on disk at
+  its content address. That step catches a real case: an image prewarmed by digest and
+  not pinned is referenced by no tag, so a garbage-collection sweep during a long pull
+  can take the early layers. That job ends in `error`, not `done`. Pin it (`"pin": true`)
+  or prewarm by tag.
+
+Blobs already on disk are **not re-hashed** — they only ever arrive by a verified
+rename — and the job says how many there were (`blobs_present`, a subset of
+`blobs_done`). `bytes_done` counts only the bytes fetched by this job.
+
+**Prewarm jobs survive a restart,** on the same terms as the Hugging Face job ledger
+(see *Jobs, restarts, and whether a snapshot is complete*): they are kept in
+`prewarm.json` in the OCI state directory (`<XHC_DOCKER_DIR>/.xhc/`, or
+`$XHC_STATE_DIR/oci/`); a prewarm that was running when the process stopped is reported
+as **`interrupted`** with its last recorded counts; at most the newest **50** finished
+or interrupted prewarms are kept, for at most **7 days**; the write rate and the atomic
+write are the same; and an unreadable file is moved aside as
+`prewarm.json.corrupt.<epoch>` and never stops the cache. A graceful stop cancels
+running prewarms and records them as `interrupted` straight away.
+
+**Resuming is re-submitting.** `POST` the same image again: blobs already cached are
+skipped with no upstream request, so only what the interrupted run had not finished is
+fetched, and the new job's `resumes` names the one it carries on from. Manifests are
+fetched again, which is a few small requests. Re-submitting while the same prewarm is
+still running returns that job instead of starting a second one (a request with a
+different `pin` value is a different prewarm).
 
 ### Docker configuration
 
@@ -2248,7 +2283,8 @@ bytes landed **and** passed verification, and it always comes with
 `finished_at`. `/_cache/status` counts `pending`, `running` and `verifying` as
 active.
 
-**Jobs survive a restart.** Job records are kept in a small ledger,
+**Jobs survive a restart.** (OCI image prewarms do too, in their own ledger and on
+the same terms: see *Docker management endpoints*.) Job records are kept in a small ledger,
 `jobs.json` in the HF state directory (`<HF_HUB_CACHE>/.xhc/`, or
 `$XHC_STATE_DIR/hf/`). When the process starts, any job the ledger last saw as
 `pending`, `running` or `verifying` is reported as **`interrupted`**, with
@@ -2549,7 +2585,8 @@ If this service ever gets in your way you can mount the volume read-only
 elsewhere and point `HF_HUB_CACHE` straight at it. Our own state lives in
 `.xhc/`: `pins.json`, `orphans.json` and `policy.json`, plus a regenerable
 viewer response cache under `.xhc/viewer/`. The docker store keeps its own
-`pins.json` and `orphans.json` in `<XHC_DOCKER_DIR>/.xhc/`.
+`pins.json`, `orphans.json` and prewarm job ledger `prewarm.json` in
+`<XHC_DOCKER_DIR>/.xhc/`.
 
 ### Separating state from blobs
 
@@ -2568,15 +2605,16 @@ volumes:
 | unset (default) | `XHC_STATE_DIR` set |
 |---|---|
 | `<HF_HUB_CACHE>/.xhc/{pins,orphans,policy,jobs}.json` | `$XHC_STATE_DIR/hf/` |
-| `<XHC_DOCKER_DIR>/.xhc/{pins,orphans}.json` | `$XHC_STATE_DIR/oci/` |
+| `<XHC_DOCKER_DIR>/.xhc/{pins,orphans,prewarm}.json` | `$XHC_STATE_DIR/oci/` |
 | `<XHC_DOCKER_DIR>/_pending/` (store-forward pushes owed upstream) | `$XHC_STATE_DIR/oci/pending/`, with the bytes they need |
 
 The two protocols get separate subdirectories, so their pin files never
 collide. The viewer response cache stays with the blobs, because it is
 regenerable and can be large. So do the prewarm listings used for
 `complete` (`.xhc/manifests/`): they describe the blobs and are useless without
-them. The job ledger `jobs.json` sits with the state so job history survives a
-lost cache disk, but it is not protection. It is copied across the first time
+them. The job ledgers (`jobs.json`, and `prewarm.json` for OCI prewarms) sit with
+the state so job history survives a lost cache disk, but they are not protection.
+Each is copied across the first time
 it is read rather than at startup, and a failure to copy it is logged, not
 fatal.
 

@@ -44,9 +44,10 @@ being copied (a stale second copy of an obligation would re-send a manifest),
 and they carry the blob bytes they need, because an obligation to forward bytes
 that went with the disk is still a lost push.
 
-The ingest job ledger (`jobs.json`) does live here, because its whole purpose
-is to outlive the process -- but it is history, not protection, and an
-unreadable one never stops the service (see JobManager.load_ledger).
+The job ledgers -- `jobs.json` for HF ingest, `prewarm.json` for OCI prewarms
+-- do live here, because their whole purpose is to outlive the process -- but
+they are history, not protection, and an unreadable one never stops the service
+(see ledger.LedgeredJobs.load_ledger).
 """
 
 from __future__ import annotations
@@ -70,7 +71,8 @@ TREE_DIR_NAME = ".xhc"
 # jobs.json (the ingest job ledger) also lives in the HF state dir but is
 # deliberately NOT listed: a failed eager migration here stops the boot, which
 # is right for protection and wrong for job history. hf_file() still carries it
-# across lazily, and the ledger's loader treats a failure as non-fatal.
+# across lazily, and the ledger's loader treats a failure as non-fatal. The same
+# holds for prewarm.json (the OCI prewarm ledger) and OCI_FILES.
 HF_FILES = ("pins.json", "orphans.json", "policy.json")
 OCI_FILES = ("pins.json", "orphans.json")
 
