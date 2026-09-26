@@ -14,10 +14,8 @@ upstream fetch happens.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,7 +25,17 @@ from typing import Literal
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import filter_repo_objects
 
-from . import cachefs, ledger, manifests, metrics, shutdown, statedir, tier
+from . import (
+    cachefs,
+    contenthash,
+    ledger,
+    manifests,
+    metrics,
+    shutdown,
+    statedir,
+    tier,
+    tierrestore,
+)
 from .config import settings
 
 log = logging.getLogger("xhc.jobs")
@@ -43,12 +51,10 @@ except ImportError:  # pragma: no cover - private name, keep a sane default
 # everything else. huggingface_hub uses exactly this test to decide whether an
 # ETag is a content hash (file_download.REGEX_SHA256) and does the same
 # comparison itself -- but only in local_dir mode, which this cache does not
-# use. So this is not a guarantee invented here; it is one the library already
-# implements on a path we do not take.
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-# A non-LFS file's ETag is its git blob id: sha1(b"blob <size>\0" + content).
-# Measured against the Hub on real repos before relying on it.
-_GIT_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+# use. The rule itself lives in app/contenthash.py, shared with the object-store
+# tier so the two cannot drift.
+_SHA256_RE = contenthash.SHA256_RE
+_GIT_SHA1_RE = contenthash.GIT_SHA1_RE
 
 
 class IngestDigestMismatch(Exception):
@@ -84,18 +90,18 @@ def verify_ingested(path: Path) -> str:
     """
     blob = path.resolve()
     etag = blob.name
-    if _SHA256_RE.match(etag):
-        h = hashlib.sha256()
-    elif _GIT_SHA1_RE.match(etag):
-        # A small (non-LFS) file: the ETag is the git blob id, which covers the
-        # content through a header naming its length. Same single pass.
+    kind = contenthash.etag_kind(etag)
+    if kind is not None:
+        # A small (non-LFS) file's ETag is its git blob id, which covers the
+        # content through a header naming its length. The rule, and the size it
+        # needs, is contenthash's: the tier checks with the same one. Same
+        # single pass either way.
         try:
-            size = blob.stat().st_size
+            size = blob.stat().st_size if kind == "gitsha1" else None
         except OSError as exc:
             metrics.record_ingest_verify("MISMATCH")
             raise IngestDigestMismatch(f"could not stat {blob} to verify: {exc}") from exc
-        h = hashlib.sha1(usedforsecurity=False)
-        h.update(b"blob %d\0" % size)
+        h = contenthash.hasher_for(etag, size)
     else:
         # A copy-mode cache with no symlink to read, or an ETag of neither
         # shape. Not a failure -- but it must not be counted as a pass either.
@@ -230,6 +236,13 @@ class Job:
     # Snapshot jobs: the sha256 blobs that landed from the tier (hashed as they
     # arrived). Verification and write-back skip exactly these. Not persisted.
     tier_etags: set[str] = field(default_factory=set, repr=False)
+    # Snapshot jobs: why the prewarm's own listing failed, so _run can tell a
+    # Hub outage or deletion (restore from the tier index) from anything else.
+    listing_error: BaseException | None = field(default=None, repr=False)
+    # Set when the job was served from the tier's index because the Hub could
+    # not answer (app/tierrestore.py): which commit, why, and how trusted.
+    # Write-back reads it and records no new ref observation.
+    index_restore: dict | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     tier_decided: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
@@ -277,6 +290,8 @@ class Job:
             "interrupted_at": self.interrupted_at,
             "verify": self.verify,
         }
+        if self.index_restore:
+            d["tier_restore"] = self.index_restore
         if self.state == "interrupted":
             d["note"] = (
                 "the process running this job stopped before it finished; "
@@ -538,15 +553,36 @@ class JobManager(ledger.LedgeredJobs):
                     watcher = asyncio.create_task(self._watch_snapshot(job))
                     try:
                         expected = await asyncio.to_thread(self._record_manifest, job)
-                        # A re-prewarm after losing the disk is how a cache is
-                        # refilled, so the tier is asked first for every sha256
-                        # file the listing names. snapshot_download then only
-                        # links what landed and fetches the rest from the Hub.
-                        if tier.enabled() and expected:
-                            job.tier_etags = await tier.fill_snapshot(
-                                job.repo_type, job.repo_id, expected
-                            )
-                        path = await asyncio.to_thread(self._download_snapshot, job)
+                        trigger = (
+                            tierrestore.trigger_for_exception(job.listing_error)
+                            if expected is None and job.listing_error is not None
+                            and tier.enabled() else None
+                        )
+                        if trigger is not None:
+                            # The Hub could not list the revision (unreachable,
+                            # 5xx, or the repo/revision is gone) and would not
+                            # serve the files either. The whole prewarm comes
+                            # from the tier's index, verified, or the job
+                            # fails saying why the index could not supply it.
+                            try:
+                                path = await tierrestore.prewarm(job, trigger)
+                            except tierrestore.Refused as exc:
+                                raise RuntimeError(
+                                    f"the Hub could not list this revision ({trigger}: "
+                                    f"{job.listing_error}), and the tier index could not "
+                                    f"restore it ({exc.result}: {exc})"
+                                ) from exc
+                        else:
+                            # A re-prewarm after losing the disk is how a cache
+                            # is refilled, so the tier is asked first for every
+                            # sha256 file the listing names. snapshot_download
+                            # then only links what landed and fetches the rest
+                            # from the Hub.
+                            if tier.enabled() and expected:
+                                job.tier_etags = await tier.fill_snapshot(
+                                    job.repo_type, job.repo_id, expected
+                                )
+                            path = await asyncio.to_thread(self._download_snapshot, job)
                     finally:
                         watcher.cancel()
                 self._stop_if_interrupted(job)
@@ -774,6 +810,7 @@ class JobManager(ledger.LedgeredJobs):
             kept = set(filter_repo_objects(entries, allow_patterns=job.allow_patterns))
             return {p: v for p, v in entries.items() if p in kept}
         except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the prewarm
+            job.listing_error = exc
             log.warning(
                 "prewarm %s: could not record the expected file list (%s); "
                 "/_cache/repos will report completeness as unknown",

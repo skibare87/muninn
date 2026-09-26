@@ -124,6 +124,10 @@ class TierSettings:
     index_key: bytes | None = field(default=None, repr=False)
     part_size: int = 64 * 1024**2
     checksum_header: bool = True
+    # Restore from the index when the Hub cannot answer (phase 2). Needs a
+    # SIGNED entry, verified with index_key, unless restore_unsigned is on.
+    restore: bool = True
+    restore_unsigned: bool = False
 
     @property
     def url(self) -> str:
@@ -230,6 +234,11 @@ def parse_tier() -> TierSettings | None:
         index_key=index_key.encode() if index_key else None,
         part_size=part_size,
         checksum_header=_env_bool("XHC_TIER2_CHECKSUM_HEADER", scheme == "s3"),
+        restore=_env_bool("XHC_TIER2_RESTORE", True),
+        # Off by default, and deliberately a separate switch from the key: an
+        # unsigned entry is as trustworthy as every credential that can write
+        # the bucket, so trusting one is a decision, never a fallback.
+        restore_unsigned=_env_bool("XHC_TIER2_RESTORE_UNSIGNED", False),
     )
 
 

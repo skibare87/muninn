@@ -44,6 +44,7 @@ from . import (
     refs,
     serving,
     tier,
+    tierrestore,
     viewer,
     webauth,
 )
@@ -810,7 +811,9 @@ async def _proxy_get(full_path: str, request: Request) -> httpx.Response:
 
     Unreachable is not the same as deleted, so a transport error surfaces as 502
     rather than falling back to cached data -- a Hub outage must never start
-    serving stale listings.
+    serving stale listings UNLABELLED. The one exception is the callers' tier
+    restore (app/tierrestore.py), which answers from a signed index and says so
+    on every response: TIER-RESTORE, and when the ref was observed.
     """
     url = f"{settings.upstream}/{quote(full_path)}"
     if request.url.query:
@@ -833,12 +836,35 @@ async def serve_repo_info(
     """Proxy repo info, falling back to the cached snapshot on an upstream 404."""
     if (denied := hfauthz.require(request, repo_type, repo_id)) is not None:
         return denied
-    upstream = await _proxy_get(full_path, request)
+    try:
+        upstream = await _proxy_get(full_path, request)
+    except HTTPException:
+        # Unreachable. The local snapshot is still NOT used for this (a Hub
+        # outage must not start serving stale listings unlabelled); the tier's
+        # index may answer, labelled with where it came from and how old it is.
+        if (r := await _restored_info(repo_type, repo_id, revision, "unreachable")):
+            return r
+        raise
     if upstream.status_code != 404:
+        trigger = tierrestore.trigger_for_status(upstream.status_code,
+                                                 upstream.headers.get("x-error-code"))
+        if trigger and (r := await _restored_info(repo_type, repo_id, revision, trigger)):
+            return r
+        if upstream.status_code == 200 and revision and tier.writable():
+            # The one place a client's snapshot_download says which commit a
+            # ref is: its file requests are all by commit. Index it, so a
+            # restore of this ref can find those files later.
+            try:
+                tier.observe_ref(repo_type, repo_id, revision, upstream.json().get("sha"))
+            except (ValueError, AttributeError):
+                pass
         return _passthrough(upstream)
 
     body = synthesize_repo_info(repo_type, repo_id, revision)
     if body is None:
+        trigger = tierrestore.trigger_for_status(404, upstream.headers.get("x-error-code"))
+        if trigger and (r := await _restored_info(repo_type, repo_id, revision, trigger)):
+            return r
         return _passthrough(upstream)
 
     log.info(
@@ -857,6 +883,33 @@ async def serve_repo_info(
     )
 
 
+async def _restored_info(repo_type: str, repo_id: str, revision: str | None,
+                         trigger: str) -> Response | None:
+    got = await _restored_listing(repo_type, repo_id, revision, trigger)
+    if got is None:
+        return None
+    ref, listing, headers = got
+    body = tierrestore.repo_info_body(repo_type, repo_id, ref, listing, trigger)
+    return JSONResponse(body, headers={**headers, "x-xhc-synthesized": "true"})
+
+
+async def _restored_tree(repo_type: str, repo_id: str, revision: str, path_in_repo: str,
+                         request: Request, trigger: str | None) -> Response | None:
+    got = await _restored_listing(repo_type, repo_id, revision, trigger)
+    if got is None:
+        return None
+    ref, listing, headers = got
+    params = request.query_params
+    entries = tierrestore.tree_entries(
+        listing, path_in_repo,
+        recursive=params.get("recursive", "").lower() in ("1", "true"),
+        expand=params.get("expand", "").lower() in ("1", "true"),
+    )
+    if entries is None:
+        return None
+    return JSONResponse(entries, headers={**headers, "x-xhc-synthesized": "true"})
+
+
 async def serve_tree(
     repo_type: str,
     repo_id: str,
@@ -865,11 +918,23 @@ async def serve_tree(
     full_path: str,
     request: Request,
 ) -> Response:
-    """Proxy a tree listing, falling back to the cached snapshot on a 404."""
+    """Proxy a tree listing, falling back to the cached snapshot on a 404, and
+    to the tier's index when the Hub cannot answer (app/tierrestore.py)."""
     if (denied := hfauthz.require(request, repo_type, repo_id)) is not None:
         return denied
-    upstream = await _proxy_get(full_path, request)
+    try:
+        upstream = await _proxy_get(full_path, request)
+    except HTTPException:
+        if (r := await _restored_tree(repo_type, repo_id, revision, path_in_repo, request,
+                                      "unreachable")):
+            return r
+        raise
+    trigger = tierrestore.trigger_for_status(upstream.status_code,
+                                             upstream.headers.get("x-error-code"))
     if upstream.status_code != 404:
+        if trigger and (r := await _restored_tree(repo_type, repo_id, revision,
+                                                  path_in_repo, request, trigger)):
+            return r
         return _passthrough(upstream)
 
     params = request.query_params
@@ -882,6 +947,9 @@ async def serve_tree(
         expand=params.get("expand", "").lower() in ("1", "true"),
     )
     if entries is None:
+        if trigger and (r := await _restored_tree(repo_type, repo_id, revision,
+                                                  path_in_repo, request, trigger)):
+            return r
         return _passthrough(upstream)
     log.info(
         "tree synthesized for %s/%s@%s (upstream 404, %d entries)",
@@ -1162,6 +1230,16 @@ async def serve_file(
         # MIT/ast-finetuned-audioset: six 502s and five retries for one file
         # that simply does not exist.
         failure = upstream_failure(exc, repo_id, filename)
+        # The Hub is unreachable, failing, or says the repo or revision is gone:
+        # the tier's index may still know this file (tierrestore says exactly
+        # which failures qualify; 401 and 403 never do). Behind the ingest
+        # policy, because a restore puts a file on this disk as an ingest does.
+        trigger = tierrestore.trigger_for_exception(exc) if tier.enabled() else None
+        if trigger is not None and decision.allowed:
+            restored = await _serve_restored(repo_type, repo_id, revision, filename,
+                                             request, range_header, trigger, pol)
+            if restored is not None:
+                return restored
         if failure.status_code == 404:
             _negative_cache_put(repo_type, repo_id, revision, filename, failure)
         raise failure from exc
@@ -1331,6 +1409,47 @@ async def serve_file(
         headers=headers,
         media_type="application/octet-stream",
     )
+
+
+async def _serve_restored(repo_type: str, repo_id: str, revision: str, filename: str,
+                          request: Request, range_header: str | None, trigger: str,
+                          pol) -> Response | None:
+    """Answer a resolve request from the tier's index (app/tierrestore.py).
+
+    None when the index cannot or may not supply it; the caller then answers
+    with the Hub's failure, as before. A HEAD fetches nothing. A prewarm
+    header gets the file restored and no body.
+    """
+    prewarm = _flag(request, "x-muninn-prewarm")
+
+    def admit(size: int):
+        d = policy.check_size(size, pol)
+        return None if d.allowed else d
+
+    restored = await tierrestore.restore_file(
+        repo_type, repo_id, revision, filename, trigger,
+        fetch=request.method != "HEAD", admit=admit,
+    )
+    if restored is None:
+        return None
+    if restored.refusal is not None:
+        return _policy_refusal(repo_type, repo_id, restored.refusal)
+    headers = _cache_headers(restored.ref.commit, restored.entry.etag, restored.headers)
+    if request.method == "HEAD":
+        headers["content-length"] = str(restored.entry.size)
+        headers["accept-ranges"] = "bytes"
+        return Response(status_code=200, headers=headers)
+    if prewarm:
+        headers["content-length"] = "0"
+        return Response(status_code=204, headers=headers)
+    return serving.file_response(restored.path, restored.entry.size, range_header, headers)
+
+
+async def _restored_listing(repo_type: str, repo_id: str, revision: str | None,
+                            trigger: str | None):
+    if trigger is None or not tier.enabled():
+        return None
+    return await tierrestore.restore_listing(repo_type, repo_id, revision or "main", trigger)
 
 
 async def proxy_upstream(full_path: str, request: Request) -> Response:

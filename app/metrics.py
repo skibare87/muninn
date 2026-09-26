@@ -51,6 +51,13 @@ _tier_requests: Counter[str] = Counter()  # "proto|kind|result"
 _tier_verify: Counter[str] = Counter()  # verified | mismatch
 _tier_upload: Counter[str] = Counter()  # ok | failed | skipped_* | verify_mismatch | dropped_*
 _tier_index_writes: Counter[str] = Counter()  # signed | unsigned | failed | skipped_exists
+# Phase 2. One per restore ATTEMPT (a request or prewarm the Hub could not
+# answer), by outcome; and one per index OBJECT read, by what its
+# authentication said. A ref walk that skips a bad signature and restores from
+# an older observation is one "ok" restore and one "bad_signature" read, so the
+# second counter is where a tampered entry shows up.
+_tier_restore: Counter[str] = Counter()
+_tier_index_reads: Counter[str] = Counter()
 # BODY bytes only. A HEAD transfers none and is never counted here -- the
 # served counter once booked HEADs as bytes, and every figure built on it
 # was inflated.
@@ -68,6 +75,13 @@ _TIER_UPLOAD_SERIES: tuple[str, ...] = (
     "dropped_queue_full",
 )
 _TIER_INDEX_SERIES: tuple[str, ...] = ("signed", "unsigned", "failed", "skipped_exists")
+_TIER_RESTORE_SERIES: tuple[str, ...] = (
+    "ok", "ok_unsigned", "unsigned_refused", "bad_signature", "missing",
+    "content_missing", "content_mismatch", "no_key", "policy_refused", "error",
+)
+_TIER_INDEX_READ_SERIES: tuple[str, ...] = (
+    "signed_ok", "unsigned_accepted", "unsigned_refused", "bad_signature", "malformed",
+)
 
 # Bounds the label cardinality: a client that sends a unique header per request
 # would otherwise grow this map without limit and blow up the scrape.
@@ -120,6 +134,10 @@ def _seed() -> None:
         _tier_upload.setdefault(k, 0)
     for k in _TIER_INDEX_SERIES:
         _tier_index_writes.setdefault(k, 0)
+    for k in _TIER_RESTORE_SERIES:
+        _tier_restore.setdefault(k, 0)
+    for k in _TIER_INDEX_READ_SERIES:
+        _tier_index_reads.setdefault(k, 0)
 
 
 _seed()
@@ -194,6 +212,16 @@ def record_tier_index_write(result: str) -> None:
         _tier_index_writes[result] += 1
 
 
+def record_tier_restore(result: str) -> None:
+    with _lock:
+        _tier_restore[result] += 1
+
+
+def record_tier_index_read(result: str) -> None:
+    with _lock:
+        _tier_index_reads[result] += 1
+
+
 def record_tier_bytes(read: int = 0, written: int = 0) -> None:
     global _tier_bytes_read, _tier_bytes_written  # noqa: PLW0603
     with _lock:
@@ -230,6 +258,8 @@ def snapshot() -> dict:
             "tier_verify": dict(_tier_verify),
             "tier_upload": dict(_tier_upload),
             "tier_index_writes": dict(_tier_index_writes),
+            "tier_restore": dict(_tier_restore),
+            "tier_index_reads": dict(_tier_index_reads),
             "tier_bytes_read": _tier_bytes_read,
             "tier_bytes_written": _tier_bytes_written,
         }
@@ -244,6 +274,8 @@ def reset() -> None:
         _tier_verify.clear()
         _tier_upload.clear()
         _tier_index_writes.clear()
+        _tier_restore.clear()
+        _tier_index_reads.clear()
         _tier_bytes_read = 0
         _tier_bytes_written = 0
         _requests.clear()
@@ -345,6 +377,8 @@ def render(gauges: dict[str, float], help_text: dict[str, str] | None = None) ->
         ("muninn_tier_verify_total", "tier_verify"),
         ("muninn_tier_upload_total", "tier_upload"),
         ("muninn_tier_index_writes_total", "tier_index_writes"),
+        ("muninn_tier_restore_total", "tier_restore"),
+        ("muninn_tier_index_reads_total", "tier_index_reads"),
     ):
         emit(name, "counter",
              [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap[key].items())])
