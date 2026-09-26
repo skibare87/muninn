@@ -321,3 +321,68 @@ def test_index_entries_keep_their_auth_marker_on_a_real_server(live, monkeypatch
     auth, sig, body = out[False]
     assert auth == tier.AUTH_UNSIGNED and sig is None
     assert body["auth"] == tier.AUTH_UNSIGNED and "sig" not in body
+
+
+def test_restore_from_a_signed_index_on_a_real_server(live, tmp_path):
+    """Phase 2 against real S3 semantics. Written through the real upload path
+    (content of both shapes, signed commit entries, a signed ref observation),
+    then restored by the real reader: a ListObjectsV2 of the ref's
+    observations and of the commit's entries, the ref's signature read back
+    from MinIO's user metadata on a HEAD, and every byte verified against the
+    ETag its entry names. Then a same-length tampered object in a second repo is
+    refused by hash, and nothing is linked."""
+    from app import tierrestore
+
+    good = {"config.json": b'{"model_type": "toy"}', "model.safetensors": os.urandom(300_000)}
+
+    def etag_of(name: str, body: bytes) -> str:
+        if name.endswith(".safetensors"):
+            return hashlib.sha256(body).hexdigest()
+        return hashlib.sha1(b"blob %d\0" % len(body) + body, usedforsecurity=False).hexdigest()
+
+    async def upload(repo: str, commit: str) -> dict[str, str]:
+        tags = {}
+        for name, body in good.items():
+            etag = tags[name] = etag_of(name, body)
+            p = tmp_path / f"{repo.replace('/', '_')}-{etag}"
+            p.write_bytes(body)
+            item = tier._content(tier.hf_blob_key("model", repo, etag), p, etag,
+                                 name_kind="sha256" if len(etag) == 64 else "gitsha1")
+            item.then.append(tier._hf_commit_index("model", repo, commit, name, etag, len(body)))
+            assert await tier.process(item) == "ok"
+        await tier.process(tier._hf_ref_index("model", repo, "main", commit, time.time()))
+        return tags
+
+    async def scenario():
+        assert (await tier.probe())["ok"]
+        await upload("acme/restore", "c" * 40)
+        restored = {n: await tierrestore.restore_file("model", "acme/restore", "main", n,
+                                                      "unreachable", fetch=True)
+                    for n in good}
+        listing = await tierrestore.restore_listing("model", "acme/restore", "main",
+                                                    "unreachable")
+        # The tampered twin: same length, different bytes, uploaded over the
+        # content object after its (correct) index entry was written.
+        tags = await upload("acme/tampered", "d" * 40)
+        key = tier.hf_blob_key("model", "acme/tampered", tags["config.json"])
+        wrong = bytes(b ^ 1 for b in good["config.json"])
+        await tier._s.client.put(key, wrong)
+        refused = await tierrestore.restore_file("model", "acme/tampered", "main",
+                                                 "config.json", "unreachable", fetch=True)
+        return restored, listing, refused
+
+    restored, listing, refused = _run(scenario())
+    for name, body in good.items():
+        r = restored[name]
+        assert r is not None, name
+        assert r.path.read_bytes() == body
+        assert r.headers["x-xhc-cache"] == "TIER-RESTORE"
+        assert r.headers["x-xhc-index-auth"] == "signed"
+        assert r.headers["x-xhc-ref-observed-at"].endswith("Z")
+    assert listing is not None and sorted(listing[1]) == sorted(good)
+    assert refused is None
+    counts = metrics.snapshot()["tier_restore"]
+    assert counts["ok"] == len(good) + 1 and counts["content_mismatch"] == 1
+    assert metrics.snapshot()["tier_index_reads"]["signed_ok"] >= len(good) + 1
+    tampered_blob = (Path(settings.cache_dir) / "models--acme--tampered" / "blobs")
+    assert not any(tampered_blob.glob("[0-9a-f]*")) if tampered_blob.exists() else True

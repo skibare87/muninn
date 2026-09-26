@@ -2239,10 +2239,17 @@ unless `XHC_TIER2` is set; unset, every tier code path is skipped.
 
 - **Read-through.** On a local miss, Muninn reads the bucket **before** the Hub
   or the registry. That covers OCI blobs, OCI manifests requested by digest, and
-  Hugging Face files whose ETag is a sha256 (LFS and Xet files, which is every
-  weight file). A fresh disk refills from the bucket, and the upstream is spared
-  the request. The Hub is still asked for metadata (the `HEAD` on every miss),
-  because that is where the expected hash comes from.
+  Hugging Face files of both kinds: those whose ETag is a sha256 (LFS and Xet
+  files, which is every weight file) and the small files whose ETag is a git
+  blob id (`config.json`, tokenizers). A fresh disk refills from the bucket, and
+  the upstream is spared the request. While the Hub answers, it is still asked
+  for metadata (the `HEAD` on every miss), because that is where the expected
+  hash comes from.
+- **Restore when the Hub cannot answer.** When the Hub is unreachable, fails
+  with a 5xx, or says a repo or revision no longer exists, Muninn can answer
+  from the bucket's **index** instead: which commit a ref pointed at, which
+  files that commit has, and their ETags. Signed entries only by default. See
+  [Restore from the index](#restore-from-the-index-when-the-hub-cannot-answer).
 - **Write-back.** After an ingest reaches `done` (verified, when
   `XHC_HF_VERIFY` is on), and after an OCI blob's digest has matched and it is
   renamed into place, the content is copied to the bucket in the background.
@@ -2268,6 +2275,7 @@ other kind) can target one without the other:
 
 ```
 <prefix>/v1/content/hf/<hf-host>/<repo_type>s/<org>/<name>/sha256/<etag>
+<prefix>/v1/content/hf/<hf-host>/<repo_type>s/<org>/<name>/gitsha1/<etag>     non-LFS files, by git blob id
 <prefix>/v1/content/oci/<upstream>/blobs/sha256/<ab>/<hex>
 <prefix>/v1/content/oci/<upstream>/manifests/sha256/<ab>/<hex>      verbatim bytes; media type as Content-Type
 <prefix>/v1/index/hf/<hf-host>/<repo_type>s/<org>/<name>/commits/<commit>/<quoted-path>.json   {etag,size,sig}
@@ -2284,9 +2292,15 @@ heavily across repos.
 
 - **Content is verified on every read from the tier, unconditionally.** A blob
   is named by its own hash, and the value it is checked against comes from the
-  request: the Hub's `HEAD`, or the digest in the URL. It never comes from the
-  bucket. So a bucket can withhold content but cannot forge it. This does not
-  depend on `XHC_HF_VERIFY`, which is a choice about bytes from the Hub.
+  request: the Hub's `HEAD`, the digest in the URL, or (on a restore) a signed
+  index entry. It never comes from the content object itself. So a bucket can
+  withhold content but cannot forge it. This does not depend on
+  `XHC_HF_VERIFY`, which is a choice about bytes from the Hub. A git-blob file
+  is checked with the same rule the ingest verifier uses,
+  `sha1("blob <size>\0" + content)`. SHA-1 has practical collisions but no
+  practical second preimage: a bucket writer cannot make other bytes match an
+  id the Hub issued. The one case it does not cover is a colliding pair that
+  whoever uploaded the file prepared and published to the Hub themselves.
 - **Mappings are not content.** A revision → commit → file → ETag chain, or a
   tag → digest, is only as trustworthy as whoever can write the bucket, and on
   R2 a token scopes to a whole bucket, never to a prefix. So index objects are
@@ -2296,11 +2310,10 @@ heavily across repos.
 - **The index is written with or without the key.** Without it, each entry is
   written **unsigned** and says so in the object itself (`"auth": "unsigned"`
   in a commit entry's body, `auth: unsigned` metadata on a ref or tag entry).
-  Nothing reads the index yet, so an unsigned entry costs no trust today.
-  **Whether a later restore will use unsigned entries is not decided.** An
-  unsigned index can be restored from only if that policy allows it. Entries
-  are immutable and never re-signed, so **set the key from the start** if you
-  want everything written to stay restorable under a signed-only policy.
+  **A restore refuses unsigned entries** unless you set
+  `XHC_TIER2_RESTORE_UNSIGNED=true`. Entries are immutable and never re-signed,
+  so **set the key from the start**: anything written before it was set stays
+  unsigned, and restorable only under the opt-in.
 - **On a mismatch** the bytes are discarded and nothing is linked;
   `muninn_tier_verify_total{result="mismatch"}` counts it and the key is logged
   and listed under `tier.bad_keys` on `/_cache/status`. That key is not read
@@ -2372,24 +2385,132 @@ that byte in the same pass and sends it.
 4. A rule whose prefix covers `v1/index/` removes the mappings, and the content
    they point to then cannot be restored once the upstream has deleted it.
 
-### What phase 1 does, and does not do
+### Restore from the index when the Hub cannot answer
+
+The index records what the Hub said: which commit a ref such as `main` pointed
+at (one immutable object per observation, stamped with when it was seen), and
+which files a commit has, with each file's ETag and size. When the Hub cannot
+answer, Muninn answers from it. That covers a file (`resolve`), repo info
+(`api/models/<repo>/revision/<rev>`, which `snapshot_download` lists through),
+and a tree listing. The response says `x-xhc-cache: TIER-RESTORE`.
+
+**When it restores, and when it never does.** Only on these Hub answers:
+
+| the Hub | restores? | why |
+|---|---|---|
+| no answer: connection refused, DNS, TLS, timeout | **yes** | an outage |
+| a 5xx | **yes** | an outage |
+| 404 for the repo or revision (`RepoNotFound`, `RevisionNotFound`, or no code) | **yes** | the repo or branch is gone |
+| 401 or 403, whatever the error code | **never** | the upstream said no. That is how a revoked gated grant, a repo made private, or a dead token looks. Restoring would turn every revocation into a no-op for anything the cache ever held |
+| 404 `EntryNotFound` | never | the Hub answered about this revision, and the file is not in it |
+| 429 | never | the upstream is alive and says "later" |
+
+A local fault (a full disk, a parse error) is never read as "unreachable".
+
+> ⚠ **Without a valid Hub token, a deleted repo does not look deleted.** Measured
+> on the public Hub: an anonymous request for a repo that does not exist gets
+> **401**, not 404, the same answer as a repo you may not read. Muninn does not
+> restore on 401, so a cache running without a valid `XHC_HF_TOKEN` survives an
+> **outage** but cannot tell a deletion from a refusal, and does not restore
+> after one. With a valid token the Hub is expected to answer 404 for a deleted
+> repo; that has not been measured from here.
+>
+> The reverse also holds, and it is a limit rather than a bug: with a token, a
+> private repo whose access was removed may answer 404 just as a deleted one
+> does, and then it restores. That matches what Muninn already does with a
+> repo it holds locally (a 404 keeps it serving, see orphans below).
+
+**Trust.** A mapping is only as trustworthy as whoever can write the bucket.
+
+- By default an entry is used **only if its HMAC verifies** with
+  `XHC_TIER2_INDEX_KEY`, recomputed from the key in your configuration. Nothing
+  from the bucket says what the signature should be. The signature covers the
+  host, repo, ref or commit, path, ETag, size, the index version, and, for a
+  ref, the time it was observed. The observation time and commit are read from
+  the object's **name**, which is what orders observations. So an old signed
+  observation copied verbatim under a newer name, an entry moved to another
+  file's path, and an entry signed with another key are all refused.
+- **A signature that does not verify counts as absent.** It is logged, counted
+  on `muninn_tier_index_reads_total{result="bad_signature"}`, and never used.
+  For a ref, the next older observation is tried (up to 16), so a tampered
+  newest observation cannot block a restore. It can only fall back to an older
+  genuine one. For a file or a listing, the restore is refused. A listing with
+  one bad entry is refused whole, rather than served with a hole in it.
+- **Unsigned entries** are refused unless `XHC_TIER2_RESTORE_UNSIGNED=true`.
+  That setting is logged as a warning at startup and on every unsigned restore,
+  and an unsigned answer says `x-xhc-index-auth: unsigned`. With it on, anyone
+  who can write the bucket can choose which commit `main` restores to and which
+  object a file name points at. Content is still verified against the ETag the
+  entry names; the entry itself is unauthenticated.
+- **Without a key and without the opt-in, restore is off.** Nothing in the
+  index is read; `muninn_tier_restore_total{result="no_key"}` counts the
+  refusals.
+- Content is verified as on every tier read: against the ETag the verified
+  entry names, as it arrives, and renamed into place only on a match. A
+  same-length forgery is refused by hash, marked bad, and never served.
+
+**Freshness.** A ref restores to its **most recent observation that verifies**.
+That observation may be stale: `main` may have moved on the Hub since. Every
+restored answer by ref carries `x-xhc-ref-observed-at` (RFC 3339, UTC) and
+`x-xhc-ref-age` (seconds). A request **by commit** has no staleness: a commit
+never moves, and it carries neither header. A restore never writes a local
+`refs/` file and never writes a new observation, so a restored answer stays
+labelled as one, and an old observation is never re-stamped as new.
+
+**What "survives upstream deletion" means, precisely.** A file can be restored
+only if all of these happened before the Hub stopped answering:
+
+1. this cache (or another sharing the bucket) fetched it,
+2. its content was written back to the bucket, and
+3. its commit entry was indexed, **and**, to restore by a ref such as `main`,
+   an observation of that ref was indexed. One is recorded whenever a request
+   by that ref reaches the Hub (a file request, a prewarm, or the repo-info call
+   `snapshot_download` makes).
+
+So a restored listing is **the files that were indexed for that commit, which
+is not necessarily the whole repo**. A repo only ever fetched file by file
+restores as exactly those files; its repo info says so in
+`xhcSynthesizedReason`. A file never fetched is answered as before (a 502 during
+an outage), never invented. It also needs the bucket's index to survive: a
+lifecycle rule on `v1/index/` removes exactly what this depends on. And the
+Hub-reachable limits still apply: an entry written unsigned is restorable only
+under the opt-in.
+
+**Prewarms.** When a prewarm's own listing fails in one of the ways above, the
+whole prewarm runs from the index: it resolves the revision, reads the commit's
+listing, filters it by `allow_patterns`, and fills and verifies every file from
+the bucket. It is all or nothing. A file whose content is absent or fails
+verification fails the job and names the file; the job never reports `done`
+with a hole in the snapshot. The job's record says `tier_restore` with the
+commit, the trigger and when the ref was observed. When the Hub is reachable,
+prewarms work as before.
+
+**Status and metrics.** `/_cache/status` → `tier.restore` gives the mode (off,
+signed only, or signed and unsigned) and the last attempt.
+`muninn_tier_restore_total{result}` counts attempts: `ok`, `ok_unsigned`,
+`unsigned_refused`, `bad_signature`, `missing` (not in the index),
+`content_missing`, `content_mismatch`, `no_key`, `policy_refused` (the ingest
+size policy still applies), and `error`.
+`muninn_tier_index_reads_total{result}` counts index objects read: `signed_ok`,
+`unsigned_accepted`, `unsigned_refused`, `bad_signature`, `malformed`.
+
+### What it does, and does not do
 
 | does | does not |
 |---|---|
-| read-through for OCI blobs, OCI manifests by digest, and HF files with a sha256 ETag | serve anything from the tier when the **upstream is unreachable for metadata**. A Hugging Face miss still needs the Hub's `HEAD`, and a tag still needs the registry |
-| write-back after `done`, with the upload-time hash | read or restore from the **index**, which is written but never read. A model deleted upstream does **not** survive through the tier yet |
-| write the index: signed with `XHC_TIER2_INDEX_KEY`, marked unsigned without it | tier small, non-LFS Hugging Face files (`config.json`, tokenizers), which are keyed by git blob id. A model restored without its `config.json` is not a model, so that is the next phase's first job |
-| verify every tier read | |
-| static keys, and a GKE metadata-server token for GCS | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
-| | parallel ranged reads from the tier: one stream per object |
+| read-through for OCI blobs, OCI manifests by digest, and HF files of both kinds (sha256 and git blob id) | restore an OCI **tag** when the registry is down; a tag still needs the registry |
+| write-back after `done`, with the upload-time hash, for both HF kinds | fill git-blob files from the tier during a prewarm while the Hub answers (they are small; the Hub serves them) |
+| write the index: signed with `XHC_TIER2_INDEX_KEY`, marked unsigned without it | restore on a 401 or 403, ever |
+| restore HF files, repo info, tree listings and whole prewarms from the index when the Hub is unreachable, failing, or says the repo is gone | restore anything that was never fetched, written back and indexed |
+| verify every tier read, and every index entry's signature | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
+| static keys, and a GKE metadata-server token for GCS | parallel ranged reads from the tier: one stream per object |
 | | delete anything from the tier, ever |
 
 Nothing here is a claim about speed. Whether the tier is faster than the Hub for
 your bucket, region and object sizes has not been measured. Measure a
 single-stream GET from your bucket against a Hub fetch before relying on it.
-It pays for itself mainly as survival (in a later phase) and as relief from
-upstream rate limits. Cross-region or cross-cloud buckets also pay egress per
-byte.
+It pays for itself mainly as survival and as relief from upstream rate limits.
+Cross-region or cross-cloud buckets also pay egress per byte.
 
 ### Stores and credentials
 
@@ -2457,8 +2578,10 @@ Supported, with the same `XHC_TIER2` prefix. Content is immutable and
 content-addressed, so concurrent PUTs write identical bytes. Index objects are
 immutable (commits) or append-only (one object per ref or tag observation), so
 nothing needs a lock. The cost of sharing: one instance's credential can write
-mappings that every instance would trust in a later phase. It cannot poison
-content. That is why the index is signed with a key the bucket does not hold.
+mappings that every instance restores from. It cannot poison content. That is
+why the index is signed with a key the bucket does not hold, and why a restore
+refuses unsigned entries by default. Instances that should restore each other's
+entries need the same `XHC_TIER2_INDEX_KEY`.
 
 ### Tier configuration
 
@@ -2472,18 +2595,22 @@ content. That is why the index is signed with a key the bucket does not hold.
 | `XHC_TIER2_SECRET_ACCESS_KEY[_FILE]` | — | static secret, or a file holding it |
 | `XHC_TIER2_READ` / `XHC_TIER2_WRITE` | `true` / `true` | a read-only replica, or a write-only seeding instance |
 | `XHC_TIER2_READ_MODE` | `verify-first` | `verify-first` \| `stream`. `stream` serves unverified bytes; see above |
-| `XHC_TIER2_MIN_SIZE` | `0` | skip the tier for smaller Hugging Face files, and don't write back OCI blobs smaller than this. OCI blob reads cannot apply it, because their size is unknown before the request. Manifests are exempt |
+| `XHC_TIER2_MIN_SIZE` | `0` | skip the tier for smaller Hugging Face files, and don't write back OCI blobs smaller than this. OCI blob reads cannot apply it, because their size is unknown before the request. Manifests and HF git-blob files are exempt from write-back's limit, and a restore ignores it: when the Hub cannot answer, the tier is the only source |
 | `XHC_TIER2_PART_SIZE` | `64M` | single PUT up to this size, multipart above it. Minimum `5M` (S3's floor). Also the memory one upload holds |
 | `XHC_TIER2_UPLOAD_CONCURRENCY` | `2` | concurrent uploads |
 | `XHC_TIER2_QUEUE_MAX` | `10000` | in-memory upload queue bound; the reconciler covers overflow |
 | `XHC_TIER2_RECONCILE_INTERVAL` | `21600` | seconds between reconciles (and one at startup); `0` disables, and the queue is then best-effort |
-| `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects. Unset: the index is still written, **unsigned**, and marked so; see the trust section |
+| `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects, and the only thing a restore verifies them with. Unset: the index is still written, **unsigned**, and marked so, and restore is off unless the opt-in below is set; see the trust section |
+| `XHC_TIER2_RESTORE` | `true` | restore from the index when the Hub is unreachable, fails with a 5xx, or 404s the repo or revision. Never on a 401 or 403. `false` turns restore off and keeps read-through and write-back |
+| `XHC_TIER2_RESTORE_UNSIGNED` | `false` | also restore **unsigned** index entries. Anyone who can write the bucket can then choose what a ref restores to. Logged at startup and on every unsigned restore |
 | `XHC_TIER2_CHECKSUM_HEADER` | `true` (s3), `false` (gs) | also send `x-amz-checksum-sha256` on single PUTs |
 
 Tier metrics: `muninn_tier_requests_total{proto,kind,result=hit|miss|error|refused}`,
 `muninn_tier_verify_total{result=verified|mismatch}`,
 `muninn_tier_upload_total{result=ok|failed|skipped_exists|skipped_evicted|verify_mismatch|dropped_queue_full}`,
 `muninn_tier_index_writes_total{result=signed|unsigned|failed|skipped_exists}`,
+`muninn_tier_restore_total{result=ok|ok_unsigned|unsigned_refused|bad_signature|missing|content_missing|content_mismatch|no_key|policy_refused|error}`,
+`muninn_tier_index_reads_total{result=signed_ok|unsigned_accepted|unsigned_refused|bad_signature|malformed}`,
 `muninn_tier_bytes_read_total` and `muninn_tier_bytes_written_total` (body
 bytes only; a HEAD is never counted), and the gauges `muninn_tier_healthy`,
 `muninn_tier_upload_queue_depth`, `muninn_tier_objects`, `muninn_tier_bytes`

@@ -1,4 +1,4 @@
-"""The object-store second tier (XHC_TIER2), phase 1.
+"""The object-store second tier (XHC_TIER2).
 
 An optional S3-compatible bucket between the local disk and the upstream. On a
 local miss, content is read from the bucket before the upstream; after a
@@ -7,15 +7,17 @@ XHC_TIER2 is set, and every entry point here returns early when it is not.
 
 THE SPLIT THIS IS BUILT ON.
 
-- CONTENT is named by its own hash: an HF blob by its sha256 ETag, an OCI blob
-  or manifest by its digest. The value it is checked against comes from the
-  REQUEST -- the Hub's HEAD, or the digest in the URL -- and never from the
-  bucket. A bucket can withhold content; it cannot forge it.
+- CONTENT is named by its own hash: an HF blob by its ETag (a sha256 for an
+  LFS/Xet file, a git blob id for any other), an OCI blob or manifest by its
+  digest. The value it is checked against comes from the REQUEST -- the Hub's
+  HEAD, the digest in the URL, or a signed index entry -- and never from the
+  object itself. A bucket can withhold content; it cannot forge it.
 - MAPPINGS (revision -> commit -> file -> etag, tag -> digest) are only as
-  trustworthy as whoever can write the bucket. Phase 1 WRITES an index of them
-  -- HMAC-signed when XHC_TIER2_INDEX_KEY is set, marked unsigned when it is
-  not -- and never READS it. Restoring from it, and whether an unsigned entry
-  may be restored at all, is phase 2.
+  trustworthy as whoever can write the bucket. They are written here as an
+  index -- HMAC-signed when XHC_TIER2_INDEX_KEY is set, marked unsigned when it
+  is not -- and READ only by app/tierrestore.py, when the Hub cannot answer.
+  That reader verifies the signature with the configured key and refuses an
+  unsigned entry unless XHC_TIER2_RESTORE_UNSIGNED is on.
 
 ONE HASH PASS, IN BOTH DIRECTIONS. A tier read hashes the bytes as they land in
 a temporary file and renames it into place only on a match -- it never fetches
@@ -36,6 +38,7 @@ Hub or the registry.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -52,16 +55,16 @@ from urllib.parse import quote, urlparse
 import filelock
 import httpx
 
-from . import cachefs, metrics, ocistore, s3client, shutdown
+from . import cachefs, contenthash, metrics, ocistore, s3client, shutdown
 from .config import settings
 
 log = logging.getLogger("xhc.tier")
 
-# Phase 1 reads back sha256-named content only. Files keyed by a git blob id
-# (40 hex) are the next phase; when they are added, verify them with the rule
-# jobs.verify_ingested already applies -- sha1(b"blob <size>\0" + content), in
-# the same single pass -- rather than with a second copy of it.
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# HF content comes in two shapes, both verified by app/contenthash.py -- the
+# same rule jobs.verify_ingested applies, never a second copy of it: a sha256
+# (LFS/Xet files) and a git blob id, sha1(b"blob <size>\0" + content), for the
+# small files a model cannot load without (config.json, tokenizers).
+_SHA256_RE = contenthash.SHA256_RE
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 CHUNK = 4 * 1024 * 1024
 # Transport failures are retried; an HTTP status is an answer and is not.
@@ -128,6 +131,9 @@ def instance_id() -> str:
 def reset_for_tests() -> None:
     global _s  # noqa: PLW0603 - test helper
     _s = _State()
+    from . import tierrestore  # the index reader; it imports this module
+
+    tierrestore.reset_for_tests()
 
 
 def use_client(client: s3client.S3Client, healthy: bool = True) -> None:
@@ -199,6 +205,21 @@ def hf_content_key(repo_type: str, repo_id: str, etag: str) -> str:
     return hf_content_prefix(repo_type, repo_id) + etag
 
 
+def hf_git_content_key(repo_type: str, repo_id: str, etag: str) -> str:
+    """A non-LFS file, named by its git blob id."""
+    return f"{_base()}/content/hf/{_hf_repo(repo_type, repo_id)}/gitsha1/{etag}"
+
+
+def hf_blob_key(repo_type: str, repo_id: str, etag: str) -> str | None:
+    """The content key for an HF ETag of either shape; None for neither."""
+    kind = contenthash.etag_kind(etag)
+    if kind == "sha256":
+        return hf_content_key(repo_type, repo_id, etag)
+    if kind == "gitsha1":
+        return hf_git_content_key(repo_type, repo_id, etag)
+    return None
+
+
 def _oci_sharded(upstream: str, kind: str, digest: str) -> str:
     hexpart = digest.split(":", 1)[1]
     return f"{_base()}/content/oci/{_SAFE.sub('_', upstream)}/{kind}/sha256/{hexpart[:2]}/{hexpart}"
@@ -254,6 +275,26 @@ def index_sig(kind: str, host: str, repo: str, ref_or_commit: str, path: str,
     canon = json.dumps([INDEX_VERSION, kind, host, repo, ref_or_commit, path, value, size,
                         observed_at], separators=(",", ":"))
     return hmac.new(cfg().index_key, canon.encode(), hashlib.sha256).hexdigest()
+
+
+def index_sig_ok(sig: object, kind: str, host: str, repo: str, ref_or_commit: str,
+                 path: str, value: str, size: int, observed_at: str = "") -> bool:
+    """Whether `sig` is the signature THIS configuration would have written.
+
+    The expected value is recomputed from the configured key and from what the
+    READER asked for (host, repo, ref or commit, path, and the observation time
+    taken from the object's NAME), plus the value the entry claims. Nothing
+    from the bucket is trusted to say what the signature should be. An entry
+    copied to another repo, path or observation time fails, because those are
+    signed and are taken from the request, not from the entry. The version is
+    signed too: it is INDEX_VERSION, the constant, never the entry's own field.
+
+    False without a key: an unverifiable signature is not a valid one.
+    """
+    if not cfg().index_key or not isinstance(sig, str):
+        return False
+    want = index_sig(kind, host, repo, ref_or_commit, path, value, size, observed_at)
+    return hmac.compare_digest(want, sig)
 
 
 # ---------------------------------------------------------------------------
@@ -323,14 +364,17 @@ async def open_read(key: str, proto: str, kind: str,
     return None
 
 
-async def hash_into(resp: httpx.Response, tmp: Path, flush: bool) -> tuple[str, int]:
+async def hash_into(resp: httpx.Response, tmp: Path, flush: bool,
+                    hasher=None) -> tuple[str, int]:
     """Stream a response into `tmp`, hashing each chunk as it is written.
 
     THE ONE HASH PASS: the digest returned here is the only one ever computed
     over these bytes. The caller compares it and renames; nothing re-reads.
     `flush` makes growth visible to a tail-follower (stream mode only).
+    `hasher` defaults to sha256; an HF git-blob file passes
+    contenthash.hasher_for(etag, size).
     """
-    h = hashlib.sha256()
+    h = hasher if hasher is not None else hashlib.sha256()
     written = 0
     tmp.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -376,13 +420,17 @@ def owns_partial(folder: str, etag: str) -> bool:
 
 
 async def _fill_blob(repo_type: str, repo_id: str, etag: str, size: int | None, *,
-                     stream: bool = False, on_answer=None) -> bool:
+                     stream: bool = False, on_answer=None, restore: bool = False) -> bool:
     """Put blobs/<etag> in place from the tier, verified, under huggingface_hub's
     own per-blob lock. Returns True only when the tier's bytes landed.
 
-    The one routine for both a file miss and a prewarm, so both keep the same
-    guarantees: one hash pass, rename only on a match, a mismatch marked bad
-    and never deleted from the tier.
+    The one routine for a file miss, a prewarm and an index restore, so all of
+    them keep the same guarantees: one hash pass, rename only on a match, a
+    mismatch marked bad and never deleted from the tier.
+
+    A git-blob ETag needs `size`: the id covers the length (contenthash). A
+    restore ignores XHC_TIER2_MIN_SIZE, which is a speed knob for when the Hub
+    can answer; when it cannot, the tier is the only source.
 
     `on_answer` is called once the tier has answered 200, before any body byte
     is read. `stream` writes where a tail-follower looks (file misses under
@@ -391,11 +439,14 @@ async def _fill_blob(repo_type: str, repo_id: str, etag: str, size: int | None, 
     been sent a prefix it cannot un-receive.
     """
     t = cfg()
-    if not (readable() and _SHA256_RE.match(etag or "")):
+    kind = contenthash.etag_kind(etag)
+    if not readable() or kind is None:
         return False
-    if (size or 0) < t.min_size:
+    if kind == "gitsha1" and size is None:
         return False
-    key = hf_content_key(repo_type, repo_id, etag)
+    if not restore and (size or 0) < t.min_size:
+        return False
+    key = hf_blob_key(repo_type, repo_id, etag)
     if key in _s.bad:
         return False
     blobs = Path(settings.cache_dir) / cachefs.repo_folder_name(repo_id, repo_type) / "blobs"
@@ -418,7 +469,22 @@ async def _fill_blob_locked(repo_type: str, repo_id: str, etag: str, size: int |
                             key: str, blobs: Path, blob: Path, *,
                             stream: bool, on_answer) -> bool:
     lock = hf_lock(repo_type, repo_id, etag)
-    await asyncio.to_thread(lock.acquire)
+    # ACQUIRE AND RELEASE ON THE SAME THREAD. filelock (3.32 here) records who
+    # holds a lock in a PER-THREAD registry. Acquired in one to_thread worker
+    # and released in another, the release cleared nothing, and the acquiring
+    # pool thread kept a stale "held" entry: the next FileLock on this blob to
+    # land on that thread -- another fill, or huggingface_hub's own lock inside
+    # hf_hub_download -- raised "Deadlock ... already held by a different
+    # FileLock instance in this thread". Seen as an intermittent 500 on a blob
+    # filled twice in one process. One single-thread executor per fill.
+    loop = asyncio.get_running_loop()
+    holder = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                   thread_name_prefix="tier-lock")
+    try:
+        await loop.run_in_executor(holder, lock.acquire)
+    except BaseException:
+        holder.shutdown(wait=False)
+        raise
     try:
         if blob.exists():
             return False
@@ -432,7 +498,8 @@ async def _fill_blob_locked(repo_type: str, repo_id: str, etag: str, size: int |
         # tail_follow follows, and is documented as serving unverified bytes.
         tmp = blobs / (f"{etag}.incomplete" if stream else f"{etag}.tier.incomplete")
         try:
-            got, _n = await hash_into(resp, tmp, flush=stream)
+            got, _n = await hash_into(resp, tmp, flush=stream,
+                                      hasher=contenthash.hasher_for(etag, size))
         except (httpx.HTTPError, OSError) as exc:
             tmp.unlink(missing_ok=True)
             metrics.record_tier_request("hf", "blob", "error")
@@ -444,7 +511,7 @@ async def _fill_blob_locked(repo_type: str, repo_id: str, etag: str, size: int |
             await resp.aclose()
         if got != etag:
             tmp.unlink(missing_ok=True)
-            mark_bad(key, f"expected sha256 {etag}, computed {got}")
+            mark_bad(key, f"expected {contenthash.etag_kind(etag)} {etag}, computed {got}")
             if stream:
                 raise TierReadFailed(f"tier bytes for {etag} failed verification")
             return False
@@ -452,7 +519,10 @@ async def _fill_blob_locked(repo_type: str, repo_id: str, etag: str, size: int |
         metrics.record_tier_verify("verified")
         return True
     finally:
-        await asyncio.to_thread(lock.release)
+        try:
+            await loop.run_in_executor(holder, lock.release)
+        finally:
+            holder.shutdown(wait=False)
 
 
 async def fill_hf_blob(job) -> bool:
@@ -566,6 +636,9 @@ class Upload:
     key: str
     path: Path | None = None
     sha256: str | None = None  # hex; for content, the object's NAME
+    # What the NAME is a hash of, and so how the upload re-verifies the bytes:
+    # "sha256", or "gitsha1" for an HF non-LFS file (contenthash's rule).
+    name_kind: str = "sha256"
     content_type: str | None = None
     body: bytes = b""
     metadata: dict[str, str] = field(default_factory=dict)
@@ -592,21 +665,22 @@ def queue_depth() -> int:
     return _s.queue.qsize() if _s.queue is not None else 0
 
 
-def _content(key: str, path: Path, sha_hex: str, content_type: str | None = None) -> Upload:
-    return Upload(kind="content", key=key, path=path, sha256=sha_hex, content_type=content_type)
+def _content(key: str, path: Path, sha_hex: str, content_type: str | None = None,
+             name_kind: str = "sha256") -> Upload:
+    return Upload(kind="content", key=key, path=path, sha256=sha_hex, content_type=content_type,
+                  name_kind=name_kind)
 
 
 def _auth(*sig_args) -> dict[str, str]:
     """The authentication fields for one index object.
 
     Signed when XHC_TIER2_INDEX_KEY is set. Otherwise written anyway and MARKED
-    unsigned in the object, so a later reader never has to infer it from an
-    absent field. Nothing reads the index in phase 1, so an unsigned entry
-    costs no trust today; whether phase 2 will restore from one is a policy
-    decision that has not been made. Writing it keeps that option open, and
-    setting the key from the start keeps the stronger one open too: an entry
-    written unsigned is never re-signed later (index objects are immutable and
-    skipped when they already exist).
+    unsigned in the object, so the reader (app/tierrestore.py) never has to
+    infer it from an absent field. A restore refuses an unsigned entry unless
+    XHC_TIER2_RESTORE_UNSIGNED is on. Setting the key from the start keeps
+    everything restorable under the default: an entry written unsigned is
+    never re-signed later (index objects are immutable and skipped when they
+    already exist).
     """
     if cfg().index_key:
         return {"auth": AUTH_SIGNED, "sig": index_sig(*sig_args)}
@@ -702,21 +776,50 @@ def _hf_job_items(job) -> list[Upload]:
             (job.kind == "file" and getattr(job, "served_from", None) == "tier")
             or etag in getattr(job, "tier_etags", ())
         )
-        if (_SHA256_RE.match(etag) and fresh and not tier_sourced
-                and st.st_size >= t.min_size):
-            item = _content(hf_content_key(job.repo_type, job.repo_id, etag), blob, etag)
+        kind = contenthash.etag_kind(etag)
+        # Git-blob files ignore MIN_SIZE: they are small by nature, and a model
+        # restored without its config.json is not a model.
+        big_enough = kind == "gitsha1" or st.st_size >= t.min_size
+        if kind is not None and fresh and not tier_sourced and big_enough:
+            item = _content(hf_blob_key(job.repo_type, job.repo_id, etag), blob, etag,
+                            name_kind=kind)
             item.then.append(idx)
             items.append(item)
         else:
-            # Git-object files (phase 2 content), content already in the tier,
-            # or content below MIN_SIZE: the mapping is still true, so record it.
+            # Content already in the tier, below MIN_SIZE, or of an unknown
+            # shape: the mapping is still true, so record it.
             loose.append(idx)
+    if getattr(job, "index_restore", None):
+        # Restored FROM the index: the ref -> commit mapping this job used is
+        # an old observation, not something the Hub said now. Writing it again
+        # would stamp it with today's time and hide exactly the staleness a
+        # restore has to report. Nothing new was observed, so nothing is said.
+        return items + loose
     ref = _hf_ref_index(job.repo_type, job.repo_id, job.revision, commit, time.time())
     rkey = (job.repo_type, job.repo_id, job.revision, commit)
     if ref is not None and rkey not in _s.refs_written:
         _s.refs_written.add(rkey)
         loose.append(ref)
     return items + loose
+
+
+def observe_ref(repo_type: str, repo_id: str, ref: str, commit: str) -> None:
+    """Index what the Hub just said a ref points at, from a repo-info answer.
+
+    Without this a client's own snapshot_download never records its ref at
+    all: it asks repo info for `main`, then fetches every file BY COMMIT, and a
+    commit-pinned request observes no ref. The files were indexed; the only way
+    back to them from `main` was not. One immutable object per new
+    (ref, commit) pair per process, like a job's.
+    """
+    if not writable() or not contenthash.GIT_SHA1_RE.match(commit or ""):
+        return
+    rkey = (repo_type, repo_id, ref, commit)
+    if rkey in _s.refs_written:
+        return
+    item = _hf_ref_index(repo_type, repo_id, ref, commit, time.time())
+    if item is not None and enqueue(item):
+        _s.refs_written.add(rkey)
 
 
 async def after_hf_job(job) -> None:
@@ -752,6 +855,13 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _name_hex(name: str, data: bytes) -> str:
+    """What `data` hashes to under the rule its NAME uses (a git blob id here)."""
+    h = contenthash.hasher_for(name, len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
 async def _exists(key: str) -> bool | None:
     r = await _retry(lambda: _s.client.head(key), f"HEAD {key}")
     if r.status_code == 200:
@@ -773,6 +883,11 @@ async def _upload_content(item: Upload) -> str:
     sent from memory (a retry re-sends the buffer, never re-reads the file).
     CompleteMultipartUpload is only called once the whole-object hash has
     matched; on a mismatch the upload is aborted and no object appears.
+
+    A git-blob name (name_kind "gitsha1") is checked with contenthash's rule
+    instead. Its single PUT also computes the body's sha256 from the same
+    in-memory bytes, because SigV4's payload hash is a sha256 whatever the
+    object is named by; the file is still read once.
     """
     t = cfg()
     path = item.path
@@ -791,13 +906,17 @@ async def _upload_content(item: Upload) -> str:
     try:
         if size <= t.part_size:
             data = await asyncio.to_thread(_read_exact, fh, size + 1)
-            got = await asyncio.to_thread(_sha256_hex, data)
+            if item.name_kind == "sha256":
+                got = payload_sha = await asyncio.to_thread(_sha256_hex, data)
+            else:
+                got = await asyncio.to_thread(_name_hex, item.sha256, data)
+                payload_sha = await asyncio.to_thread(_sha256_hex, data)
             if got != item.sha256:
                 log.error("TIER UPLOAD REFUSED: %s hashes to %s, not its name %s. "
                           "Local bytes changed after ingest.", path, got, item.sha256)
                 return "verify_mismatch"
             r = await _retry(
-                lambda: _s.client.put(item.key, data, sha256_hex=item.sha256,
+                lambda: _s.client.put(item.key, data, sha256_hex=payload_sha,
                                       checksum_header=t.checksum_header,
                                       content_type=item.content_type),
                 f"PUT {item.key}",
@@ -814,7 +933,8 @@ async def _upload_content(item: Upload) -> str:
         )
         completed = False
         try:
-            h = hashlib.sha256()
+            h = (hashlib.sha256() if item.name_kind == "sha256"
+                 else contenthash.hasher_for(item.sha256, size))
             parts: list[str] = []
             number = 1
             while True:
@@ -1020,7 +1140,8 @@ def _local_hf(view_repos) -> list[tuple[str, str, Path]]:
         try:
             with os.scandir(blobs) as it:
                 for e in it:
-                    if _SHA256_RE.match(e.name) and e.is_file():
+                    # Both shapes: a sha256 file and a git-blob file.
+                    if contenthash.etag_kind(e.name) and e.is_file():
                         out.append((r.repo_type, r.repo_id, Path(e.path)))
         except OSError:
             continue
@@ -1111,15 +1232,17 @@ async def reconcile() -> dict:
         enq = 0
         view = await cachefs.get_view(force=True)
         for repo_type, repo_id, path in await asyncio.to_thread(_local_hf, view.repos):
-            key = hf_content_key(repo_type, repo_id, path.name)
+            kind = contenthash.etag_kind(path.name)
+            key = hf_blob_key(repo_type, repo_id, path.name)
             if key in content:
                 continue
             try:
-                if path.stat().st_size < cfg().min_size:
+                # Git-blob files are exempt from MIN_SIZE, as at write-back.
+                if kind == "sha256" and path.stat().st_size < cfg().min_size:
                     continue
             except OSError:
                 continue
-            enq += enqueue(_content(key, path, path.name))
+            enq += enqueue(_content(key, path, path.name, name_kind=kind))
         if settings.docker_enabled:
             for kind, up, digest, path, media in await asyncio.to_thread(_local_oci):
                 key = _oci_sharded(up, kind, digest)
@@ -1220,6 +1343,15 @@ async def start() -> None:
         log.warning("XHC_TIER2_READ_MODE=stream serves tier bytes to Hugging Face "
                     "clients BEFORE they are verified; a mismatch is detected only after "
                     "the last byte, when the client has already accepted it.")
+    log.warning("tier restore (serving from the index when the Hub cannot answer): %s",
+                restore_mode())
+    if t.read and t.restore and t.restore_unsigned:
+        log.warning(
+            "XHC_TIER2_RESTORE_UNSIGNED=true: UNSIGNED INDEX ENTRIES WILL BE RESTORED. "
+            "Anyone who can write to this bucket can choose which commit a ref such as "
+            "`main` restores to, and which object a file name resolves to. Content is "
+            "still verified against the ETag the entry names, but the entry itself is "
+            "unauthenticated. Every unsigned restore is logged.")
 
 
 async def stop() -> None:
@@ -1250,10 +1382,37 @@ async def stop() -> None:
             fresh.put_nowait(old.get_nowait())
 
 
+def restore_mode() -> str:
+    """One line saying whether, and on what trust, the index is restored from."""
+    t = cfg()
+    if not t.read:
+        return "off: XHC_TIER2_READ=false"
+    if not t.restore:
+        return "off: XHC_TIER2_RESTORE=false"
+    if t.restore_unsigned:
+        return ("on, signed AND UNSIGNED entries (XHC_TIER2_RESTORE_UNSIGNED=true)"
+                if t.index_key else
+                "on, UNSIGNED entries only: no XHC_TIER2_INDEX_KEY, so no signature can be "
+                "checked (XHC_TIER2_RESTORE_UNSIGNED=true)")
+    if t.index_key:
+        return "on, signed entries only (verified with XHC_TIER2_INDEX_KEY)"
+    return ("off: signed entries are required and XHC_TIER2_INDEX_KEY is unset "
+            "(XHC_TIER2_RESTORE_UNSIGNED=true would restore unsigned ones)")
+
+
+def restore_enabled() -> bool:
+    t = cfg()
+    return (enabled() and t.read and t.restore
+            and bool(t.index_key or t.restore_unsigned))
+
+
 def status() -> dict:
     if not enabled():
         return {"enabled": False}
     t = cfg()
+    from . import tierrestore  # the reader; it imports this module
+
+
     return {
         "enabled": True,
         "url": t.url,
@@ -1264,7 +1423,9 @@ def status() -> dict:
         "read_mode": t.read_mode,
         "index": "signed" if t.index_key else (
             "unsigned: XHC_TIER2_INDEX_KEY is unset. Entries are written and marked "
-            "unsigned; whether a later restore will trust them is not decided"),
+            "unsigned, and a restore refuses them unless XHC_TIER2_RESTORE_UNSIGNED=true"),
+        "restore": {"mode": restore_mode(), "enabled": restore_enabled(),
+                    "unsigned_opt_in": t.restore_unsigned, **tierrestore.status()},
         "healthy": _s.healthy,
         "probe": _s.probe,
         "last_error": _s.last_error,
