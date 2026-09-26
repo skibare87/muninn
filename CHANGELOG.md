@@ -9,6 +9,33 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.27 — 2026-09-25
+
+v0.9.27 -- shutdown can no longer hang on a swallowed cancel
+
+Stopping Muninn could hang forever. Background loops were stopped with
+`task.cancel(); await task`, which assumes a cancelled task always ends. Under
+httpx, anyio's connect_tcp can swallow a cancel that arrives just as a new
+connection is established: the request completes normally and the task
+carries on. An object-store upload worker caught that way went back to waiting
+on its queue, and shutdown waited on it forever. The same exposure applied to
+the tier's probe loop and the orphan sweep. It was reproduced outside Muninn
+with a plain httpx PUT (10 in 4000 cancels swallowed, on Python 3.11 and 3.12).
+It is intermittent and depends on timing.
+
+  - Loops that make HTTP requests now check, at the top of each pass and before
+    they sleep, whether they have been asked to cancel, and exit if so, even
+    when the library swallowed the cancel itself.
+  - Every shutdown step is time-bounded: background tasks at 10 s, tier.stop at
+    30 s, closing HTTP clients at 10 s. An overrun logs a warning naming the
+    step, the task and where it is suspended, then moves on. A step that fails
+    no longer stops the steps after it.
+
+In Kubernetes or compose, the old hang ended in a SIGKILL after the grace
+period. The job ledger is flushed before the step that hung, so no job state
+was lost.
+
+
 ## v0.9.26 — 2026-09-25
 
 v0.9.26 -- an acknowledged push survives losing the blob disk; HTTP clients follow their event loop
