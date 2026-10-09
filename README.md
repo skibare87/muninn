@@ -2245,11 +2245,14 @@ unless `XHC_TIER2` is set; unset, every tier code path is skipped.
   the upstream is spared the request. While the Hub answers, it is still asked
   for metadata (the `HEAD` on every miss), because that is where the expected
   hash comes from.
-- **Restore when the Hub cannot answer.** When the Hub is unreachable, fails
-  with a 5xx, or says a repo or revision no longer exists, Muninn can answer
-  from the bucket's **index** instead: which commit a ref pointed at, which
-  files that commit has, and their ETags. Signed entries only by default. See
-  [Restore from the index](#restore-from-the-index-when-the-hub-cannot-answer).
+- **Restore when the upstream cannot answer.** When the Hub is unreachable,
+  fails with a 5xx, or says a repo or revision no longer exists, Muninn can
+  answer from the bucket's **index** instead: which commit a ref pointed at,
+  which files that commit has, and their ETags. The same holds for an OCI tag
+  when its registry is unreachable or says the tag is gone: the index says
+  which digest the tag last pointed at. Signed entries only by default. See
+  [Restore from the index](#restore-from-the-index-when-the-hub-cannot-answer)
+  and [OCI tags](#oci-tags-restore-when-the-registry-cannot-answer).
 - **Write-back.** After an ingest reaches `done` (verified, when
   `XHC_HF_VERIFY` is on), and after an OCI blob's digest has matched and it is
   renamed into place, the content is copied to the bucket in the background.
@@ -2364,8 +2367,11 @@ that byte in the same pass and sends it.
 - **The queue is in memory, and the bucket is the durable record.** A
   reconciler runs at startup and every `XHC_TIER2_RECONCILE_INTERVAL`. It LISTs
   the content prefix, compares it with what is on local disk, and enqueues the
-  difference. With an index key it also backfills the index for local
-  snapshots and refs. A restart therefore loses nothing but time. Overflow past
+  difference. It also backfills the index for local snapshots, refs and OCI
+  tags (signed with an index key, marked unsigned without one). An OCI tag is
+  backfilled only if the registry was seen to hold it (a pull or prewarm by
+  tag, or a push the registry accepted), stamped with when it was seen, not
+  with the time of the backfill. A restart therefore loses nothing but time. Overflow past
   `XHC_TIER2_QUEUE_MAX` is dropped, counted as `dropped_queue_full`, and picked
   up by the next reconcile.
 - **Evicted before upload:** the item is dropped (`skipped_evicted`). Eviction
@@ -2488,21 +2494,116 @@ prewarms work as before.
 
 **Status and metrics.** `/_cache/status` → `tier.restore` gives the mode (off,
 signed only, or signed and unsigned) and the last attempt.
-`muninn_tier_restore_total{result}` counts attempts: `ok`, `ok_unsigned`,
-`unsigned_refused`, `bad_signature`, `missing` (not in the index),
-`content_missing`, `content_mismatch`, `no_key`, `policy_refused` (the ingest
-size policy still applies), and `error`.
-`muninn_tier_index_reads_total{result}` counts index objects read: `signed_ok`,
-`unsigned_accepted`, `unsigned_refused`, `bad_signature`, `malformed`.
+`muninn_tier_restore_total{proto,result}` counts attempts, with `proto` `hf` or
+`oci`: `ok`, `ok_unsigned`, `unsigned_refused`, `bad_signature`, `missing` (not
+in the index), `content_missing`, `content_mismatch`, `no_key`,
+`policy_refused` (the ingest size policy still applies), and `error`.
+`muninn_tier_index_reads_total{proto,result}` counts index objects read:
+`signed_ok`, `unsigned_accepted`, `unsigned_refused`, `bad_signature`,
+`malformed`. Both gained the `proto` label when OCI restore was added; a
+selector on `result` alone now matches both protocols, so `sum by (result)`
+means what it did before.
+
+### OCI tags: restore when the registry cannot answer
+
+A pull by digest never needed this: blobs and manifests by digest are read
+from the bucket before the registry, so they already survive an outage. A pull
+**by tag** needs to know which digest the tag points at, and that is what the
+index records: one immutable, signed object per observation,
+`index/oci/<upstream>/tags/<repo>/<tag>/<observed_at>-<digest>`.
+
+When the registry cannot answer a pull by tag and nothing is held locally,
+Muninn reads the newest observation that verifies, fetches that manifest by
+digest (local disk, else the bucket, hashed against the digest as it is read),
+and serves it with its own media type and `Docker-Content-Digest`. `HEAD`
+works the same way, and docker sends one first. For a multi-arch index the
+index is restored. The platform manifest docker picks, and its config and
+layers, then follow **by digest** through the ordinary read-through.
+
+**When it restores**, the same policy as the Hub, mapped to the registry:
+
+| the registry | restores? | why |
+|---|---|---|
+| no answer: connection refused, DNS, TLS, timeout | **yes** | an outage |
+| a 5xx | **yes** | an outage |
+| 404 `MANIFEST_UNKNOWN` or `NAME_UNKNOWN` | **yes** | the tag or repository is gone |
+| the **token endpoint** does not answer, or answers 5xx | **yes** | an outage of the registry's auth service |
+| 401 or 403 (`UNAUTHORIZED`, `DENIED`, any code) | **never** | the registry said no |
+| the token endpoint answers 401 or 403 | **never** | the registry's auth service refused this repository |
+| 429 (`TOOMANYREQUESTS`), from the registry or its token endpoint | never | it is alive and says "later" |
+| 404 with any other code, or none | never | a registry names a deleted tag; a bare 404 is as likely a proxy in front of it |
+| a token endpoint answering 200 with no token, or no usable realm | never | an answer this cache cannot use, not an outage |
+
+A local fault is never read as "unreachable", and neither is a protocol error
+that came with a response.
+
+> ⚠ **As on the Hub, a registry that will not leak existence answers 401 for a
+> repository it does not have.** Docker Hub issues an anonymous token for a
+> repository that does not exist and then answers 401. Muninn does not restore
+> on 401, so a **deleted repository** on such a registry does not restore. A
+> deleted **tag** in a repository that still exists answers 404
+> `MANIFEST_UNKNOWN`, and does.
+
+**Trust** is the Hub's. The signature covers the upstream, the repository, the
+tag, the digest, the index version and the observation time, which is read
+from the object's name. So an observation copied to another tag, or replayed
+under a newer name, is refused. A bad signature counts as absent, is counted on
+`muninn_tier_index_reads_total{proto="oci",result="bad_signature"}`, and the
+next older observation is tried. Unsigned observations restore only with
+`XHC_TIER2_RESTORE_UNSIGNED=true`, logged on every restore, and
+`XHC_TIER2_RESTORE=false` turns OCI restore off along with the Hub's. The
+manifest is verified against the digest the verified observation names. A
+same-length forgery in the bucket is refused, marked bad, and nothing is
+served. The media type comes from the manifest's own `mediaType` field, which
+the digest covers, not from the bucket's Content-Type.
+
+**What a restored tag says about itself:** `x-xhc-cache: TIER-RESTORE`,
+`x-xhc-restore-reason` (`unreachable`, `upstream_5xx` or `not_found`),
+`x-xhc-index-auth` (`signed` or `unsigned`), and `x-xhc-ref-observed-at` /
+`x-xhc-ref-age`. **The docker CLI shows none of these:** it prints the status
+and discards headers and body. So every OCI restore is also logged at INFO by
+`xhc.tier.restore`, with the repository, tag, digest and the observation's age,
+and counted on `muninn_tier_restore_total{proto="oci"}` and
+`muninn_docker_requests_total{result="RESTORED",kind="manifest"}`.
+
+**A restored tag may be stale.** It is the digest the tag pointed at **when it
+was last observed**, and the registry may have moved it since, or deleted it on
+purpose. A restore never writes a local tag file and never records a new
+observation, so the next pull by tag asks the registry again and is labelled
+again if it is restored again.
+
+**What survives, precisely.** A tag restores only if, before the registry
+stopped answering:
+
+1. its observation was indexed. That happens when a pull or a prewarm by tag
+   gets an answer from the registry and the mapping is new to this cache or
+   has moved. The reconciler backfills any that did not reach the bucket.
+2. the manifest it names was written back, and for an image manifest, **every
+   blob it names**. Muninn will not serve an image manifest whose config or
+   layers are not on local disk or in the bucket, because the pull would then
+   fail on its first missing layer. An OCI blob smaller than
+   `XHC_TIER2_MIN_SIZE` is never written back, and config blobs are small, so
+   **with `XHC_TIER2_MIN_SIZE` set, image manifests do not restore.**
+3. for a multi-arch index, the platform you need was itself pulled. The index
+   is served whole. A platform this cache never pulled is not in the bucket
+   and fails when docker asks for it by digest.
+
+A client whose `Accept` does not include the observed media type is not served
+a restore of another type. An older observation of an acceptable type is used
+if there is one.
+
+When nothing can be restored, a registry that did not answer is a **502**, not
+a 404. The docker CLI prints 404 as "not found", which is wrong for an outage.
 
 ### What it does, and does not do
 
 | does | does not |
 |---|---|
-| read-through for OCI blobs, OCI manifests by digest, and HF files of both kinds (sha256 and git blob id) | restore an OCI **tag** when the registry is down; a tag still needs the registry |
+| read-through for OCI blobs, OCI manifests by digest, and HF files of both kinds (sha256 and git blob id) | restore an OCI image manifest whose blobs are not all in the bucket, or a platform of an index that was never pulled |
 | write-back after `done`, with the upload-time hash, for both HF kinds | fill git-blob files from the tier during a prewarm while the Hub answers (they are small; the Hub serves them) |
 | write the index: signed with `XHC_TIER2_INDEX_KEY`, marked unsigned without it | restore on a 401 or 403, ever |
 | restore HF files, repo info, tree listings and whole prewarms from the index when the Hub is unreachable, failing, or says the repo is gone | restore anything that was never fetched, written back and indexed |
+| restore OCI tags (GET and HEAD) from the index when the registry or its token endpoint is unreachable or failing, or the registry says the tag is gone | promise a restored tag is current: it is the last observation, labelled with its age |
 | verify every tier read, and every index entry's signature | AWS role credentials (IRSA, EKS Pod Identity, instance profiles) |
 | static keys, and a GKE metadata-server token for GCS | parallel ranged reads from the tier: one stream per object |
 | | delete anything from the tier, ever |
@@ -2596,13 +2697,13 @@ entries need the same `XHC_TIER2_INDEX_KEY`.
 | `XHC_TIER2_SECRET_ACCESS_KEY[_FILE]` | — | static secret, or a file holding it |
 | `XHC_TIER2_READ` / `XHC_TIER2_WRITE` | `true` / `true` | a read-only replica, or a write-only seeding instance |
 | `XHC_TIER2_READ_MODE` | `verify-first` | `verify-first` \| `stream`. `stream` serves unverified bytes; see above |
-| `XHC_TIER2_MIN_SIZE` | `0` | skip the tier for smaller Hugging Face files, and don't write back OCI blobs smaller than this. OCI blob reads cannot apply it, because their size is unknown before the request. Manifests and HF git-blob files are exempt from write-back's limit, and a restore ignores it: when the Hub cannot answer, the tier is the only source |
+| `XHC_TIER2_MIN_SIZE` | `0` | skip the tier for smaller Hugging Face files, and don't write back OCI blobs smaller than this. OCI blob reads cannot apply it, because their size is unknown before the request. Manifests and HF git-blob files are exempt from write-back's limit, and a restore ignores it: when the Hub cannot answer, the tier is the only source. Set above a config blob's size, it stops OCI image manifests restoring, because their small blobs were never written back |
 | `XHC_TIER2_PART_SIZE` | `64M` | single PUT up to this size, multipart above it. Minimum `5M` (S3's floor). Also the memory one upload holds |
 | `XHC_TIER2_UPLOAD_CONCURRENCY` | `2` | concurrent uploads |
 | `XHC_TIER2_QUEUE_MAX` | `10000` | in-memory upload queue bound; the reconciler covers overflow |
 | `XHC_TIER2_RECONCILE_INTERVAL` | `21600` | seconds between reconciles (and one at startup); `0` disables, and the queue is then best-effort |
 | `XHC_TIER2_INDEX_KEY[_FILE]` | *(unset)* | HMAC key for index objects, and the only thing a restore verifies them with. Unset: the index is still written, **unsigned**, and marked so, and restore is off unless the opt-in below is set; see the trust section |
-| `XHC_TIER2_RESTORE` | `true` | restore from the index when the Hub is unreachable, fails with a 5xx, or 404s the repo or revision. Never on a 401 or 403. `false` turns restore off and keeps read-through and write-back |
+| `XHC_TIER2_RESTORE` | `true` | restore from the index when the Hub is unreachable, fails with a 5xx, or 404s the repo or revision, and an OCI tag when its registry is unreachable, fails with a 5xx, or 404s the tag (`MANIFEST_UNKNOWN`, `NAME_UNKNOWN`). Never on a 401 or 403. `false` turns restore off for both and keeps read-through and write-back |
 | `XHC_TIER2_RESTORE_UNSIGNED` | `false` | also restore **unsigned** index entries. Anyone who can write the bucket can then choose what a ref restores to. Logged at startup and on every unsigned restore |
 | `XHC_TIER2_CHECKSUM_HEADER` | `true` (s3), `false` (gs) | also send `x-amz-checksum-sha256` on single PUTs |
 
@@ -2610,8 +2711,8 @@ Tier metrics: `muninn_tier_requests_total{proto,kind,result=hit|miss|error|refus
 `muninn_tier_verify_total{result=verified|mismatch}`,
 `muninn_tier_upload_total{result=ok|failed|skipped_exists|skipped_evicted|verify_mismatch|dropped_queue_full}`,
 `muninn_tier_index_writes_total{result=signed|unsigned|failed|skipped_exists}`,
-`muninn_tier_restore_total{result=ok|ok_unsigned|unsigned_refused|bad_signature|missing|content_missing|content_mismatch|no_key|policy_refused|error}`,
-`muninn_tier_index_reads_total{result=signed_ok|unsigned_accepted|unsigned_refused|bad_signature|malformed}`,
+`muninn_tier_restore_total{proto=hf|oci,result=ok|ok_unsigned|unsigned_refused|bad_signature|missing|content_missing|content_mismatch|no_key|policy_refused|error}`,
+`muninn_tier_index_reads_total{proto=hf|oci,result=signed_ok|unsigned_accepted|unsigned_refused|bad_signature|malformed}`,
 `muninn_tier_bytes_read_total` and `muninn_tier_bytes_written_total` (body
 bytes only; a HEAD is never counted), and the gauges `muninn_tier_healthy`,
 `muninn_tier_upload_queue_depth`, `muninn_tier_objects`, `muninn_tier_bytes`
