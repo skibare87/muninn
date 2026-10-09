@@ -42,6 +42,7 @@ from . import (
     registry,
     shutdown,
     statedir,
+    tier,
 )
 from .cachefs import StateUnavailable
 from .config import settings
@@ -337,9 +338,18 @@ async def _fetch_closure(job: PrewarmJob, ref: registry.Ref,
         ocistore.store_manifest(ref.upstream, digest, body, media)
         manifests.append(digest)
         job.manifests_done += 1
-        if not ocistore.DIGEST_RE.match(r):
+        by_tag = not ocistore.DIGEST_RE.match(r)
+        if by_tag:
             ocistore.write_tag(ref.upstream, ref.repo, r,
-                               ocistore.accept_fingerprint(_ACCEPT), digest, media)
+                               ocistore.accept_fingerprint(_ACCEPT), digest, media,
+                               observed=True)
+        # Write-back, as a pull does (ocicompat._revalidate_tag). Without it a
+        # prewarmed tag was never observed in the tier's index at all: the
+        # prewarm stored the tag, every later pull was a local HIT that never
+        # asked the registry, and so nothing ever recorded what the tag pointed
+        # at. Its manifests reached the bucket only at the next reconcile.
+        tier.enqueue_oci_manifest(ref.upstream, digest, media,
+                                  ref.repo if by_tag else None, r if by_tag else None)
         doc = json.loads(body)
         for child in doc.get("manifests") or []:
             if child.get("digest"):

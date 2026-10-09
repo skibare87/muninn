@@ -264,6 +264,17 @@ def read_tag(upstream: str, repo: str, tag: str, accept_fp: str) -> dict | None:
         return None
 
 
+def accepts(accept: str | None, media_type: str | None) -> bool:
+    """Whether a client sending `accept` takes a manifest of `media_type`.
+
+    No Accept, or */*, takes anything. Parameters (`;q=0.5`) are ignored, as
+    registries ignore them.
+    """
+    wanted = {t.split(";")[0].strip().lower() for t in (accept or "").split(",") if t.strip()}
+    media = (media_type or "").split(";")[0].strip().lower()
+    return not wanted or "*/*" in wanted or media in wanted
+
+
 def read_tag_compatible(upstream: str, repo: str, tag: str, accept: str | None) -> dict | None:
     """Find any stored mapping for this tag whose media type the client accepts.
 
@@ -280,7 +291,6 @@ def read_tag_compatible(upstream: str, repo: str, tag: str, accept: str | None) 
     d = tag_path(upstream, repo, tag, "x").parent
     if not d.is_dir():
         return None
-    wanted = {t.split(";")[0].strip().lower() for t in (accept or "").split(",") if t.strip()}
     prefix = f"{_safe(tag)}@"
     best = None
     for f in sorted(d.glob(f"{prefix}*.json")):
@@ -290,8 +300,7 @@ def read_tag_compatible(upstream: str, repo: str, tag: str, accept: str | None) 
             continue
         if not entry.get("digest"):
             continue
-        media = (entry.get("media_type") or "").split(";")[0].strip().lower()
-        acceptable = not wanted or "*/*" in wanted or media in wanted
+        acceptable = accepts(accept, entry.get("media_type"))
         fresher = best is None or float(entry.get("checked_at") or 0) > float(
             best.get("checked_at") or 0
         )
@@ -301,18 +310,69 @@ def read_tag_compatible(upstream: str, repo: str, tag: str, accept: str | None) 
 
 
 def write_tag(
-    upstream: str, repo: str, tag: str, accept_fp: str, digest: str, media_type: str
+    upstream: str, repo: str, tag: str, accept_fp: str, digest: str, media_type: str,
+    *, observed: bool = False,
 ) -> None:
-    _atomic_write(
-        tag_path(upstream, repo, tag, accept_fp),
-        json.dumps(
-            {
-                "digest": digest,
-                "media_type": media_type,
-                "checked_at": time.time(),
-            }
-        ).encode(),
-    )
+    """Record tag -> digest.
+
+    `observed` means the UPSTREAM said so just now (a 200 to a pull by tag, a
+    201 to a pushed manifest), as opposed to this cache holding a mapping it
+    has not yet delivered. Only an observed mapping carries `observed_at`, and
+    only those are backfilled into the tier's index (tier.reconcile): an
+    observation there is a claim about what the registry held, and a
+    store-forward push the registry has not accepted yet is not one.
+
+    The upstream, repo and tag are stored as given, because the directory
+    names are flattened (`localhost:5000` becomes `localhost_5000`) and an
+    index entry is signed over the real names.
+    """
+    now = time.time()
+    entry = {
+        "digest": digest,
+        "media_type": media_type,
+        "checked_at": now,
+        "upstream": upstream,
+        "repo": repo,
+        "tag": tag,
+    }
+    if observed:
+        entry["observed_at"] = now
+    _atomic_write(tag_path(upstream, repo, tag, accept_fp), json.dumps(entry).encode())
+
+
+def iter_observed_tags() -> list[dict]:
+    """Every local tag mapping the upstream was seen to hold, with its names.
+
+    Entries written before names were recorded, and unobserved ones, are
+    skipped: there is nothing true to sign for them. Walks only this cache's
+    own tags/ directories.
+    """
+    out: list[dict] = []
+    r = root()
+    try:
+        ups = [p for p in r.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    for up in ups:
+        tags_root = up / "tags"
+        if not tags_root.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(tags_root):
+            for fn in files:
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    e = json.loads((Path(dirpath) / fn).read_text())
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(e, dict):
+                    continue
+                if (DIGEST_RE.match(str(e.get("digest") or ""))
+                        and all(isinstance(e.get(k), str) and e.get(k)
+                                for k in ("upstream", "repo", "tag"))
+                        and isinstance(e.get("observed_at"), int | float)):
+                    out.append(e)
+    return out
 
 
 def touch_tag(upstream: str, repo: str, tag: str, accept_fp: str) -> None:

@@ -1251,7 +1251,9 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
         if r.status_code not in (201, 202):
             raise PushError(502, "UNAVAILABLE",
                             f"{ref.upstream} rejected the manifest: {r.status_code}")
-        _store_manifest(ref, digest, body, media_type, reference)
+        # The registry accepted it: a mapping the upstream holds, as observed as
+        # one a pull reads back. Store-forward below has not been accepted yet.
+        _store_manifest(ref, digest, body, media_type, reference, observed=True)
         return digest
 
     # store-forward: land it, answer, deliver behind -- after its blobs.
@@ -1273,12 +1275,13 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
 
 
 def _store_manifest(ref, digest, body, media_type, reference, *,
-                    force_keep: bool = False) -> None:
+                    force_keep: bool = False, observed: bool = False) -> None:
     if not (settings.docker_cache_on_push or force_keep):
         return
     ocistore.store_manifest(ref.upstream, digest, body, media_type)
     ocistore.write_tag(ref.upstream, ref.repo, reference,
-                       ocistore.accept_fingerprint(media_type), digest, media_type)
+                       ocistore.accept_fingerprint(media_type), digest, media_type,
+                       observed=observed and not ocistore.DIGEST_RE.match(reference))
 
 
 async def _forward_manifest_later(ref, body, media_type, reference, digest, key):

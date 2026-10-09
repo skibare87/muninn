@@ -15,7 +15,8 @@ THE SPLIT THIS IS BUILT ON.
 - MAPPINGS (revision -> commit -> file -> etag, tag -> digest) are only as
   trustworthy as whoever can write the bucket. They are written here as an
   index -- HMAC-signed when XHC_TIER2_INDEX_KEY is set, marked unsigned when it
-  is not -- and READ only by app/tierrestore.py, when the Hub cannot answer.
+  is not -- and READ only by app/tierrestore.py, when the Hub or a registry
+  cannot answer.
   That reader verifies the signature with the configured key and refuses an
   unsigned entry unless XHC_TIER2_RESTORE_UNSIGNED is on.
 
@@ -1216,6 +1217,32 @@ def _local_oci() -> list[tuple[str, str, str, Path, str | None]]:
     return out
 
 
+async def _backfill_oci_tags() -> int:
+    """Index every locally held, upstream-observed tag the bucket has no
+    observation of. The OCI half of the ref backfill above.
+
+    A pull writes a tag observation only when the mapping it holds MOVES
+    (ocicompat._revalidate_tag), so one whose PUT was dropped (queue full, the
+    tier unhealthy at the time) was never retried: the next revalidation finds
+    the same digest and writes nothing. Any observation of the tag at that
+    digest is enough, as for refs. The observation time is when the registry
+    was last seen to say so (the tag file's `observed_at`), never now: a
+    backfill must not make an old answer look fresh.
+    """
+    index = await _list_keys(f"{_base()}/index/oci/")
+    seen = {(k.rsplit("/", 1)[0], k.rsplit("/", 1)[1].split("-", 1)[-1]) for k in index}
+    n = 0
+    for e in await asyncio.to_thread(ocistore.iter_observed_tags):
+        up, repo, tag, digest = e["upstream"], e["repo"], e["tag"], e["digest"]
+        tag_dir = oci_tag_index_key(up, repo, tag, 0, digest).rsplit("/", 1)[0]
+        if (tag_dir, digest) in seen:
+            continue
+        seen.add((tag_dir, digest))
+        media = e.get("media_type") or "application/vnd.oci.image.manifest.v1+json"
+        n += enqueue(_oci_tag_index(up, repo, tag, digest, float(e["observed_at"]), media))
+    return n
+
+
 async def reconcile() -> dict:
     """Enqueue whatever is held locally and absent from the tier.
 
@@ -1279,6 +1306,8 @@ async def reconcile() -> dict:
             item = _hf_ref_index(repo_type, repo_id, ref, commit, mtime)
             if item is not None:
                 ienq += enqueue(item)
+        if settings.docker_enabled:
+            ienq += await _backfill_oci_tags()
         summary["index_enqueued"] = ienq
         summary["ok"] = True
     except s3client.TierAuthError as exc:
