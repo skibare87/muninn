@@ -9,6 +9,54 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.34 — 2026-10-09
+
+v0.9.34 -- container images survive the upstream registry going away
+
+With the object-store tier on (XHC_TIER2), a pull BY TAG is now served from the
+bucket when the upstream registry is unreachable or the tag has been deleted,
+as v0.9.33 already did for Hugging Face. Muninn reads the newest signed
+observation of the tag from the index. It then fetches the manifest by digest,
+from local disk or the tier, verifies it against that digest, and serves it.
+A multi-arch index restores whole; platform manifests and blobs follow by
+digest through the existing read-through. HEAD works as well as GET.
+
+When it restores:
+  - transport failure, 5xx, or 404 MANIFEST_UNKNOWN / NAME_UNKNOWN.
+  - never on 401 or 403 (UNAUTHORIZED, DENIED), 429, or a 404 with no code.
+  - the registry's token endpoint is judged first. If it is down, that counts
+    as an outage and restore is allowed. If it refuses, that is a refusal and
+    nothing restores.
+  - a deleted tag in a live repo restores. Docker Hub answers a deleted
+    repository with 401, so that does not.
+
+Trust and visibility:
+  - Restore requires a signed index entry, exactly as for HF. The signature
+    covers upstream, repo, tag, digest, observed time and version. Unsigned
+    entries restore only with XHC_TIER2_RESTORE_UNSIGNED=true.
+    XHC_TIER2_RESTORE=false turns restore off.
+  - Restored responses carry x-xhc-cache: TIER-RESTORE, the reason, the index
+    auth state, and the tag observation's time and age. The docker CLI does
+    not show headers, so every OCI restore is also logged at INFO with repo,
+    tag, digest and age.
+  - Metrics: muninn_tier_restore_total and muninn_tier_index_reads_total gain a
+    proto label (hf | oci).
+
+Recording fixes, without which there would have been nothing to restore:
+  - A prewarm by tag now records a tag observation.
+  - A dropped observation upload is retried.
+  - Reconcile backfills OCI tag observations as it already did HF refs.
+  - Tag files record when the registry last confirmed the mapping, and only a
+    real confirmation moves it.
+
+Behaviour change: a registry outage with nothing cached or restorable now
+answers 502, not 404. The docker CLI prints a 404 as "not found", which hid
+the outage.
+
+Limit: if XHC_TIER2_MIN_SIZE is set, small config blobs are never written
+back, so image manifests cannot restore.
+
+
 ## v0.9.33 — 2026-09-26
 
 v0.9.33 -- object-store tier phase 2: a cached model survives the Hub going away
