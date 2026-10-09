@@ -266,11 +266,14 @@ def _blob(etag: str) -> Path:
 
 
 def _restore_counts() -> dict:
-    return {k: v for k, v in metrics.snapshot()["tier_restore"].items() if v}
+    # HF only, keyed by result: the metric carries proto (hf|oci) since OCI restore.
+    return {k[3:]: v for k, v in metrics.snapshot()["tier_restore"].items()
+            if v and k.startswith("hf|")}
 
 
 def _index_reads() -> dict:
-    return {k: v for k, v in metrics.snapshot()["tier_index_reads"].items() if v}
+    return {k[3:]: v for k, v in metrics.snapshot()["tier_index_reads"].items()
+            if v and k.startswith("hf|")}
 
 
 def _iso(ms: int) -> str:

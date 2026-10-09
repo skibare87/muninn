@@ -197,12 +197,24 @@ async def _fetch_token(ref: Ref, challenge: dict, out: dict | None = None) -> st
                      refusal is indistinguishable from "no such repository".
         unreachable  transport error or 5xx -- we never got an answer. This is
                      what a gateway failure actually is.
-        unusable     a realm we cannot or must not use, or a 200 with no token.
+        unusable     a realm we cannot or must not use, or a 200 with no token
+                     (or a 200 whose body is not JSON at all).
+
+    `out["token_status"]` is the token endpoint's status (None when there was
+    no response), and `out["token_transport"]` says whether the failure was a
+    TRANSPORT failure -- connection refused, DNS, TLS, timeout -- rather than
+    a local fault such as a realm httpx cannot parse. "unreachable" folds 5xx,
+    429 and transport errors together, which is right for the error a client
+    sees and wrong for deciding to serve a restored tag (tierrestore): a
+    rate-limited token endpoint is ALIVE, and a local fault says nothing about
+    the registry.
     """
 
-    def _mark(state: str) -> None:
+    def _mark(state: str, status: int | None = None, transport: bool = False) -> None:
         if out is not None:
             out["token"] = state
+            out["token_status"] = status
+            out["token_transport"] = transport
 
     realm = challenge.get("realm")
     if not realm:
@@ -230,20 +242,25 @@ async def _fetch_token(ref: Ref, challenge: dict, out: dict | None = None) -> st
         # ValueError as well: httpx raises it out of urllib for a malformed URL
         # rather than as an httpx error. Belt and braces behind the check above.
         log.warning("token fetch failed for %s: %s", ref.upstream, exc)
-        _mark("unreachable")
+        _mark("unreachable", None, isinstance(exc, httpx.TransportError))
         return None
     if r.status_code != 200:
         log.warning("token endpoint %s returned %s for %s", realm, r.status_code, ref.key)
         # 401/403 is the auth service ANSWERING: it understood the request and
         # refused this scope. Anything else -- 5xx, 429, a redirect loop -- is a
         # failure to get an answer at all, and only that is a gateway problem.
-        _mark("declined" if r.status_code in (401, 403) else "unreachable")
+        _mark("declined" if r.status_code in (401, 403) else "unreachable", r.status_code)
         return None
-    body = r.json()
-    token = body.get("token") or body.get("access_token")
+    # A 200 that is not JSON (a captive portal, an HTML error page behind a
+    # proxy) used to raise out of here as a 500. It is an answer we cannot use.
+    try:
+        body = r.json()
+    except ValueError:
+        body = None
+    token = (body.get("token") or body.get("access_token")) if isinstance(body, dict) else None
     if not token:
         log.warning("token endpoint %s returned 200 with no token for %s", realm, ref.key)
-        _mark("unusable")
+        _mark("unusable", 200)
         return None
     ttl = float(body.get("expires_in") or 300)
     # Expire a little early rather than discovering staleness mid-pull.

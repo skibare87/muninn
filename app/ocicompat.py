@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -27,7 +28,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from . import dockerauth, metrics, ocigc, ocipush, ocistore, policy, registry, serving, tier
+from . import (
+    dockerauth,
+    metrics,
+    ocigc,
+    ocipush,
+    ocistore,
+    policy,
+    registry,
+    serving,
+    tier,
+    tierrestore,
+)
 from .config import settings
 
 log = logging.getLogger("xhc.oci")
@@ -145,6 +157,16 @@ def _unavailable(ref: registry.Ref, up: dict | int | None,
                     f"{ref.upstream} returned {upstream_status} for {reference}",
                     {"x-xhc-upstream-status": str(upstream_status),
                      "x-xhc-upstream-auth": "n/a"})
+    # NO ANSWER AT ALL is a gateway failure, not an absence. It used to fall
+    # through to the 404 below, so a registry outage with nothing cached (and,
+    # since the tier restores tags, nothing restorable) printed "not found" --
+    # the one status the docker CLI erases, on the one failure that is not
+    # about the image.
+    if upstream_status is None:
+        return _err(502, "UNAVAILABLE",
+                    f"could not get an answer from {ref.upstream} for {reference}, and "
+                    "this cache holds no copy it may serve",
+                    {"x-xhc-upstream-status": "none", "x-xhc-upstream-auth": "n/a"})
     if upstream_status != 401:
         return _err(404, unknown, f"{kind} {reference} not available",
                     {"x-xhc-upstream-status": str(upstream_status or "none"),
@@ -666,6 +688,21 @@ def _resolve_or_error(name: str, request: Request, operation: str = "pull"):
     return ref, None
 
 
+def _error_code(r) -> str | None:
+    """The first OCI error code in a registry's error body, or None.
+
+    {"errors": [{"code": "MANIFEST_UNKNOWN", ...}]} is the spec's shape. Any
+    other body -- empty, HTML from a proxy, JSON of another shape -- has no
+    code, and the restore rule treats a 404 without one as not a deletion.
+    """
+    try:
+        doc = json.loads(r.content or b"")
+        code = doc["errors"][0]["code"]
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
 async def _revalidate_tag(
     ref: registry.Ref,
     tag: str,
@@ -686,11 +723,17 @@ async def _revalidate_tag(
                                out=out)
     except httpx.HTTPError as exc:
         metrics.record_docker_upstream(ref.upstream, None)
+        if out is not None:
+            # Only a transport failure is "the registry did not answer"; a
+            # protocol or decoding error is a response this cache could not use.
+            out["transport"] = isinstance(exc, httpx.TransportError)
         log.info("tag revalidation failed for %s:%s (%s) -- serving cached", ref.key, tag, exc)
         return None
     metrics.record_docker_upstream(ref.upstream, r.status_code)
     if out is not None:
         out["status"] = r.status_code
+        if r.status_code != 200:
+            out["error_code"] = _error_code(r)
     if r.status_code != 200:
         log.info(
             "tag revalidation got %s for %s:%s -- serving cached if held",
@@ -712,7 +755,7 @@ async def _revalidate_tag(
     except ocistore.DigestMismatch as exc:
         log.error("manifest digest mismatch from %s for %s:%s: %s", ref.upstream, ref.key, tag, exc)
         return None
-    ocistore.write_tag(ref.upstream, ref.repo, tag, accept_fp, digest, media)
+    ocistore.write_tag(ref.upstream, ref.repo, tag, accept_fp, digest, media, observed=True)
     if tier.writable():
         # A tag observation is written to the index only when the mapping this
         # cache holds CHANGES (or is new): one object per revalidation would be
@@ -827,6 +870,24 @@ async def manifests(name: str, reference: str, request: Request) -> Response:
             ocigc.mark_orphan(ref.upstream, ref.repo, reference)
             metrics.record_docker("RETAINED", "manifest")
             return _manifest_response(held, head)
+
+    # Nothing held locally: the tier's index, if the registry's failure is one
+    # that restores (tierrestore.trigger_for_registry) -- never a 401, 403 or 429.
+    # A restore puts a manifest on local disk, as a miss does, so it is subject
+    # to the pull policy as a miss is (the digest path's tier read is too).
+    trigger = tierrestore.trigger_for_registry(up) if tier.enabled() else None
+    if trigger is not None and not verdict.allowed:
+        return _denied(verdict.reason, "manifest")
+    if trigger is not None:
+        restored = await tierrestore.restore_oci_tag(ref.upstream, ref.repo, reference,
+                                                     accept, trigger)
+        if restored is not None:
+            metrics.record_docker("RESTORED", "manifest")
+            resp = _manifest_response(
+                ocistore.StoredManifest(body=restored.body, media_type=restored.media_type,
+                                        digest=restored.digest), head)
+            resp.headers.update(restored.headers)
+            return resp
     return _unavailable(ref, up, reference, "manifest")
 
 

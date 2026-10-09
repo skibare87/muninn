@@ -382,7 +382,77 @@ def test_restore_from_a_signed_index_on_a_real_server(live, tmp_path):
     assert listing is not None and sorted(listing[1]) == sorted(good)
     assert refused is None
     counts = metrics.snapshot()["tier_restore"]
-    assert counts["ok"] == len(good) + 1 and counts["content_mismatch"] == 1
-    assert metrics.snapshot()["tier_index_reads"]["signed_ok"] >= len(good) + 1
+    assert counts["hf|ok"] == len(good) + 1 and counts["hf|content_mismatch"] == 1
+    assert metrics.snapshot()["tier_index_reads"]["hf|signed_ok"] >= len(good) + 1
     tampered_blob = (Path(settings.cache_dir) / "models--acme--tampered" / "blobs")
     assert not any(tampered_blob.glob("[0-9a-f]*")) if tampered_blob.exists() else True
+
+
+def test_oci_tag_restore_from_a_signed_index_on_a_real_server(live, tmp_path):
+    """OCI restore against real S3 semantics. A manifest, its blobs and a signed
+    tag observation go up through the real upload path; the real reader then
+    LISTs the tag's observations, HEADs one and reads its signature back from
+    MinIO's user metadata, fetches the manifest by digest and verifies it. A
+    second tag whose manifest object was overwritten with same-length bytes is
+    refused by digest and nothing is stored locally."""
+    import json
+
+    from app import ocistore, tierrestore
+
+    up, repo = "registry.minio.test", "team/app"
+    config = b'{"architecture":"amd64","os":"linux"}'
+    layer = os.urandom(200_000)
+
+    def d(b: bytes) -> str:
+        return "sha256:" + hashlib.sha256(b).hexdigest()
+
+    manifest = json.dumps({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": d(config), "size": len(config)},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": d(layer), "size": len(layer)}],
+    }, separators=(",", ":")).encode()
+    media = "application/vnd.oci.image.manifest.v1+json"
+
+    async def upload(tag: str) -> None:
+        for b in (config, layer):
+            p = tmp_path / d(b)[7:]
+            p.write_bytes(b)
+            assert await tier.process(tier._content(tier.oci_blob_key(up, d(b)), p,
+                                                    d(b)[7:])) in ("ok", "skipped_exists")
+        p = tmp_path / f"manifest-{tag}"
+        p.write_bytes(manifest)
+        item = tier._content(tier.oci_manifest_key(up, d(manifest)), p, d(manifest)[7:],
+                             content_type=media)
+        item.then.append(tier._oci_tag_index(up, repo, tag, d(manifest), time.time(), media))
+        assert await tier.process(item) in ("ok", "skipped_exists")
+
+    async def scenario():
+        assert (await tier.probe())["ok"]
+        await upload("v1")
+        good = await tierrestore.restore_oci_tag(up, repo, "v1", None, "unreachable")
+        # Tamper with the manifest object, drop the local copy, restore another tag.
+        await upload("v2")
+        wrong = manifest.replace(b'"schemaVersion":2', b'"schemaVersion":3')
+        assert len(wrong) == len(manifest) and wrong != manifest
+        r = await tier._s.client.put(tier.oci_manifest_key(up, d(manifest)), wrong,
+                                     content_type=media)
+        assert r.status_code == 200, r.text
+        back = await tier._s.client.get_bytes(tier.oci_manifest_key(up, d(manifest)))
+        assert back.content == wrong, "the tamper did not land"
+        ocistore.manifest_path(up, d(manifest)).unlink()
+        bad = await tierrestore.restore_oci_tag(up, repo, "v2", None, "unreachable")
+        return good, bad
+
+    good, bad = _run(scenario())
+    assert good is not None
+    assert good.body == manifest and good.digest == d(manifest) and good.media_type == media
+    assert good.headers["x-xhc-cache"] == "TIER-RESTORE"
+    assert good.headers["x-xhc-index-auth"] == "signed"
+    assert good.headers["x-xhc-ref-observed-at"].endswith("Z")
+    assert bad is None
+    assert not ocistore.manifest_path(up, d(manifest)).exists()
+    counts = metrics.snapshot()["tier_restore"]
+    assert counts["oci|ok"] == 1 and counts["oci|content_mismatch"] == 1
+    assert metrics.snapshot()["tier_index_reads"]["oci|signed_ok"] == 2

@@ -58,6 +58,12 @@ _tier_index_writes: Counter[str] = Counter()  # signed | unsigned | failed | ski
 # authentication said. A ref walk that skips a bad signature and restores from
 # an older observation is one "ok" restore and one "bad_signature" read, so the
 # second counter is where a tampered entry shows up.
+#
+# Both carry `proto` (hf | oci), keyed "<proto>|<result>". A label rather than a
+# sibling metric: the outcomes are the same set for both protocols, so one
+# metric keeps "sum by (result)" meaning what it meant before OCI restore
+# existed, and the cardinality is fixed at 2 x 10 and 2 x 5 series. A selector
+# on `result` alone keeps matching; it now matches both protocols.
 _tier_restore: Counter[str] = Counter()
 _tier_index_reads: Counter[str] = Counter()
 # BODY bytes only. A HEAD transfers none and is never counted here -- the
@@ -77,12 +83,17 @@ _TIER_UPLOAD_SERIES: tuple[str, ...] = (
     "dropped_queue_full",
 )
 _TIER_INDEX_SERIES: tuple[str, ...] = ("signed", "unsigned", "failed", "skipped_exists")
-_TIER_RESTORE_SERIES: tuple[str, ...] = (
-    "ok", "ok_unsigned", "unsigned_refused", "bad_signature", "missing",
-    "content_missing", "content_mismatch", "no_key", "policy_refused", "error",
+_TIER_PROTOS: tuple[str, ...] = ("hf", "oci")
+_TIER_RESTORE_SERIES: tuple[str, ...] = tuple(
+    f"{proto}|{result}" for proto in _TIER_PROTOS for result in (
+        "ok", "ok_unsigned", "unsigned_refused", "bad_signature", "missing",
+        "content_missing", "content_mismatch", "no_key", "policy_refused", "error",
+    )
 )
-_TIER_INDEX_READ_SERIES: tuple[str, ...] = (
-    "signed_ok", "unsigned_accepted", "unsigned_refused", "bad_signature", "malformed",
+_TIER_INDEX_READ_SERIES: tuple[str, ...] = tuple(
+    f"{proto}|{result}" for proto in _TIER_PROTOS for result in (
+        "signed_ok", "unsigned_accepted", "unsigned_refused", "bad_signature", "malformed",
+    )
 )
 
 # Bounds the label cardinality: a client that sends a unique header per request
@@ -99,6 +110,7 @@ _DOCKER_SERIES: tuple[tuple[str, str], ...] = (
     ("HIT", "manifest"), ("HIT", "blob"),
     ("MISS", "manifest"), ("MISS", "blob"),
     ("RETAINED", "manifest"),
+    ("RESTORED", "manifest"),
     ("DENIED", "manifest"), ("DENIED", "blob"),
     ("UPSTREAM_AUTH", "manifest"), ("UPSTREAM_AUTH", "blob"),
     ("PROXIED", "tags"), ("PROXIED", "referrers"),
@@ -239,14 +251,14 @@ def record_tier_index_write(result: str) -> None:
         _tier_index_writes[result] += 1
 
 
-def record_tier_restore(result: str) -> None:
+def record_tier_restore(result: str, proto: str = "hf") -> None:
     with _lock:
-        _tier_restore[result] += 1
+        _tier_restore[f"{proto}|{result}"] += 1
 
 
-def record_tier_index_read(result: str) -> None:
+def record_tier_index_read(result: str, proto: str = "hf") -> None:
     with _lock:
-        _tier_index_reads[result] += 1
+        _tier_index_reads[f"{proto}|{result}"] += 1
 
 
 def record_tier_bytes(read: int = 0, written: int = 0) -> None:
@@ -407,11 +419,16 @@ def render(gauges: dict[str, float], help_text: dict[str, str] | None = None) ->
         ("muninn_tier_upload_total", "tier_upload"),
         ("muninn_tier_index_writes_total", "tier_index_writes"),
         ("muninn_hf_writes_total", "hf_writes"),
+    ):
+        emit(name, "counter",
+             [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap[key].items())])
+    for name, key in (
         ("muninn_tier_restore_total", "tier_restore"),
         ("muninn_tier_index_reads_total", "tier_index_reads"),
     ):
         emit(name, "counter",
-             [(f'{{result="{_escape(k)}"}}', v) for k, v in sorted(snap[key].items())])
+             [(f'{{proto="{_escape(k.split("|")[0])}",result="{_escape(k.split("|")[1])}"}}',
+               v) for k, v in sorted(snap[key].items())])
     emit("muninn_tier_bytes_read_total", "counter", [("", snap["tier_bytes_read"])])
     emit("muninn_tier_bytes_written_total", "counter", [("", snap["tier_bytes_written"])])
     emit("muninn_bytes_served_total", "counter", [("", snap["bytes_served"])])
