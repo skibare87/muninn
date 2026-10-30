@@ -18,6 +18,19 @@ not change).
 The image is a real multi-arch shape: an OCI index naming two platform
 manifests, each with a config blob and one layer, every digest computed here
 from the bytes.
+
+BLOBS AND MANIFESTS ARE SCOPED PER REPOSITORY, as a real registry scopes them.
+A blob pushed to (or mounted into) repository A is NOT visible from repository
+B: HEAD and GET on B answer 404 until it is uploaded or mounted there. A fake
+that kept one global blob table would hide exactly the defect where a blob
+present in one repository was assumed present in another.
+
+It also accepts pushes: POST/PATCH/PUT upload sessions (with cross-repository
+mount), and manifest PUTs. By default it accepts a manifest WITHOUT checking
+that the repository holds what it references -- as some real registries do --
+and records, at the moment of every manifest PUT, which referenced blobs were
+missing. `events` is one ordered log of every blob HEAD answer and every
+manifest PUT, so a test can assert what was confirmed before a manifest arrived.
 """
 
 from __future__ import annotations
@@ -27,8 +40,9 @@ import http.server
 import json
 import socket
 import threading
+import uuid as uuidlib
 from dataclasses import dataclass, field
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 INDEX_MEDIA = "application/vnd.oci.image.index.v1+json"
 MANIFEST_MEDIA = "application/vnd.oci.image.manifest.v1+json"
@@ -90,8 +104,23 @@ class Image:
 class _State:
     def __init__(self):
         self.tags: dict[str, str] = {}  # "<repo>:<tag>" -> manifest digest
-        self.manifests: dict[str, tuple[bytes, str]] = {}
-        self.blobs: dict[str, bytes] = {}
+        self.manifests: dict[str, tuple[bytes, str]] = {}  # content, by digest
+        self.blobs: dict[str, bytes] = {}                    # content, by digest
+        # What each REPOSITORY holds. Content above is shared storage; whether
+        # a repository can see it is decided here, as a registry decides it.
+        self.repo_blobs: dict[str, set[str]] = {}
+        self.repo_manifests: dict[str, set[str]] = {}
+        self.uploads: dict[str, dict] = {}   # session uuid -> {"repo", "data"}
+        # Ordered: ("HEAD", repo, digest, status) and
+        # ("MANIFEST_PUT", repo, reference, digest, missing-at-that-moment).
+        self.events: list[tuple] = []
+        self.verify_manifests = False
+        # Answer the finalising PUT of the next `n` uploads with `status`. With
+        # `commits`, the blob is stored first: a registry that errors AFTER it
+        # has committed.
+        self.finalise_fail: dict = {"n": 0, "status": 500, "commits": True}
+        self.mounts: list[tuple[str, str, str, int]] = []  # (repo, digest, from, status)
+        self.lock = threading.Lock()
         self.status: int | None = None  # forced registry answer
         self.code: str | None = None
         self.token_status: int = 200  # token endpoint answer
@@ -134,16 +163,21 @@ def _make_registry_handler(state: _State):
             if "/manifests/" in rest:
                 repo, _, ref = rest.rpartition("/manifests/")
                 digest = ref if ref.startswith("sha256:") else state.tags.get(f"{repo}:{ref}")
-                got = state.manifests.get(digest or "")
+                held = digest in state.repo_manifests.get(repo, set())
+                got = state.manifests.get(digest or "") if held else None
                 if got is None:
                     return self._send(404, {"content-type": "application/json"},
                                       _err_body("MANIFEST_UNKNOWN"))
                 body, media = got
                 return self._send(200, {"content-type": media,
                                         "docker-content-digest": digest}, body)
-            if "/blobs/" in rest:
-                _, _, digest = rest.rpartition("/blobs/")
-                body = state.blobs.get(digest)
+            if "/blobs/" in rest and "/blobs/uploads" not in rest:
+                repo, _, digest = rest.rpartition("/blobs/")
+                held = digest in state.repo_blobs.get(repo, set())
+                body = state.blobs.get(digest) if held else None
+                if self.command == "HEAD":
+                    state.events.append(("HEAD", repo, digest,
+                                         200 if body is not None else 404))
                 if body is None:
                     return self._send(404, {"content-type": "application/json"},
                                       _err_body("BLOB_UNKNOWN"))
@@ -152,6 +186,144 @@ def _make_registry_handler(state: _State):
             return self._send(404, {}, b"")
 
         do_GET = do_HEAD = _serve
+
+        # --- push ---------------------------------------------------------
+
+        def _body(self) -> bytes:
+            n = int(self.headers.get("content-length") or 0)
+            return self.rfile.read(n) if n else b""
+
+        def _authed(self) -> bool:
+            if self.headers.get("authorization") == f"Bearer {TOKEN}":
+                return True
+            self._body()
+            self._send(401, {
+                "www-authenticate": (f'Bearer realm="{state.token_url}",'
+                                     'service="fake-registry"'),
+                "content-type": "application/json"}, _err_body("UNAUTHORIZED"))
+            return False
+
+        def _open_session(self, repo: str) -> None:
+            u = uuidlib.uuid4().hex
+            state.uploads[u] = {"repo": repo, "data": bytearray()}
+            self._send(202, {"location": f"/v2/{repo}/blobs/uploads/{u}",
+                             "docker-upload-uuid": u, "range": "0-0"})
+
+        def _commit(self, repo: str, data: bytes) -> str:
+            d = digest_of(data)
+            with state.lock:
+                state.blobs[d] = data
+                state.repo_blobs.setdefault(repo, set()).add(d)
+            return d
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
+            state.log.append(f"POST {unquote(self.path)}")
+            if not self._authed():
+                return None
+            body = self._body()
+            if state.status is not None:
+                return self._send(state.status, {"content-type": "application/json"},
+                                  _err_body(state.code))
+            rest = path[len("/v2/"):]
+            if not rest.endswith("/blobs/uploads/"):
+                return self._send(404, {}, b"")
+            repo = rest[: -len("/blobs/uploads/")]
+            q = parse_qs(parsed.query)
+            mount, src = q.get("mount", [None])[0], q.get("from", [None])[0]
+            if mount:
+                if src and mount in state.repo_blobs.get(src, set()):
+                    state.repo_blobs.setdefault(repo, set()).add(mount)
+                    state.mounts.append((repo, mount, src, 201))
+                    return self._send(201, {"location": f"/v2/{repo}/blobs/{mount}",
+                                            "docker-content-digest": mount})
+                # The spec's answer to a mount it cannot honour: an ordinary
+                # upload session, which the client then uses.
+                state.mounts.append((repo, mount, src or "", 202))
+                return self._open_session(repo)
+            want = q.get("digest", [None])[0]
+            if want:
+                if digest_of(body) != want:
+                    return self._send(400, {}, _err_body("DIGEST_INVALID"))
+                self._commit(repo, body)
+                return self._send(201, {"location": f"/v2/{repo}/blobs/{want}",
+                                        "docker-content-digest": want})
+            return self._open_session(repo)
+
+        def do_PATCH(self):
+            path = unquote(urlparse(self.path).path)
+            state.log.append(f"PATCH {path}")
+            if not self._authed():
+                return None
+            body = self._body()
+            u = path.rsplit("/", 1)[1]
+            sess = state.uploads.get(u)
+            if sess is None:
+                return self._send(404, {}, _err_body("BLOB_UPLOAD_UNKNOWN"))
+            sess["data"] += body
+            return self._send(202, {"location": f"/v2/{sess['repo']}/blobs/uploads/{u}",
+                                    "range": f"0-{max(len(sess['data']) - 1, 0)}"})
+
+        def do_PUT(self):
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
+            state.log.append(f"PUT {path}")
+            if not self._authed():
+                return None
+            body = self._body()
+            if state.status is not None:
+                return self._send(state.status, {"content-type": "application/json"},
+                                  _err_body(state.code))
+            rest = path[len("/v2/"):]
+            if "/manifests/" in rest:
+                repo, _, ref = rest.rpartition("/manifests/")
+                return self._put_manifest(repo, ref, body)
+            if "/blobs/uploads/" in rest:
+                u = rest.rsplit("/", 1)[1]
+                sess = state.uploads.pop(u, None)
+                if sess is None:
+                    return self._send(404, {}, _err_body("BLOB_UPLOAD_UNKNOWN"))
+                data = bytes(sess["data"]) + body
+                want = parse_qs(parsed.query).get("digest", [None])[0]
+                if not want or digest_of(data) != want:
+                    return self._send(400, {}, _err_body("DIGEST_INVALID"))
+                fail = state.finalise_fail
+                if fail["n"] > 0:
+                    fail["n"] -= 1
+                    if fail["commits"]:
+                        self._commit(sess["repo"], data)
+                    return self._send(fail["status"], {"content-type": "application/json"},
+                                      _err_body("UNKNOWN"))
+                self._commit(sess["repo"], data)
+                return self._send(201, {"location": f"/v2/{sess['repo']}/blobs/{want}",
+                                        "docker-content-digest": want})
+            return self._send(404, {}, b"")
+
+        def _put_manifest(self, repo: str, ref: str, body: bytes):
+            media = self.headers.get("content-type") or MANIFEST_MEDIA
+            d = digest_of(body)
+            try:
+                doc = json.loads(body)
+            except ValueError:
+                return self._send(400, {}, _err_body("MANIFEST_INVALID"))
+            refs = [doc.get("config") or {}, *(doc.get("layers") or [])]
+            held = state.repo_blobs.get(repo, set())
+            missing = [x["digest"] for x in refs if x.get("digest") and x["digest"] not in held]
+            missing += [m["digest"] for m in doc.get("manifests") or []
+                        if m.get("digest")
+                        and m["digest"] not in state.repo_manifests.get(repo, set())]
+            state.events.append(("MANIFEST_PUT", repo, ref, d, tuple(missing)))
+            if missing and state.verify_manifests:
+                return self._send(400, {"content-type": "application/json"},
+                                  _err_body("MANIFEST_BLOB_UNKNOWN"))
+            with state.lock:
+                state.manifests[d] = (body, media)
+                state.repo_manifests.setdefault(repo, set()).add(d)
+                if not ref.startswith("sha256:"):
+                    state.tags[f"{repo}:{ref}"] = d
+            return self._send(201, {"location": f"/v2/{repo}/manifests/{d}",
+                                    "docker-content-digest": d})
 
         def log_message(self, *a):
             return
@@ -225,10 +397,23 @@ class FakeRegistry:
     def log(self) -> list[str]:
         return self.state.log
 
+    @property
+    def events(self) -> list[tuple]:
+        return self.state.events
+
     def push(self, repo: str, tag: str, image: Image) -> None:
+        """Seed `repo` with the whole image. Only that repository can see it."""
         self.state.manifests.update(image.manifests)
         self.state.blobs.update(image.blobs)
+        self.state.repo_manifests.setdefault(repo, set()).update(image.manifests)
+        self.state.repo_blobs.setdefault(repo, set()).update(image.blobs)
         self.state.tags[f"{repo}:{tag}"] = image.index_digest
+
+    def has_blob(self, repo: str, digest: str) -> bool:
+        return digest in self.state.repo_blobs.get(repo, set())
+
+    def manifest_puts(self) -> list[tuple]:
+        return [e for e in self.state.events if e[0] == "MANIFEST_PUT"]
 
     def delete_tag(self, repo: str, tag: str) -> None:
         self.state.tags.pop(f"{repo}:{tag}", None)
