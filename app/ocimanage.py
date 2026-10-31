@@ -450,6 +450,11 @@ class AbandonRequest(BaseModel):
     digest: str = Field(description="sha256:... of the blob whose forward is abandoned")
 
 
+class RetryRequest(BaseModel):
+    upstream: str | None = Field(default=None, description="registry host; with digest, retry one entry")
+    digest: str | None = Field(default=None, description="sha256:... of the entry; omit both to retry every failed one")
+
+
 class EvictRequest(BaseModel):
     image: str = Field(description="drops the tag; blobs go on the next sweep if unreferenced")
 
@@ -638,6 +643,24 @@ async def abandon_pending(req: AbandonRequest) -> dict:
     """
     try:
         return ocipush.abandon(req.upstream, req.digest)
+    except ocipush.PushError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+
+
+@router.post("/pending/retry")
+async def retry_pending(req: RetryRequest | None = None) -> dict:
+    """Retry one outstanding forward (upstream + digest), or every failed one.
+
+    Without this a failed forward could only be retried by restarting the
+    process, which re-sends everything, or abandoned. A failed or cancelled
+    entry is rebuilt from its durable record, as a restart would rebuild it,
+    with a fresh attempt budget; a manifest parked on a dependency is woken to
+    re-check now. Returns what was scheduled and what was re-checked. 404 for
+    an entry that is not pending; 409 for one that is forwarding right now.
+    """
+    req = req or RetryRequest()
+    try:
+        return ocipush.retry(req.upstream, req.digest)
     except ocipush.PushError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
 
