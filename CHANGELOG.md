@@ -9,6 +9,39 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.35 — 2026-10-31
+
+v0.9.35 -- store-forward never sends a manifest to a repository missing one of its blobs
+
+A pushed image could reach the upstream registry missing a layer. Registries
+keep blobs PER REPOSITORY. When Muninn already held a blob -- for example the
+common empty layer, cached from a pull of a different repo on the same
+registry -- it answered the pusher's HEAD with 200. The client skipped the
+upload, and the manifest was forwarded to a repository that did not have the
+blob. A registry that accepts manifests without checking layers then served
+a broken image. This happened twice in production.
+
+  - Before any manifest PUT, store-forward and proxy mode alike HEAD every blob
+    it references IN THE TARGET REPOSITORY. Each missing blob is delivered
+    first: by cross-repo mount from a repository known to hold it, or by
+    uploading Muninn's local copy, hashed while it is sent. A copy that does
+    not match its digest is never finalised. A manifest is never PUT while
+    any blob is missing. A blob nobody holds fails the manifest by name; in
+    proxy mode the client gets 400 MANIFEST_BLOB_UNKNOWN.
+  - A registry that commits a blob and then answers 5xx on the finalise is
+    checked with a HEAD. If the blob is present with the right size, the
+    finalise counts as successful.
+  - A manifest whose dependency failed is now parked as `blocked`, without
+    spending its attempts. Previously it was marked failed and never retried.
+    It re-checks whenever a forward completes, and on a timer, then is
+    delivered with its own five attempts.
+  - New: POST /_cache/docker/pending/retry retries one entry
+    (upstream + digest) or every failed one, without a restart.
+  - GET /_cache/docker/pending lists every blob a pending manifest still
+    needs upstream, including blobs the client never uploaded through Muninn.
+    An empty view can no longer mean "delivered" for a broken image.
+
+
 ## v0.9.34 — 2026-10-09
 
 v0.9.34 -- container images survive the upstream registry going away
