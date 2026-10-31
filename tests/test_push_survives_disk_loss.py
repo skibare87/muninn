@@ -155,8 +155,22 @@ def _accept_push_while_upstream_is_down(upstream):
 def _resume_and_drain():
     async def go():
         await ocipush.resume()
-        tasks = list(ocipush._pending.values())
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+        # Until every forward has finished or is a manifest PARKED on a
+        # dependency: a parked manifest waits, by design, and never finishes
+        # on its own while what it needs is missing.
+        loop = asyncio.get_running_loop()
+        end = loop.time() + 10
+        while True:
+            live = [t for k, t in ocipush._pending.items()
+                    if not t.done() and k not in ocipush._blocked]
+            if not live:
+                await asyncio.sleep(0.05)
+                if not [t for k, t in ocipush._pending.items()
+                        if not t.done() and k not in ocipush._blocked]:
+                    break
+                continue
+            assert loop.time() < end, "forwards still running"
+            await asyncio.wait(live, timeout=0.2)
         return ocipush.pending()
     return asyncio.run(go())
 
@@ -344,6 +358,10 @@ def test_an_old_obligation_whose_bytes_are_gone_is_kept_not_dropped(tmp_path, mo
     pend = _resume_and_drain()
     failed = [p for p in pend if p["digest"] == layer]
     assert failed and failed[0]["state"] == "failed", pend
+    # Its manifest is parked on it, not failed and not sent.
+    [man] = [p for p in pend if p["kind"] == "manifest"]
+    assert man["state"] == "blocked" and man["attempts"] == 0, man
+    assert layer in [n["digest"] for n in man["needs"]]
     assert list((tmp_path / "state" / "oci" / "pending").glob("*.json"))
 
 

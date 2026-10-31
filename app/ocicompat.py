@@ -917,8 +917,16 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         #
         # So: keep the 200 (store-forward is eventually consistent, not
         # immediately consistent) and make sure the delivery it implies is
-        # actually scheduled. No-op for a blob cached from a pull, which was
-        # fetched from that upstream and is already there.
+        # actually scheduled.
+        #
+        # A blob cached from a PULL is not scheduled here, and this 200 does
+        # NOT mean the push target holds it: it was fetched from some
+        # repository on that upstream, and registries scope blobs per
+        # repository. The client skips the upload on the strength of this
+        # answer, so the manifest forward makes it good -- it HEADs every blob
+        # the manifest references in the target repository and mounts or
+        # uploads any that is missing before the manifest is PUT
+        # (ocipush._resolve_dependencies).
         if settings.docker_push_enabled:
             ocipush.ensure_forward(ref, digest)
         size = path.stat().st_size
@@ -965,6 +973,10 @@ async def blobs(name: str, digest: str, request: Request) -> Response:
         metrics.record_docker_upstream(ref.upstream, None)
         return _err(502, "UNAVAILABLE", f"upstream unreachable: {exc}")
 
+    if settings.docker_push_enabled and not job.tier_source:
+        # This repository answered for this blob: a source a later push to a
+        # DIFFERENT repository on the same upstream can mount it from.
+        ocipush.note_source(ref, digest)
     size = job.size
     headers = dict(_API_VERSION)
     headers["docker-content-digest"] = digest

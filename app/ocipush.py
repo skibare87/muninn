@@ -50,6 +50,7 @@ import httpx
 
 from . import ocistore, pushlimits, registry, statedir
 from .config import settings
+from .shutdown import reraise_if_cancelled
 
 log = logging.getLogger("xhc.ocipush")
 
@@ -514,39 +515,44 @@ def _recovered_manifest(rec: dict) -> tuple[bytes, str] | None:
 async def resume() -> None:
     """Schedule everything recover() found. Separate so it can be tested."""
     for rec in recover():
-        ref = registry.Ref(upstream=rec["upstream"], api=rec["api"],
-                           repo=rec["repo"])
-        key = f"{rec['upstream']}/{rec['digest']}"
-        _pinned.add(key)
-        if rec.get("kind") == "manifest":
-            got = _recovered_manifest(rec)
-            if got is None:
-                # Kept, pinned and visible as FAILED rather than cleared. This
-                # used to delete the record: an acknowledged push erased with
-                # nothing but a log line to say so. Giving up on it is the
-                # operator's call (DELETE /_cache/docker/pending).
-                log.error("manifest %s was owed to %s but its body is no longer "
-                          "available; cannot resume it", rec["digest"], rec["upstream"])
-                _pending[key] = asyncio.create_task(_fail(PushError(
-                    502, "UNAVAILABLE",
-                    f"manifest {rec['digest']} was acknowledged but its body is "
-                    "gone; it cannot be delivered")))
-                continue
-            body, media_type = got
-            if ocistore.load_manifest(rec["upstream"], rec["digest"]) is None:
-                # Back into the cache (the disk was replaced), so a pull
-                # resolves the tag here while the forward is still owed.
-                try:
-                    _store_manifest(ref, rec["digest"], body, media_type,
-                                    rec["reference"], force_keep=True)
-                except (OSError, ocistore.DigestMismatch):
-                    log.exception("could not restore manifest %s to the cache; "
-                                  "forwarding it anyway", rec["digest"])
-            _pending[key] = asyncio.create_task(_forward_manifest_later(
-                ref, body, media_type, rec["reference"], rec["digest"], key))
-        else:
-            _pending[key] = asyncio.create_task(
-                _forward_later(ref, rec["digest"], key))
+        _schedule_from_record(rec)
+
+
+def _schedule_from_record(rec: dict) -> None:
+    """(Re)start the forward a durable record describes. Used at startup and by
+    retry(), so a retried entry is rebuilt exactly as a restart would rebuild it."""
+    ref = registry.Ref(upstream=rec["upstream"], api=rec["api"], repo=rec["repo"])
+    key = f"{rec['upstream']}/{rec['digest']}"
+    _pinned.add(key)
+    if rec.get("kind") != "manifest":
+        _schedule_blob(ref, rec["digest"], key)
+        return
+    got = _recovered_manifest(rec)
+    if got is None:
+        # Kept, pinned and visible as FAILED rather than cleared. This used to
+        # delete the record: an acknowledged push erased with nothing but a log
+        # line to say so. Giving up on it is the operator's call
+        # (DELETE /_cache/docker/pending).
+        log.error("manifest %s was owed to %s but its body is no longer "
+                  "available; cannot resume it", rec["digest"], rec["upstream"])
+        _meta[key] = {"kind": "manifest", "repo": ref.repo,
+                      "reference": rec.get("reference")}
+        _pending[key] = asyncio.create_task(_fail(PushError(
+            502, "UNAVAILABLE",
+            f"manifest {rec['digest']} was acknowledged but its body is "
+            "gone; it cannot be delivered")))
+        return
+    body, media_type = got
+    if ocistore.load_manifest(rec["upstream"], rec["digest"]) is None:
+        # Back into the cache (the disk was replaced), so a pull resolves the
+        # tag here while the forward is still owed.
+        try:
+            _store_manifest(ref, rec["digest"], body, media_type,
+                            rec["reference"], force_keep=True)
+        except (OSError, ocistore.DigestMismatch):
+            log.exception("could not restore manifest %s to the cache; "
+                          "forwarding it anyway", rec["digest"])
+    _schedule_manifest(ref, body, media_type, rec["reference"], rec["digest"], key)
 
 
 # --- upload sessions: in memory, and bounded -----------------------------------
@@ -743,7 +749,8 @@ async def _blob_exists(ref: registry.Ref, digest: str) -> bool:
     """Skip re-uploading a layer the registry already has.
 
     This is what makes a second push of a similar image fast, and it is the
-    same check a docker client performs before offering a blob.
+    same check a docker client performs before offering a blob. It asks the
+    TARGET REPOSITORY (`ref.repo`): registries scope blobs per repository.
     """
     try:
         r = await registry.request(ref, "HEAD", f"blobs/{digest}")
@@ -753,10 +760,73 @@ async def _blob_exists(ref: registry.Ref, digest: str) -> bool:
     return r.status_code == 200
 
 
+async def _committed(ref: registry.Ref, digest: str, size: int) -> bool:
+    """After a finalise that answered 5xx or broke at the transport: did the
+    registry commit the blob anyway?
+
+    Registries can store the blob and THEN fail the response -- a proxy that
+    times out the request after the backend finished, or a backend that errors
+    while writing its own bookkeeping. Declaring that a failure left a manifest
+    waiting forever on a blob the registry already held. Present in the target
+    repository with the right size is success; anything else, including a HEAD
+    that itself fails, is not.
+    """
+    try:
+        r = await registry.request(ref, "HEAD", f"blobs/{digest}")
+    except Exception as exc:  # noqa: BLE001 - could not confirm, so not confirmed
+        log.debug("HEAD %s after a failed finalise also failed: %s", digest, exc)
+        return False
+    if r.status_code != 200:
+        return False
+    got = r.headers.get("content-length")
+    try:
+        return got is not None and int(got) == size
+    except ValueError:
+        return False
+
+
 READ_SIZE = 1024 * 1024
 
 
-def _chunk_reader(path: Path, start: int, length: int):
+class _Verify:
+    """Hashes bytes as they are SENT, so a local copy that no longer matches its
+    digest is never committed upstream.
+
+    The local blob was verified when it landed, but a dependency delivered on a
+    manifest's behalf may be a cache entry from a pull months ago, read from a
+    disk that has had time to rot. A registry checks the digest on finalise as
+    well, but trusting the far end to catch our corruption is not a check.
+
+    `base` is the hash of everything already ACCEPTED upstream. Each send starts
+    from a copy of it, because the auth dance may send one body twice; a running
+    hash updated by both attempts would hash the chunk twice and be wrong.
+    """
+
+    def __init__(self, digest: str):
+        self.digest = digest
+        self.base = hashlib.sha256()
+        self.last: hashlib._Hash | None = None
+        self.bad: str | None = None
+
+    def accept(self) -> None:
+        """The chunk last sent was accepted: it is now part of the base."""
+        if self.last is not None:
+            self.base = self.last
+            self.last = None
+
+    def matches(self) -> bool:
+        return "sha256:" + self.base.hexdigest() == self.digest
+
+
+def _read_hashed(fh, n: int, h) -> bytes:
+    data = fh.read(n)
+    if data:
+        h.update(data)
+    return data
+
+
+def _chunk_reader(path: Path, start: int, length: int, verify: _Verify | None = None,
+                  final: bool = False):
     """Body factory for one chunk: a FRESH ASYNC iterator per call.
 
     Two properties, both learned the hard way.
@@ -774,19 +844,44 @@ def _chunk_reader(path: Path, start: int, length: int):
 
     File reads go through a thread so a multi-gigabyte monolithic PUT does not
     block the event loop while every other request waits on it.
+
+    With `verify`, every byte is hashed as it is read. With `final` too (the
+    body that completes the blob, i.e. a monolithic PUT), the reader runs one
+    read ahead and refuses to yield the LAST piece if the whole does not hash to
+    the digest: the request then fails before the registry has the full body,
+    so nothing wrong is committed. `verify.bad` records why.
     """
     def factory():
+        h = verify.base.copy() if verify is not None else None
+        if verify is not None:
+            verify.last = h
+
         async def stream():
             fh = await asyncio.to_thread(path.open, "rb")
             try:
                 await asyncio.to_thread(fh.seek, start)
                 left = length
+                held = b""
                 while left > 0:
-                    data = await asyncio.to_thread(fh.read, min(READ_SIZE, left))
+                    if h is not None:
+                        data = await asyncio.to_thread(_read_hashed, fh,
+                                                       min(READ_SIZE, left), h)
+                    else:
+                        data = await asyncio.to_thread(fh.read, min(READ_SIZE, left))
                     if not data:
                         break
                     left -= len(data)
-                    yield data
+                    if held:
+                        yield held
+                    held = data
+                if final and verify is not None and h is not None:
+                    got = "sha256:" + h.hexdigest()
+                    if got != verify.digest:
+                        verify.bad = (f"the local copy hashes to {got}, not {verify.digest}; "
+                                      "refusing to send it")
+                        raise PushError(500, "DIGEST_INVALID", verify.bad)
+                if held:
+                    yield held
             finally:
                 await asyncio.to_thread(fh.close)
         return stream()
@@ -815,23 +910,60 @@ def _stage(t0: float, what: str, key: str = "") -> float:
     return now
 
 
-async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
-    """Upload one blob upstream, chunked according to that registry's policy."""
+async def _try_mounts(ref: registry.Ref, digest: str,
+                      sources: list[str]) -> tuple[str, str | None]:
+    """Ask the registry to link `digest` into `ref.repo` from a repository that
+    already holds it, rather than sending the bytes again.
+
+    Returns ("mounted", None), or ("session", location) when the registry
+    declined the mount and opened an ordinary upload session instead -- the
+    spec's answer to a mount it cannot honour, and not an error -- or
+    ("none", None) when no mount was attempted or every attempt was refused
+    outright. A wrong source therefore costs one request, never the push.
+    """
+    for src in sources:
+        if src == ref.repo:
+            continue
+        r = await registry.request(ref, "POST",
+                                   f"blobs/uploads/?mount={digest}&from={src}")
+        if r.status_code == 201:
+            log.info("mounted %s into %s/%s from %s", digest, ref.upstream, ref.repo, src)
+            return "mounted", None
+        if r.status_code == 202 and r.headers.get("location"):
+            log.debug("mount of %s from %s declined; uploading through the session "
+                      "the registry opened instead", digest, src)
+            return "session", r.headers["location"]
+        log.debug("mount of %s from %s refused: %s", digest, src, r.status_code)
+    return "none", None
+
+
+async def push_blob(ref: registry.Ref, path: Path, digest: str, *,
+                    mount_from: list[str] | tuple[str, ...] = ()) -> str:
+    """Put one blob into `ref.repo` upstream, chunked by that registry's policy.
+
+    Returns how: "present" (the repository already had it), "mounted" (linked
+    from one of `mount_from`), or "uploaded" (the local bytes, hashed as they
+    were sent).
+    """
     t = time.monotonic()
     key = f"{ref.upstream}/{digest[:19]}"
     if await _blob_exists(ref, digest):
-        log.info("%s already has %s; skipping upload", ref.upstream, digest)
-        return
+        log.info("%s/%s already has %s; skipping upload", ref.upstream, ref.repo, digest)
+        return "present"
     t = _stage(t, "HEAD blob (does upstream have it)", key)
 
     size = path.stat().st_size
     session_base = f"{ref.api}/v2/{ref.repo}/blobs/uploads/"
-    r = await registry.request(ref, "POST", "blobs/uploads/")
-    if r.status_code not in (202, 201):
-        raise PushError(502, "UNAVAILABLE",
-                        f"{ref.upstream} refused an upload session: {r.status_code}")
-    t = _stage(t, "POST open upload session (incl. any auth retry)", key)
-    location = r.headers.get("location")
+    how, location = await _try_mounts(ref, digest, list(mount_from))
+    if how == "mounted":
+        return "mounted"
+    if location is None:
+        r = await registry.request(ref, "POST", "blobs/uploads/")
+        if r.status_code not in (202, 201):
+            raise PushError(502, "UNAVAILABLE",
+                            f"{ref.upstream} refused an upload session: {r.status_code}")
+        t = _stage(t, "POST open upload session (incl. any auth retry)", key)
+        location = r.headers.get("location")
     if not location:
         raise PushError(502, "UNAVAILABLE",
                         f"{ref.upstream} returned no upload Location")
@@ -853,7 +985,7 @@ async def push_blob(ref: registry.Ref, path: Path, digest: str) -> None:
         try:
             await _upload(ref, location, path, size, digest, limit)
             _stage(t, "upload body and finalise", key)
-            return
+            return "uploaded"
         except _TooLarge as exc:
             # The registry said 413. Halve and retry rather than failing --
             # unconfigured pushes should work, slowly, and tell the operator
@@ -874,19 +1006,53 @@ class _TooLarge(Exception):
         self.chunk = chunk
 
 
+async def _finalise(ref, digest, size, send, what: str, *, monolithic: bool) -> None:
+    """Send the request that commits a blob, and decide whether it did.
+
+    A 5xx, or a connection that broke, does not say the blob is absent: the
+    registry may have committed it and failed afterwards. So HEAD it in the
+    target repository before declaring failure (see _committed). A 4xx is an
+    answer about the request and is reported as it stands.
+    """
+    try:
+        r = await send()
+    except RETRYABLE as exc:
+        if await _committed(ref, digest, size):
+            log.warning("%s of %s to %s/%s broke at the transport (%s), but the "
+                        "registry holds it at the right size; treating it as "
+                        "committed", what, digest, ref.upstream, ref.repo,
+                        describe_exc(exc))
+            return
+        raise
+    if r.status_code == 413 and monolithic:
+        raise _TooLarge(0)
+    if r.status_code in (201, 202):
+        return
+    if r.status_code >= 500 and await _committed(ref, digest, size):
+        log.warning("%s of %s to %s/%s answered %d, but the registry holds it at "
+                    "the right size; treating it as committed", what, digest,
+                    ref.upstream, ref.repo, r.status_code)
+        return
+    raise PushError(502, "UNAVAILABLE",
+                    f"{ref.upstream} refused to {what} {digest}: {r.status_code}")
+
+
 async def _upload(ref, location, path, size, digest, limit) -> None:
+    verify = _Verify(digest)
     if not limit.chunks or size <= limit.threshold:
-        r = await registry.request_absolute(
-            ref, "PUT", _with_digest(location, digest),
-            {"content-type": "application/octet-stream",
-             "content-length": str(size)},
-            _chunk_reader(path, 0, size),
-        )
-        if r.status_code == 413:
-            raise _TooLarge(0)
-        if r.status_code not in (201, 202):
-            raise PushError(502, "UNAVAILABLE",
-                            f"{ref.upstream} rejected blob {digest}: {r.status_code}")
+        async def send_whole():
+            return await registry.request_absolute(
+                ref, "PUT", _with_digest(location, digest),
+                {"content-type": "application/octet-stream",
+                 "content-length": str(size)},
+                _chunk_reader(path, 0, size, verify, final=True),
+            )
+        try:
+            await _finalise(ref, digest, size, send_whole, "accept blob", monolithic=True)
+        except Exception:
+            if verify.bad is not None:
+                raise PushError(500, "DIGEST_INVALID", verify.bad) from None
+            raise
         return
 
     offset = 0
@@ -898,7 +1064,7 @@ async def _upload(ref, location, path, size, digest, limit) -> None:
             {"content-type": "application/octet-stream",
              "content-length": str(n),
              "content-range": f"{offset}-{offset + n - 1}"},
-            _chunk_reader(path, offset, n),
+            _chunk_reader(path, offset, n, verify),
         )
         if r.status_code == 413:
             raise _TooLarge(limit.chunk)
@@ -906,6 +1072,7 @@ async def _upload(ref, location, path, size, digest, limit) -> None:
             raise PushError(502, "UNAVAILABLE",
                             f"{ref.upstream} rejected a chunk at {offset}: "
                             f"{r.status_code}")
+        verify.accept()
         # The session URL may move between chunks; the registry chooses it,
         # and may again choose a relative one. Resolve against the URL this
         # response actually came from, not against the original session base --
@@ -915,11 +1082,17 @@ async def _upload(ref, location, path, size, digest, limit) -> None:
         url = urljoin(url, nxt) if nxt else url
         offset += n
 
-    r = await registry.request_absolute(ref, "PUT", _with_digest(url, digest),
-                                        {"content-length": "0"})
-    if r.status_code not in (201, 202):
-        raise PushError(502, "UNAVAILABLE",
-                        f"{ref.upstream} refused to finalise {digest}: {r.status_code}")
+    if not verify.matches():
+        # Every chunk was accepted but the whole is not the blob: do not ask
+        # the registry to commit it under a digest it does not hash to.
+        raise PushError(500, "DIGEST_INVALID",
+                        f"the local copy of {digest} hashes to "
+                        f"sha256:{verify.base.hexdigest()}; refusing to finalise it")
+
+    async def send_finalise():
+        return await registry.request_absolute(ref, "PUT", _with_digest(url, digest),
+                                               {"content-length": "0"})
+    await _finalise(ref, digest, size, send_finalise, "finalise", monolithic=False)
 
 
 def _with_digest(url: str, digest: str) -> str:
@@ -981,7 +1154,7 @@ async def _finalise_blob(up: Upload, claimed: str) -> None:
             discard(up)
             raise
     _land(up, claimed, pin=True, force_keep=True)
-    _pending[key] = asyncio.create_task(_forward_later(up.ref, claimed, key))
+    _schedule_blob(up.ref, claimed, key)
 
 
 async def _hold(up: Upload, digest: str, key: str) -> None:
@@ -1042,8 +1215,13 @@ def ensure_forward(ref: registry.Ref, digest: str) -> bool:
     loudly; the second skipped the upload and enqueued nothing at all.
 
     Returns True if a forward was (re)scheduled. Only ever acts on blobs this
-    cache is holding UNCONFIRMED -- a blob cached from a pull was fetched from
-    that upstream, so it is already there and needs nothing.
+    cache is holding UNCONFIRMED. A blob cached from a pull needs nothing HERE
+    -- but note what that does and does not mean: it was fetched from SOME
+    repository on that upstream, and registries scope blobs per repository, so
+    it is not necessarily in the one now being pushed to. That gap is closed
+    where it matters, before the manifest is forwarded: _resolve_dependencies
+    HEADs every referenced blob in the target repository and delivers any that
+    is missing.
     """
     key = f"{ref.upstream}/{digest}"
     if key not in _pinned:
@@ -1054,8 +1232,97 @@ def ensure_forward(ref: registry.Ref, digest: str) -> bool:
     log.info("re-scheduling the forward of %s to %s: it is held here but not "
              "confirmed upstream, and no attempt is in flight",
              digest, ref.upstream)
-    _pending[key] = asyncio.create_task(_forward_later(ref, digest, key))
+    _schedule_blob(ref, digest, key)
     return True
+
+
+# --- what each pending entry is, and what a manifest still needs ---------------
+#
+# _meta: kind ("blob" | "manifest"), repo and, for a manifest, the reference.
+# _needs: for a manifest, every digest it references that has NOT yet been
+#   confirmed present in the target repository upstream, with its state. This
+#   is what makes the pending view honest: a manifest that references a blob the
+#   client never uploaded through Muninn (it HEADed 200 here and skipped it)
+#   used to show nothing outstanding, so an empty view could mean "delivered"
+#   for an image the registry did not hold.
+# _blocked: manifests parked because a dependency cannot be resolved right now,
+#   with the reason. Parked is NOT failed: no delivery attempt was made, so none
+#   is counted, and the manifest wakes when its dependencies change.
+_meta: dict[str, dict] = {}
+_needs: dict[str, dict[str, dict]] = {}
+_blocked: dict[str, str] = {}
+
+# Parked manifests re-check on this schedule (seconds) even if nothing wakes
+# them, so a blob that appears upstream by other means -- pushed by someone
+# else, or committed by a finalise that answered an error -- is noticed.
+DEP_RECHECK_S = (30, 60, 120, 300, 600)
+
+# Futures parked manifests wait on; _wake() resolves them all. Futures rather
+# than an Event because an Event binds to one loop and this module outlives
+# several in tests.
+_waiters: set[asyncio.Future] = set()
+# Bumped by every _wake(). A manifest compares it across its own check, so a
+# wake that lands WHILE it is checking (and so before it parks) is not lost.
+_generation = [0]
+
+
+def _wake() -> None:
+    """Something a parked manifest may depend on changed: re-check now."""
+    _generation[0] += 1
+    for fut in list(_waiters):
+        if not fut.done():
+            try:
+                fut.set_result(None)
+            except RuntimeError:        # its loop is gone
+                pass
+    _waiters.clear()
+
+
+async def _park(delay: float) -> None:
+    fut = asyncio.get_running_loop().create_future()
+    _waiters.add(fut)
+    try:
+        await asyncio.wait({fut}, timeout=delay)
+    finally:
+        _waiters.discard(fut)
+
+
+def _schedule_blob(ref: registry.Ref, digest: str, key: str) -> None:
+    _pinned.add(key)
+    _meta[key] = {"kind": "blob", "repo": ref.repo}
+    _attempts.pop(key, None)
+    _pending[key] = asyncio.create_task(_forward_later(ref, digest, key))
+    _wake()
+
+
+def _schedule_manifest(ref: registry.Ref, body: bytes, media_type: str,
+                       reference: str, digest: str, key: str) -> None:
+    _pinned.add(key)
+    _meta[key] = {"kind": "manifest", "repo": ref.repo, "reference": reference}
+    _needs[key] = {d: {"kind": kind, "state": "unchecked", "detail": None}
+                   for d, kind, _ in _dependencies(body)}
+    _blocked.pop(key, None)
+    _attempts.pop(key, None)
+    _pending[key] = asyncio.create_task(_forward_manifest_later(
+        ref, body, media_type, reference, digest, key))
+    _wake()
+
+
+def _forget(key: str) -> None:
+    _pending.pop(key, None)
+    _meta.pop(key, None)
+    _needs.pop(key, None)
+    _blocked.pop(key, None)
+
+
+def _task_state(task: asyncio.Task) -> tuple[str, str | None]:
+    if not task.done():
+        return "running", None
+    if task.cancelled():
+        return "cancelled", "the forward was cancelled, likely at shutdown"
+    if task.exception() is not None:
+        return "failed", describe_exc(task.exception())
+    return "done", None
 
 
 def pending() -> list[dict]:
@@ -1064,24 +1331,34 @@ def pending() -> list[dict]:
     store-forward owes an answer to "what is pending right now" -- an invisible
     queue is how a push gets silently lost. The failure text is included
     because "failed" without a reason sends the reader to the wrong place.
+
+    A manifest row carries `needs`: every blob (or, for an index, child
+    manifest) it references that has not yet been confirmed in the target
+    repository upstream -- including ones the client never uploaded through
+    Muninn. `blocked` means it is waiting on one of those and has made no
+    delivery attempt; it is not a failure and needs no restart.
     """
     out = []
     for key, task in _pending.items():
         upstream, _, digest = key.partition("/")
-        if not task.done():
-            state, err = "running", None
-        elif task.cancelled():
-            state, err = "cancelled", "the forward was cancelled, likely at shutdown"
-        elif task.exception() is not None:
-            state, err = "failed", describe_exc(task.exception())
-        else:
-            state, err = "done", None
+        state, err = _task_state(task)
+        if state == "running" and key in _blocked:
+            state, err = "blocked", _blocked[key]
         attempts = _attempts.get(key, 0)
         if state == "running" and attempts > 1:
             state = "retrying"
-        out.append({"upstream": upstream, "digest": digest, "state": state,
-                    "error": err, "pinned": key in _pinned,
-                    "attempts": attempts, "max_attempts": MAX_ATTEMPTS})
+        meta = _meta.get(key, {})
+        row = {"upstream": upstream, "digest": digest, "state": state,
+               "error": err, "pinned": key in _pinned,
+               "attempts": attempts, "max_attempts": MAX_ATTEMPTS,
+               "kind": meta.get("kind", "blob")}
+        if meta.get("repo"):
+            row["repo"] = meta["repo"]
+        if meta.get("kind") == "manifest":
+            row["reference"] = meta.get("reference")
+            row["needs"] = [{"digest": d, **info}
+                            for d, info in sorted(_needs.get(key, {}).items())]
+        out.append(row)
     return sorted(out, key=lambda x: (x["state"], x["digest"]))
 
 
@@ -1101,11 +1378,14 @@ def abandon(upstream: str, digest: str) -> dict:
     if task is None and key not in _pinned:
         raise PushError(404, "NOT_PENDING", f"{key} is not a pending push")
     if task is not None and not task.done():
-        raise PushError(409, "STILL_RUNNING",
-                        f"{key} is still forwarding; refusing to unpin content "
-                        "whose upload is in flight")
+        if key not in _blocked:
+            raise PushError(409, "STILL_RUNNING",
+                            f"{key} is still forwarding; refusing to unpin content "
+                            "whose upload is in flight")
+        # A parked manifest is waiting, not sending: nothing is in flight to race.
+        task.cancel()
     _pinned.discard(key)
-    _pending.pop(key, None)
+    _forget(key)
     # Drop the durable marker too, or an abandoned forward comes back from the
     # dead at the next restart -- the operator's decision must outlive the
     # process just as the obligation does.
@@ -1117,7 +1397,96 @@ def abandon(upstream: str, digest: str) -> dict:
             "if no manifest references it"}
 
 
-async def _with_retries(make_coro, *, what: str, key: str):
+def _read_obligation(key: str) -> dict | None:
+    try:
+        rec = json.loads(_obligation_path(key).read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _on_disk_keys() -> list[str]:
+    out = []
+    for marker in sorted(_obligations_dir().glob("*.json")):
+        try:
+            rec = json.loads(marker.read_text())
+            out.append(f"{rec['upstream']}/{rec['digest']}")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return out
+
+
+def retry(upstream: str | None = None, digest: str | None = None) -> dict:
+    """Retry one pending forward, or every failed one, without a restart.
+
+    Before this the only ways to make a failed forward try again were a process
+    restart (which re-sends everything) or ABANDON (which gives up). Neither is
+    an answer to "the registry is back, send it now".
+
+    Per entry:
+      - failed or cancelled: rescheduled from its DURABLE RECORD -- the same
+        record a restart resumes from, so this is exactly what a restart would
+        do for that one entry, with a fresh attempt budget;
+      - a manifest parked on a dependency: woken to re-check now (`rechecked`);
+      - running: left alone (one entry asked for by name is a 409);
+      - a record on disk with no task in this process: scheduled.
+
+    Synchronous and bounded by the number of entries: it only creates tasks.
+    The tasks are the ordinary forwards, bounded by MAX_ATTEMPTS, and a parked
+    manifest's loop re-raises a cancel (shutdown.reraise_if_cancelled).
+    """
+    if (upstream is None) != (digest is None):
+        raise PushError(400, "INVALID",
+                        "give both upstream and digest to retry one entry, or "
+                        "neither to retry every failed one")
+    if upstream is not None:
+        keys, single = [f"{upstream}/{digest}"], True
+    else:
+        keys, single = sorted(set(_pending) | set(_on_disk_keys())), False
+
+    scheduled, rechecked, running, unreadable = [], [], [], []
+    # Blobs before manifests, so a manifest scheduled here finds the forwards
+    # it depends on already in flight.
+    order = sorted(keys, key=lambda k: _meta.get(k, {}).get("kind") == "manifest")
+    for key in order:
+        task = _pending.get(key)
+        if task is not None and not task.done():
+            if key in _blocked:
+                rechecked.append(key)
+                continue
+            if single:
+                raise PushError(409, "STILL_RUNNING",
+                                f"{key} is forwarding now; nothing to retry")
+            running.append(key)
+            continue
+        if task is not None and _task_state(task)[0] == "done":
+            continue
+        rec = _read_obligation(key)
+        if rec is None:
+            if task is None:
+                if single:
+                    raise PushError(404, "NOT_PENDING", f"{key} is not a pending push")
+                continue
+            # Known in memory, but its record is gone or unreadable: there is
+            # nothing to rebuild the forward from. Say so rather than skip it.
+            unreadable.append(key)
+            continue
+        _schedule_from_record(rec)
+        scheduled.append(key)
+    if rechecked:
+        _wake()
+    if scheduled or rechecked:
+        log.warning("pending retry: scheduled %d, re-checking %d parked manifest(s)",
+                    len(scheduled), len(rechecked))
+    out = {"scheduled": scheduled, "rechecked": rechecked}
+    if not single:
+        out["running"] = running
+    if unreadable:
+        out["unreadable"] = unreadable
+    return out
+
+
+async def _with_retries(make_coro, *, what: str, key: str | None):
     """Retry TRANSPORT failures; never retry an answer.
 
     A 401 already retried -- the auth dance re-sends after a challenge -- so a
@@ -1131,7 +1500,8 @@ async def _with_retries(make_coro, *, what: str, key: str):
     """
     last: BaseException | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        _attempts[key] = attempt
+        if key is not None:
+            _attempts[key] = attempt
         try:
             return await make_coro()
         except RETRYABLE as exc:
@@ -1193,8 +1563,11 @@ async def _forward_later(ref: registry.Ref, digest: str, key: str) -> None:
         raise
     else:
         _pinned.discard(key)
-        _pending.pop(key, None)
+        _forget(key)
         _clear_obligation(key)
+        note_source(ref, digest)
+        # A manifest parked on this blob can go now.
+        _wake()
         if not settings.docker_cache_on_push:
             # Ephemeral store: it existed only to be forwarded, and upstream
             # now has it. Deleting AFTER confirmation is the whole point --
@@ -1212,18 +1585,139 @@ def referenced_digests(body: bytes) -> list[str]:
     points at other manifests rather than blobs; those have their own
     dependencies and are not chased here.
     """
+    return [d for d, kind, _ in _dependencies(body) if kind == "blob"]
+
+
+def _dependencies(body: bytes) -> list[tuple[str, str, str | None]]:
+    """(digest, "blob" | "manifest", media type) for everything a manifest
+    needs in its repository before it may be PUT there: the config and layers
+    of an image manifest, the child manifests of an index or manifest list."""
     try:
         doc = json.loads(body)
     except ValueError:
         return []
-    out = []
-    cfg = (doc.get("config") or {}).get("digest")
-    if cfg:
-        out.append(cfg)
+    if not isinstance(doc, dict):
+        return []
+    out: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+
+    def add(entry, kind):
+        if not isinstance(entry, dict):
+            return
+        d = entry.get("digest")
+        if isinstance(d, str) and ocistore.DIGEST_RE.match(d) and d not in seen:
+            seen.add(d)
+            out.append((d, kind, entry.get("mediaType")))
+
+    add(doc.get("config"), "blob")
     for layer in doc.get("layers") or []:
-        if layer.get("digest"):
-            out.append(layer["digest"])
+        add(layer, "blob")
+    for child in doc.get("manifests") or []:
+        add(child, "manifest")
     return out
+
+
+# --- where a blob can be MOUNTED from -----------------------------------------
+#
+# A cross-repository mount links a blob the registry already holds into another
+# repository without sending the bytes. Muninn knows a source two ways:
+#   - in memory, from what it has seen this process: a pull that fetched the
+#     blob from repository R, a forward that delivered it to R, a HEAD that
+#     found it in R. Bounded, newest kept;
+#   - durably, from tag mappings the upstream was SEEN to hold
+#     (ocistore.iter_observed_tags): if R's observed tag resolves, through the
+#     manifests held here, to a manifest referencing the blob, R had it.
+# Either can be stale -- a repository can be deleted -- and that is harmless: a
+# mount the registry cannot honour is answered with an ordinary upload session,
+# which is then used. A source is a hint; the HEAD before the manifest PUT is
+# the check.
+_SOURCES_MAX = 10_000
+_SOURCES_PER_BLOB = 4
+_sources: dict[str, list[str]] = {}
+
+
+def note_source(ref: registry.Ref, digest: str) -> None:
+    """`ref.repo` on `ref.upstream` holds `digest`."""
+    key = f"{ref.upstream}/{digest}"
+    repos = _sources.pop(key, [])
+    if ref.repo in repos:
+        repos.remove(ref.repo)
+    repos.append(ref.repo)
+    _sources[key] = repos[-_SOURCES_PER_BLOB:]
+    while len(_sources) > _SOURCES_MAX:
+        _sources.pop(next(iter(_sources)))
+
+
+def _manifest_closure_has(upstream: str, digest: str, want: str, depth: int = 0) -> bool:
+    held = ocistore.load_manifest(upstream, digest)
+    if held is None or depth > 2:
+        return False
+    for d, kind, _ in _dependencies(held.body):
+        if d == want:
+            return True
+        if kind == "manifest" and _manifest_closure_has(upstream, d, want, depth + 1):
+            return True
+    return False
+
+
+def _mount_sources(upstream: str, digest: str, target_repo: str) -> list[str]:
+    """Repositories on `upstream` believed to hold `digest`, newest first.
+    Blocking (it may read tag files): call it in a thread."""
+    out = [r for r in reversed(_sources.get(f"{upstream}/{digest}", []))
+           if r != target_repo]
+    if out:
+        return out
+    for entry in ocistore.iter_observed_tags():
+        if entry.get("upstream") != upstream or entry.get("repo") == target_repo:
+            continue
+        if entry["repo"] in out:
+            continue
+        if _manifest_closure_has(upstream, entry["digest"], digest):
+            out.append(entry["repo"])
+            if len(out) >= _SOURCES_PER_BLOB:
+                break
+    return out
+
+
+def _local_blob(upstream: str, digest: str) -> Path | None:
+    """The bytes of `digest` held here, from the cache or the pending area."""
+    p = ocistore.blob_path(upstream, digest)
+    if p.is_file():
+        return p
+    held = _held_path(f"{upstream}/{digest}")
+    return held if _durable() and held.is_file() else None
+
+
+class _Unconfirmed(Exception):
+    """The upstream did not say yes or no (an auth failure, a 5xx, a dropped
+    connection). Not "absent": nothing is delivered on the strength of it."""
+
+
+_MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+
+
+async def _present(ref: registry.Ref, digest: str, kind: str,
+                   media_type: str | None) -> bool:
+    """Is `digest` in `ref.repo` upstream? True, False, or _Unconfirmed."""
+    if kind == "blob":
+        path, headers = f"blobs/{digest}", None
+    else:
+        accept = f"{media_type}, {_MANIFEST_ACCEPT}" if media_type else _MANIFEST_ACCEPT
+        path, headers = f"manifests/{digest}", {"accept": accept}
+    try:
+        r = await registry.request(ref, "HEAD", path, headers)
+    except RETRYABLE as exc:
+        raise _Unconfirmed(f"upstream unreachable: {describe_exc(exc)}") from exc
+    if r.status_code == 200:
+        return True
+    if r.status_code == 404:
+        return False
+    raise _Unconfirmed(f"HEAD answered {r.status_code}")
 
 
 async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
@@ -1243,6 +1737,15 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
     digest = ocistore.compute_digest(body)
 
     if settings.docker_push_mode == "proxy":
+        # The same guarantee as the deferred path, inline: nothing is PUT while
+        # the target repository is missing something the manifest references.
+        blocking = await _resolve_dependencies(ref, body, None, set())
+        if blocking:
+            raise PushError(
+                502, "UNAVAILABLE",
+                f"not forwarding the manifest: {ref.upstream}/{ref.repo} does not "
+                "hold everything it references and Muninn could not deliver it: "
+                + "; ".join(blocking))
         r = await registry.request(
             ref, "PUT", f"manifests/{reference}",
             {"content-type": media_type, "content-length": str(len(body))},
@@ -1268,9 +1771,7 @@ async def push_manifest(ref: registry.Ref, body: bytes, media_type: str,
               "body_b64": base64.b64encode(body).decode()}
     _record_obligation(key, record)     # refused before any 201, in both modes
     _store_manifest(ref, digest, body, media_type, reference, force_keep=True)
-    _pinned.add(key)
-    _pending[key] = asyncio.create_task(
-        _forward_manifest_later(ref, body, media_type, reference, digest, key))
+    _schedule_manifest(ref, body, media_type, reference, digest, key)
     return digest
 
 
@@ -1284,21 +1785,215 @@ def _store_manifest(ref, digest, body, media_type, reference, *,
                        observed=observed and not ocistore.DIGEST_RE.match(reference))
 
 
+async def _deliver_blob(ref: registry.Ref, digest: str) -> tuple[bool, str | None]:
+    """Put a blob Muninn holds into the target repository, for a manifest that
+    needs it there. Mount first when a source repository is known; upload the
+    local bytes otherwise (push_blob does both, and hashes what it sends).
+
+    Raises PushError when the blob can never be delivered from here: not held,
+    or held but no longer matching its digest. Returns (False, why) for a
+    failure that a later attempt may not repeat.
+    """
+    src = _local_blob(ref.upstream, digest)
+    if src is None:
+        raise PushError(400, "MANIFEST_BLOB_UNKNOWN",
+                        f"blob {digest} is not in {ref.upstream}/{ref.repo} and "
+                        "Muninn does not hold it, so the manifest cannot be "
+                        "forwarded: the registry would hold an image missing "
+                        "that blob")
+    sources = await asyncio.to_thread(_mount_sources, ref.upstream, digest, ref.repo)
+    try:
+        how = await _with_retries(
+            lambda: push_blob(ref, src, digest, mount_from=sources),
+            what=f"blob {digest} to {ref.upstream}/{ref.repo} (needed by a manifest)",
+            key=None)
+    except asyncio.CancelledError:
+        raise
+    except PushError as exc:
+        if exc.code == "DIGEST_INVALID":
+            raise
+        return False, f"delivering it failed: {exc.message}"
+    except Exception as exc:  # noqa: BLE001 - reported on the manifest, not raised
+        return False, f"delivering it failed: {describe_exc(exc)}"
+    log.warning("%s %s into %s/%s for a manifest that references it: the client "
+                "skipped it because this cache held it, but that repository did "
+                "not", how, digest, ref.upstream, ref.repo)
+    try:
+        if await _present(ref, digest, "blob", None):
+            note_source(ref, digest)
+            return True, None
+    except _Unconfirmed as exc:
+        return False, f"{how}, but not confirmed: {exc}"
+    return False, f"{how}, but a HEAD in {ref.repo} still does not find it"
+
+
+async def _deliver_manifest(ref: registry.Ref, digest: str, media_type: str | None,
+                            key: str | None, confirmed: set[str],
+                            depth: int) -> tuple[bool, str | None]:
+    """Put a child manifest Muninn holds into the target repository, after its
+    own dependencies. Same contract as _deliver_blob."""
+    held = ocistore.load_manifest(ref.upstream, digest)
+    if held is None:
+        raise PushError(400, "MANIFEST_BLOB_UNKNOWN",
+                        f"manifest {digest} is not in {ref.upstream}/{ref.repo} and "
+                        "Muninn does not hold it, so the index cannot be forwarded")
+    if depth >= 2:
+        return False, "nested too deeply to deliver on the parent's behalf"
+    sub = await _resolve_dependencies(ref, held.body, key, confirmed, depth + 1)
+    if sub:
+        return False, "its own dependencies are not all upstream yet"
+    mt = held.media_type or media_type or "application/vnd.oci.image.manifest.v1+json"
+    try:
+        r = await _with_retries(
+            lambda: registry.request(
+                ref, "PUT", f"manifests/{digest}",
+                {"content-type": mt, "content-length": str(len(held.body))},
+                lambda: held.body),
+            what=f"manifest {digest} to {ref.upstream}/{ref.repo} (needed by an index)",
+            key=None)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - reported on the parent
+        return False, f"delivering it failed: {describe_exc(exc)}"
+    if r.status_code not in (201, 202):
+        return False, f"{ref.upstream} answered {r.status_code} to its PUT"
+    try:
+        if await _present(ref, digest, "manifest", mt):
+            return True, None
+    except _Unconfirmed as exc:
+        return False, f"PUT accepted, but not confirmed: {exc}"
+    return False, f"PUT accepted, but a HEAD in {ref.repo} does not find it"
+
+
+async def _resolve_dependencies(ref: registry.Ref, body: bytes, key: str | None,
+                                confirmed: set[str], depth: int = 0) -> list[str]:
+    """Make everything `body` references present in `ref.repo` upstream, or say
+    why not.
+
+    REGISTRIES SCOPE BLOBS PER REPOSITORY. A blob pulled through this cache from
+    repository A is held here and answered 200 to a pusher's HEAD for
+    repository B, so the pusher skips the upload -- correctly, as far as it can
+    tell -- and nothing ever sends that blob to B. Waiting only on the forwards
+    Muninn happens to be running cannot see that, and a registry that accepts a
+    manifest without verifying its blobs then holds an image missing a layer.
+
+    So every dependency is HEADed IN THE TARGET REPOSITORY, after any forward of
+    it in flight here has finished. One that is missing is delivered from here
+    if Muninn holds it (mount, else upload) and HEADed again.
+
+    Returns the dependencies still blocking, as reasons (empty: all present,
+    each confirmed by a HEAD in the target repository). Raises PushError when a
+    dependency can never be supplied from here (not held, or held corrupt).
+    A dependency whose OWN forward failed is blocking, not fatal: it may be
+    retried, and the manifest must not be failed for it.
+    """
+    deps = [x for x in _dependencies(body) if x[0] not in confirmed]
+    needs = _needs.setdefault(key, {}) if key is not None else {}
+
+    def mark(d: str, kind: str, state: str, detail: str | None = None) -> None:
+        if state == "present":
+            needs.pop(d, None)
+        else:
+            needs[d] = {"kind": kind, "state": state, "detail": detail}
+
+    inflight = []
+    for d, kind, _ in deps:
+        dkey = f"{ref.upstream}/{d}"
+        t = _pending.get(dkey)
+        if t is not None and not t.done() and dkey != key and dkey not in _blocked:
+            mark(d, kind, "forwarding")
+            inflight.append(t)
+    if inflight:
+        log.info("manifest for %s/%s waits on %d forward(s) in flight",
+                 ref.upstream, ref.repo, len(inflight))
+        # wait(), not gather(): cancelling this manifest must not cancel the
+        # forwards it is waiting on, and one failing must not end the wait.
+        await asyncio.wait(inflight)
+
+    blocking: list[str] = []
+    for d, kind, media in deps:
+        reraise_if_cancelled()
+        if d in confirmed:          # delivered on the way, as a child's dependency
+            continue
+        dkey = f"{ref.upstream}/{d}"
+        try:
+            if await _present(ref, d, kind, media):
+                confirmed.add(d)
+                mark(d, kind, "present")
+                if kind == "blob":
+                    note_source(ref, d)
+                continue
+        except _Unconfirmed as exc:
+            mark(d, kind, "unconfirmed", str(exc))
+            blocking.append(f"{d}: {exc}")
+            continue
+        task = _pending.get(dkey)
+        if task is not None and dkey != key:
+            state, err = _task_state(task)
+            if state != "done":
+                if dkey in _blocked:
+                    why = f"its own forward is blocked ({_blocked[dkey]})"
+                elif state == "running":
+                    why = "its own forward is still running"
+                else:
+                    why = f"its own forward {state}: {err}"
+                mark(d, kind, "blocked", why)
+                blocking.append(f"{d}: {why}")
+                continue
+        mark(d, kind, "delivering")
+        try:
+            if kind == "blob":
+                ok, why = await _deliver_blob(ref, d)
+            else:
+                ok, why = await _deliver_manifest(ref, d, media, key, confirmed, depth)
+        except PushError as exc:
+            mark(d, kind, "missing", exc.message)
+            raise
+        if ok:
+            confirmed.add(d)
+            mark(d, kind, "present")
+        else:
+            mark(d, kind, "blocked", why)
+            blocking.append(f"{d}: {why}")
+    return blocking
+
+
 async def _forward_manifest_later(ref, body, media_type, reference, digest, key):
-    """Wait for this manifest's blobs to land upstream, then deliver it.
+    """Make this manifest's dependencies present upstream, then deliver it.
+
+    NEVER PUT WHILE ANYTHING IT REFERENCES IS MISSING FROM THE TARGET
+    REPOSITORY (see _resolve_dependencies). A dependency that cannot be
+    resolved right now PARKS the manifest rather than failing it: a dependency
+    failure used to mark the manifest failed with no attempt counted and none
+    scheduled, so it stayed failed until a restart even after its blob was
+    delivered. Parked, it re-checks when a forward completes or is retried, and
+    on a slow timer, and no attempt is counted until a PUT is actually tried.
 
     Released on success only, for the same reason as a blob: a manifest whose
     forward failed is the record that the client was told 201 and the registry
     never got it. Tidying it away turns a visible failure into a silent one.
     """
     try:
-        deps = [_pending.get(f"{ref.upstream}/{d}")
-                for d in referenced_digests(body)]
-        deps = [t for t in deps if t is not None]
-        if deps:
-            log.info("manifest %s waits on %d blob forward(s) to %s",
-                     reference, len(deps), ref.upstream)
-            await asyncio.gather(*deps)
+        confirmed: set[str] = set()
+        rechecks = 0
+        while True:
+            reraise_if_cancelled()
+            gen = _generation[0]
+            blocking = await _resolve_dependencies(ref, body, key, confirmed)
+            if not blocking:
+                _blocked.pop(key, None)
+                break
+            _blocked[key] = "waiting on " + "; ".join(blocking)
+            if _generation[0] != gen:
+                continue        # something changed while checking: look again now
+            delay = DEP_RECHECK_S[min(rechecks, len(DEP_RECHECK_S) - 1)]
+            rechecks += 1
+            log.warning("manifest %s to %s/%s is BLOCKED, not failed: %s. No "
+                        "delivery attempted; re-checking when a dependency changes "
+                        "or in %ds", reference, ref.upstream, ref.repo,
+                        _blocked[key], delay)
+            await _park(delay)
+
         async def deliver():
             r = await registry.request(
                 ref, "PUT", f"manifests/{reference}",
@@ -1323,5 +2018,8 @@ async def _forward_manifest_later(ref, body, media_type, reference, digest, key)
         raise
     else:
         _pinned.discard(key)
-        _pending.pop(key, None)
+        _forget(key)
         _clear_obligation(key)
+        _wake()                 # an index parked on this manifest can go now
+    finally:
+        _blocked.pop(key, None)

@@ -506,6 +506,11 @@ def test_a_deferred_manifest_waits_for_its_blobs(monkeypatch, tmp_path):
         order.append("blob")
 
     async def upstream(r, method, path, headers=None, content=None):
+        # The pre-PUT HEAD in the target repository finds the blob once its
+        # forward has run, and not before.
+        if method == "HEAD":
+            code = 200 if "blob" in order else 404
+            return type("R", (), {"status_code": code, "headers": {}})()
         order.append("manifest")
         return type("R", (), {"status_code": 201, "headers": {}})()
 
@@ -531,8 +536,10 @@ def test_a_deferred_manifest_waits_for_its_blobs(monkeypatch, tmp_path):
         return order
 
     got = asyncio.run(go())
-    assert got and got[0] == "blob", \
-        f"the manifest was delivered before its blobs: {got}"
+    # Both, in this order. Checking only the first element passed vacuously
+    # once the manifest stopped being sent at all.
+    assert got == ["blob", "manifest"], \
+        f"the manifest was delivered before its blobs, or never: {got}"
 
 
 def test_a_held_but_unconfirmed_blob_gets_its_forward_rescheduled(monkeypatch, tmp_path):
