@@ -40,9 +40,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "docker_push_limits", None)
     monkeypatch.setattr(settings, "docker_blob_chunk", 0)
     pushlimits.reset()
-    ocipush._sessions.clear()
-    ocipush._pinned.clear()
-    ocipush._pending.clear()
+    ocipush.reset()
     yield
     pushlimits.reset()
 
@@ -749,9 +747,7 @@ def test_recovery_re_enqueues_what_a_previous_run_owed(monkeypatch, tmp_path):
     digest = asyncio.run(enqueue())
 
     # THE RESTART: memory goes, disk stays.
-    ocipush._pending.clear()
-    ocipush._pinned.clear()
-    ocipush._attempts.clear()
+    ocipush.reset()
     assert ocipush.pending() == [], "precondition: the queue looks empty"
 
     monkeypatch.setattr(ocipush, "_forward_later", capture)
@@ -806,3 +802,27 @@ def test_abandoning_a_forward_also_drops_its_marker(monkeypatch, tmp_path):
     assert list((tmp_path / "_pending").glob("*.json")), "a failed forward lost its record"
     ocipush.abandon("r.example.com", digest)
     assert not list((tmp_path / "_pending").glob("*.json"))
+
+
+def test_reset_clears_every_module_level_table():
+    """A table added to ocipush without being added to reset() leaks state, and
+    loop-bound futures, from one test's event loop into the next."""
+    import asyncio as _asyncio
+
+    tables = {n: v for n, v in vars(ocipush).items()
+              if n.startswith("_") and not n.startswith("__")
+              and isinstance(v, dict | set) and not n.isupper()}
+    loop = _asyncio.new_event_loop()
+    try:
+        for name, table in tables.items():
+            if isinstance(table, dict):
+                table.setdefault("__probe__", None)
+            else:
+                table.add(loop.create_future() if name == "_waiters" else "__probe__")
+        ocipush.reset()
+    finally:
+        loop.close()
+    leftover = {n for n, t in tables.items()
+                if (n == "_held" and t.get("bytes") is not None)
+                or (n != "_held" and len(t))}
+    assert not leftover, f"reset() does not clear: {sorted(leftover)}"

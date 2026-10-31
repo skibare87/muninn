@@ -62,13 +62,10 @@ def docker(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "docker_push_mode", "proxy")
     monkeypatch.setattr(settings, "docker_cache_on_push", True)
     monkeypatch.setattr(settings, "docker_partial_max_age_s", 6 * 3600.0)
-    ocipush._sessions.clear()
-    ocipush._pinned.clear()
-    ocipush._pending.clear()
-    ocipush._held["bytes"] = None
+    ocipush.reset()
     ocistore.reset_stats_cache()
     yield Path(settings.docker_dir)
-    ocipush._sessions.clear()
+    ocipush.reset()
 
 
 @pytest.fixture

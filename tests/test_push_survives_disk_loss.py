@@ -57,12 +57,7 @@ def _isolate(tmp_path, monkeypatch):
 
 def _restart():
     """Memory goes; whatever is on disk stays."""
-    ocipush._sessions.clear()
-    ocipush._pinned.clear()
-    ocipush._pending.clear()
-    ocipush._attempts.clear()
-    if hasattr(ocipush, "_held"):
-        ocipush._held["bytes"] = None
+    ocipush.reset()
 
 
 def _ref():

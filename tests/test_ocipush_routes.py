@@ -38,9 +38,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "docker_push_enabled", True)
     monkeypatch.setattr(settings, "docker_push_mode", "proxy")
     monkeypatch.setattr(settings, "docker_cache_on_push", True)
-    ocipush._sessions.clear()
-    ocipush._pinned.clear()
-    ocipush._pending.clear()
+    ocipush.reset()
 
     async def no_upstream(ref, path, digest):
         return None

@@ -2023,3 +2023,15 @@ async def _forward_manifest_later(ref, body, media_type, reference, digest, key)
         _wake()                 # an index parked on this manifest can go now
     finally:
         _blocked.pop(key, None)
+
+
+def reset() -> None:
+    """Forget every piece of in-process push state, as a process restart would;
+    nothing on disk is touched. One list, here beside the state it clears, so a
+    new module-level table cannot be left out of it -- tests that cleared tables
+    by hand missed the loop-bound `_waiters` and leaked futures across event loops.
+    """
+    for table in (_sessions, _pending, _pinned, _meta, _needs, _blocked,
+                  _waiters, _attempts, _sources):
+        table.clear()
+    _held["bytes"] = None

@@ -55,13 +55,7 @@ def _sha(b: bytes) -> str:
 
 
 def _reset_push_state() -> None:
-    ocipush._sessions.clear()
-    ocipush._pinned.clear()
-    ocipush._pending.clear()
-    ocipush._attempts.clear()
-    for name in ("_meta", "_needs", "_blocked", "_sources"):
-        getattr(ocipush, name, {}).clear()
-    ocipush._held["bytes"] = None
+    ocipush.reset()
 
 
 @pytest.fixture
