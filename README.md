@@ -1118,6 +1118,7 @@ bearer token.
 | `DELETE` | `/_cache/docker/images` | drop a tag; frees every layer no other tag references. `?sweep=1` reclaims now and reports the bytes, otherwise the next sweep does it |
 | `POST` | `/_cache/docker/gc` | run mark-and-sweep now (`?dry_run=true` to see what would go) |
 | `GET` | `/_cache/docker/pending` | store-forward: what has been accepted but not yet confirmed upstream |
+| `POST` | `/_cache/docker/pending/retry` | retry one outstanding forward (`{"upstream", "digest"}`), or every failed one (no body), without a restart; returns what it scheduled |
 | `DELETE` | `/_cache/docker/pending` | give up on one outstanding forward and unpin it — **the content is then evictable and may be the only copy** |
 
 Prewarm is fire-and-forget, so nobody holds an HTTP connection open across a 30 GB pull.
@@ -1293,6 +1294,34 @@ that "eventually" is a commitment rather than a hope.
 - **Manifests are deferred until their blobs are upstream.** A manifest that lands before
   its layers is a tag that resolves to a broken image, which is worse than a tag that does
   not resolve yet. Muninn holds the manifest until every blob it references is confirmed.
+- **"Upstream" means the repository being pushed to.** Registries keep blobs per
+  repository: a layer in `team/base` is not in `team/app` until it is uploaded or mounted
+  there. When a client asks this cache whether `team/app` has a layer it pulled earlier
+  from `team/base`, the cache answers `200` because it holds the bytes, and the client
+  skips the upload. So before a manifest is sent, Muninn checks (`HEAD`) every blob it
+  references in the **target** repository. For an index, it checks the child manifests
+  too. Anything missing there is delivered first:
+  - **held here**: mounted from another repository on the same registry that Muninn knows
+    has it (one it pulled the blob from, delivered it to, or saw it in, or one whose tag it
+    has seen the registry serve with that blob). If no source is known, or the registry
+    declines the mount, the local copy is uploaded. Every byte is hashed as it is sent, and
+    a copy that no longer matches its digest is never finalised. After a mount or an
+    upload, the blob is checked again in the target repository.
+  - **not held here**: the manifest forward fails with an error naming the missing digest.
+
+  **A manifest is never sent while anything it references is missing from the target
+  repository.** Some registries accept such a manifest without checking, and the result is
+  a tag for an image that cannot be pulled. `proxy` mode does the same checks before it
+  forwards the manifest.
+- **A dependency that fails does not fail the manifest.** If a blob forward fails, the
+  manifest that needs it shows as `blocked` with no attempts counted. It is not marked
+  failed. It checks again when any forward completes or is retried, and every few minutes
+  in any case, in case the blob was pushed some other way. Once everything is present, it
+  is delivered with its own 5 attempts.
+- **A finalise that errors is checked before it counts as failed.** A registry can store a
+  blob and still answer `5xx`, or drop the connection, on the request that finalises it.
+  When that happens, Muninn checks for the blob in the target repository. If it is there at
+  the right size, the upload counts as successful.
 - **Transport failures retry with backoff** (5 attempts, 1s/4s/15s/45s). A registry that is
   briefly unreachable does not cost you the push.
 - **Outstanding forwards survive a restart.** Each one is recorded on disk before the client
@@ -1355,14 +1384,29 @@ its staged bytes are reclaimed, after `XHC_DOCKER_PARTIAL_MAX_AGE` idle (see
   `GET /_cache/docker/pending` is empty first.
 
 `GET /_cache/docker/pending` is the window into all of it, one row per outstanding forward
-with `state` (`running`, `retrying`, `failed`, `cancelled`, `done`), the `error` text if it
-failed, `attempts`/`max_attempts`, and whether it is `pinned`. **An empty queue means
-delivered** — that is the distinction the whole mechanism exists to create, and it is worth
-checking directly against the upstream at least once rather than trusting the queue alone.
+with `kind` (`blob` or `manifest`), `repo`, `state` (`running`, `retrying`, `blocked`,
+`failed`, `cancelled`, `done`), the `error` text if it failed (or, for `blocked`, what it is
+waiting on), `attempts`/`max_attempts`, and whether it is `pinned`. A manifest row also has
+`reference` and `needs`. `needs` lists every blob or child manifest it references that has
+not yet been found in the target repository, each with a `state` (`unchecked`,
+`forwarding`, `delivering`, `blocked`, `unconfirmed`, `missing`) and a `detail`. That
+includes blobs the client never uploaded through Muninn, so a manifest waiting on a pulled
+layer is visible too. **An empty queue means delivered** — that is the distinction the
+whole mechanism exists to create, and it is worth checking directly against the upstream at
+least once rather than trusting the queue alone.
+
+Retrying does not need a restart: `POST /_cache/docker/pending/retry` with
+`{"upstream": ..., "digest": ...}` retries one entry, and with no body it retries every
+failed or cancelled one. A retried entry is rebuilt from its record on disk, as a restart
+would rebuild it, and gets a fresh set of attempts. A `blocked` manifest is told to check
+its dependencies again. The response lists what was `scheduled` and what was `rechecked`.
+An entry that is not pending gets `404`. One that is being forwarded right now gets `409`.
 
 Giving up is explicit: `DELETE /_cache/docker/pending` abandons one forward and unpins it.
 That is a deliberate decision to break the promise made to whoever pushed, and it makes the
-content evictable when it may be the only copy anywhere. Nothing does it automatically.
+content evictable when it may be the only copy anywhere. Nothing does it automatically. A
+`blocked` manifest can be abandoned. It is waiting, not sending, so there is no upload in
+flight to race.
 
 #### What enabling push means
 
