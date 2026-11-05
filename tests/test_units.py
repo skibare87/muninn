@@ -23,6 +23,7 @@ from app.cachefs import repo_folder_name, repo_key
 from app.config import TierSettings, parse_size
 from app.hfcompat import is_xet_token_path, parse_resolve
 from app.jwtconfig import IssuerConfig
+from app.regcreds import CredentialEntry
 from app.serving import parse_range
 
 
@@ -730,6 +731,12 @@ ENV_GROUPS = [
         },
         {"jwt_issuers": (IssuerConfig(issuer="https://k8s.example", audiences=("muninn",),
                                       subject_template="k8s:{sub}"),)},
+    ),
+    (
+        {"XHC_REGISTRY_CREDENTIALS": '[{"hosts": ["*-docker.pkg.dev", "GCR.io"],'
+                                     ' "provider": "gcp-metadata"}]'},
+        {"registry_credentials": (CredentialEntry(hosts=("*-docker.pkg.dev", "gcr.io"),
+                                                  provider="gcp-metadata"),)},
     ),
     (
         # Hub writes: only with key auth and enforced rules (the default).

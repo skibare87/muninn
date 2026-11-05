@@ -31,15 +31,24 @@ that the repository holds what it references -- as some real registries do --
 and records, at the moment of every manifest PUT, which referenced blobs were
 missing. `events` is one ordered log of every blob HEAD answer and every
 manifest PUT, so a test can assert what was confirmed before a manifest arrived.
+
+OAUTH MODE (`require_oauth`, or a FakeMetadata tied to the registry) is how
+Google Artifact Registry authenticates: the token endpoint accepts only Basic
+`oauth2accesstoken:<t>` for a currently valid OAuth token t, and a bearer token
+works only while the OAuth token it was exchanged for is still valid. FakeMetadata
+is the metadata server (and Google's token endpoint for the service-account
+flow) that issues those OAuth tokens; rotating it revokes the old one.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.server
 import json
 import socket
 import threading
+import time
 import uuid as uuidlib
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote, urlparse
@@ -127,6 +136,22 @@ class _State:
         self.log: list[str] = []
         self.token_log: list[str] = []
         self.token_url = ""
+        # OAUTH MODE, as Google Artifact Registry authenticates. None: off, and
+        # the token endpoint issues TOKEN to anyone. A set: the token endpoint
+        # accepts only Basic `oauth2accesstoken:<t>` for a t in it, issues a
+        # bearer token DERIVED from t, and the registry accepts a bearer token
+        # only while the OAuth token it came from is still in this set -- so
+        # revoking t (expiry) also kills every bearer token exchanged for it.
+        self.oauth_valid: set[str] | None = None
+        self.oauth_seen: list[str | None] = []  # the OAuth token each exchange presented
+        self.bearer_ttl = 3600
+
+    def bearer_ok(self, header: str | None) -> bool:
+        if self.oauth_valid is None:
+            return header == f"Bearer {TOKEN}"
+        prefix = f"Bearer {TOKEN}+"
+        return bool(header and header.startswith(prefix)
+                    and header[len(prefix):] in self.oauth_valid)
 
 
 def _err_body(code: str | None) -> bytes:
@@ -149,7 +174,7 @@ def _make_registry_handler(state: _State):
         def _serve(self):
             path = unquote(urlparse(self.path).path)
             state.log.append(f"{self.command} {path}")
-            if self.headers.get("authorization") != f"Bearer {TOKEN}":
+            if not state.bearer_ok(self.headers.get("authorization")):
                 return self._send(401, {
                     "www-authenticate": (f'Bearer realm="{state.token_url}",'
                                          'service="fake-registry"'),
@@ -194,7 +219,7 @@ def _make_registry_handler(state: _State):
             return self.rfile.read(n) if n else b""
 
         def _authed(self) -> bool:
-            if self.headers.get("authorization") == f"Bearer {TOKEN}":
+            if state.bearer_ok(self.headers.get("authorization")):
                 return True
             self._body()
             self._send(401, {
@@ -331,13 +356,35 @@ def _make_registry_handler(state: _State):
     return H
 
 
+def _oauth_from_basic(header: str | None) -> str | None:
+    """The OAuth token in `Basic base64(oauth2accesstoken:<t>)`, else None."""
+    if not header or not header.lower().startswith("basic "):
+        return None
+    try:
+        user, _, password = base64.b64decode(header[6:]).decode().partition(":")
+    except ValueError:
+        return None
+    return password if user == "oauth2accesstoken" else None
+
+
 def _make_token_handler(state: _State):
     class T(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             state.token_log.append(self.path)
+            oauth = None
+            if state.oauth_valid is not None:
+                oauth = _oauth_from_basic(self.headers.get("authorization"))
+                state.oauth_seen.append(oauth)
             if state.token_status != 200:
                 body = b'{"details":"refused"}'
                 self.send_response(state.token_status)
+            elif state.oauth_valid is not None and oauth not in state.oauth_valid:
+                body = b'{"details":"invalid or expired oauth2accesstoken"}'
+                self.send_response(401)
+            elif state.oauth_valid is not None:
+                body = json.dumps({"token": f"{TOKEN}+{oauth}",
+                                   "expires_in": state.bearer_ttl}).encode()
+                self.send_response(200)
             else:
                 body = json.dumps({"token": TOKEN, "expires_in": 300}).encode()
                 self.send_response(200)
@@ -425,6 +472,10 @@ class FakeRegistry:
     def token_answer(self, status: int) -> None:
         self.state.token_status = status
 
+    def require_oauth(self, *valid: str) -> None:
+        """Artifact-Registry mode: only these OAuth tokens are accepted."""
+        self.state.oauth_valid = set(valid)
+
     def refuse(self) -> None:
         self.registry.refuse()
 
@@ -440,3 +491,95 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class FakeMetadata:
+    """A GCE/GKE metadata server's token endpoint, plus a Google OAuth token
+    endpoint for the service-account flow. One real HTTP server.
+
+    GET  /computeMetadata/v1/instance/service-accounts/default/token
+         needs `Metadata-Flavor: Google`; answers the CURRENT token.
+    POST /token  the JWT-bearer grant; records each form and answers the
+         current token.
+
+    `rotate()` issues a new current token and, when tied to a FakeRegistry,
+    revokes the old one there -- which is what expiry means to the registry.
+    `delay_s` holds every answer, so concurrent callers overlap; `status`
+    forces an error answer; `body` replaces a 200's body.
+    """
+
+    PATH = "/computeMetadata/v1/instance/service-accounts/default/token"
+
+    def __init__(self, registry: FakeRegistry | None = None, ttl: int = 3600):
+        self.registry = registry
+        self.ttl = ttl
+        self.n = 0
+        self.current = ""
+        self.status = 200
+        self.body: bytes | None = None
+        self.delay_s = 0.0
+        self.requests: list[str] = []
+        self.forms: list[dict] = []
+        self.rotate()
+        fake = self
+
+        class M(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                if fake.delay_s:
+                    time.sleep(fake.delay_s)
+                if fake.status != 200:
+                    body, status = b'{"error":"forced"}', fake.status
+                else:
+                    body = fake.body if fake.body is not None else json.dumps(
+                        {"access_token": fake.current, "expires_in": fake.ttl,
+                         "token_type": "Bearer"}).encode()
+                    status = 200
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                fake.requests.append(f"GET {self.path}")
+                if (urlparse(self.path).path != FakeMetadata.PATH
+                        or self.headers.get("metadata-flavor") != "Google"):
+                    self.send_response(403)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                self._answer()
+
+            def do_POST(self):
+                fake.requests.append(f"POST {self.path}")
+                n = int(self.headers.get("content-length") or 0)
+                form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+                fake.forms.append(form)
+                self._answer()
+
+            def log_message(self, *a):
+                return
+
+        self.server = _Server(M)
+
+    def rotate(self) -> str:
+        old = self.current
+        self.n += 1
+        self.current = f"oauth-{self.n}"
+        if self.registry is not None:
+            valid = self.registry.state.oauth_valid or set()
+            valid.discard(old)
+            valid.add(self.current)
+            self.registry.state.oauth_valid = valid
+        return self.current
+
+    @property
+    def token_url(self) -> str:
+        return f"{self.server.url}{self.PATH}"
+
+    @property
+    def oauth_url(self) -> str:
+        return f"{self.server.url}/token"
+
+    def close(self) -> None:
+        self.server.refuse()
