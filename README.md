@@ -2251,11 +2251,21 @@ than an invented answer.
 
 ### Google Artifact Registry
 
-> **Verified only against fakes, not a live GCP project.** The tests run a fake metadata
-> server, a fake Google token endpoint and a fake registry whose token endpoint accepts only
-> the current `oauth2accesstoken`. Nothing has been pulled from or pushed to a real
-> `*-docker.pkg.dev` yet, so the first run on a real cluster is the real test. If it fails,
-> the `x-xhc-upstream-auth` header and the cache's log say which layer refused.
+> **Verified against a live Artifact Registry**, from a GCE VM using the `gcp-metadata`
+> provider (the VM's own service account, no key on disk):
+>
+> - **pull**: an image through a remote repository, with the index, a platform
+>   manifest and a 3.85 MB layer served and digest-verified. The same request on a
+>   Muninn without the provider was refused by Artifact Registry, so the provider is
+>   what made it work.
+> - **push** (`XHC_DOCKER_PUSH_MODE=proxy`) to a standard repository in another
+>   project. The client uploaded only the config blob and skipped a layer that
+>   Muninn already held from a pull of a different repository. Muninn found the
+>   layer missing in the target repository, mounted it there, and only then PUT
+>   the manifest. Read back from Artifact Registry directly, the manifest and both
+>   blobs were present with matching digests.
+>
+> The `gcp-service-account` provider is tested against fakes only.
 
 Artifact Registry (`<region>-docker.pkg.dev`) and Container Registry (`gcr.io`, `*.gcr.io`)
 authenticate with **short-lived OAuth access tokens**, which last about an hour. A static
