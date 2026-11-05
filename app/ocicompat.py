@@ -174,6 +174,22 @@ def _unavailable(ref: registry.Ref, up: dict | int | None,
 
     configured = registry.has_credentials(ref.upstream)
 
+    # THE CACHE COULD NOT OBTAIN ITS OWN CREDENTIAL. A token provider (the
+    # metadata server, a service-account token endpoint) did not answer or
+    # refused, so nothing was presented upstream at all. That is neither
+    # "not found" nor "your credentials were rejected", and saying either
+    # sends the reader to the wrong place: this is the cache host's identity.
+    if token_state == "credential":
+        provider = (up.get("credential_provider") if isinstance(up, dict) else None) or "provider"
+        metrics.record_docker("UPSTREAM_AUTH", kind)
+        return _err(502, "UNAVAILABLE",
+                    f"this cache could not obtain its credential for {ref.upstream}: the "
+                    f"{provider} credential provider failed (see the cache's log). "
+                    f"Nothing was presented to {ref.upstream}; this is not a missing "
+                    "image and not a rejected login.",
+                    {"x-xhc-upstream-status": "401",
+                     "x-xhc-upstream-auth": "credential-provider-failed"})
+
     # A 401 AFTER WE SUCCESSFULLY AUTHENTICATED IS AN ANSWER, NOT A GATEWAY
     # FAILURE, and with no credentials configured it is the ordinary way a
     # registry says "no such repository".

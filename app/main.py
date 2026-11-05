@@ -32,6 +32,8 @@ from . import (
     orphans,
     pushlimits,
     refs,
+    regcreds,
+    registry,
     shutdown,
     statedir,
     tier,
@@ -227,6 +229,14 @@ async def lifespan(app: FastAPI):
         if settings.hf_auth != "key":
             log.warning("XHC_JWT_ISSUERS is set but XHC_HF_AUTH is not `key`: the "
                         "Hugging Face surface is unauthenticated and ignores tokens.")
+
+    if settings.registry_credentials:
+        # Raises on a service-account key file that cannot be read or does not
+        # load: refused at boot, not discovered as every pull from that
+        # registry failing. Token fetches happen on first use, never here, so a
+        # metadata server that is slow at boot delays nothing.
+        registry.reset_credentials()
+        regcreds.load()
 
     # The object-store tier: probes in the background and fails open, so a
     # bucket that is down at boot delays nothing. A no-op when XHC_TIER2 is unset.

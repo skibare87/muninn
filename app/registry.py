@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import httpclients
+from . import httpclients, regcreds
 from .config import settings
 
 log = logging.getLogger("xhc.registry")
@@ -120,6 +120,11 @@ async def close_client() -> None:
     await _http.aclose()
 
 
+# Token providers fetch through this module's loop-bound client, so a provider's
+# requests are rebuilt on a new event loop exactly as the registry's are.
+regcreds.set_client_factory(_get_client)
+
+
 def _load_credentials() -> dict:
     """Read a standard ~/.docker/config.json. Reusing the format `docker login`
     already produces means no bespoke config format, and mounting it as a Docker
@@ -147,8 +152,10 @@ def _load_credentials() -> dict:
 
 
 def reset_credentials() -> None:
+    """Forget the static file AND every provider's cached token."""
     global _creds_cache  # noqa: PLW0603 - module-level cache
     _creds_cache = None
+    regcreds.reset()
 
 
 def has_credentials(upstream: str) -> bool:
@@ -158,13 +165,71 @@ def has_credentials(upstream: str) -> bool:
     that registry" from "the credentials it has were rejected". Those have
     different fixes and different owners, and before an internal issue both rendered as
     404 MANIFEST_UNKNOWN along with "genuinely not there".
+
+    A host governed by a token PROVIDER is configured whether or not its last
+    fetch succeeded: configured is a fact about the operator's intent, and a
+    provider that fails is reported as such, never as "not logged in".
     """
+    entry = regcreds.entry_for(upstream)
+    if entry is not None and entry.provider != "static":
+        return True
     return _basic_for(upstream) is not None
 
 
 def _basic_for(upstream: str) -> str | None:
+    """The STATIC login for an upstream, base64-encoded. Synchronous and
+    file-backed; a host with a token provider goes through _credential()."""
     creds = _load_credentials().get(upstream)
     return base64.b64encode(creds.encode()).decode() if creds else None
+
+
+@dataclass(frozen=True)
+class _Cred:
+    """What _credential() found. `basic` is the base64 Basic value (None: hold
+    nothing for this host); `expires_at` caps anything derived from it;
+    `failed` means a provider was configured and could not produce one."""
+
+    basic: str | None
+    expires_at: float | None = None
+    failed: bool = False
+
+
+async def _credential(upstream: str, out: dict | None = None) -> _Cred:
+    """The credential to present to `upstream`, from its provider or the file.
+
+    EVERY place this module authenticates goes through here -- the token
+    exchange, a Basic challenge, and the preemptive Basic re-send -- so a host
+    with a provider can never fall back to a stale static value, and a host
+    without one behaves exactly as before.
+
+    A provider that fails is recorded in `out["token"] = "credential"`. That is
+    the cache failing to obtain ITS OWN credential: an upstream auth failure,
+    which renders as 502 and never as "not found", and is not an outage of the
+    registry (tierrestore does not restore on it).
+    """
+    try:
+        provider = regcreds.provider_for(upstream)
+    except regcreds.CredentialUnavailable as exc:
+        provider, failure = None, str(exc)
+    else:
+        failure = None
+        if provider is None:
+            return _Cred(_basic_for(upstream))
+        try:
+            c = await provider.credential()
+        except regcreds.CredentialUnavailable as exc:
+            failure = str(exc)
+        else:
+            return _Cred(base64.b64encode(c.userpass.encode()).decode(), c.expires_at)
+    kind = getattr(provider, "kind", "provider")
+    log.warning("UPSTREAM AUTH: the %s credential provider for %s could not produce a "
+                "credential: %s", kind, upstream, failure)
+    if out is not None:
+        out["token"] = "credential"
+        out["token_status"] = None
+        out["token_transport"] = False
+        out["credential_provider"] = kind
+    return _Cred(None, None, failed=True)
 
 
 def _parse_challenge(header: str) -> dict:
@@ -233,9 +298,13 @@ async def _fetch_token(ref: Ref, challenge: dict, out: dict | None = None) -> st
     params = {k: v for k, v in challenge.items() if k in ("service", "scope") and v}
     params.setdefault("scope", f"repository:{ref.repo}:pull")
     headers = {}
-    basic = _basic_for(ref.upstream)
-    if basic:
-        headers["authorization"] = f"Basic {basic}"
+    cred = await _credential(ref.upstream, out)
+    if cred.failed:
+        # Not an anonymous fetch instead: a registry that refused it would read
+        # as "credentials rejected", which names the wrong fault.
+        return None
+    if cred.basic:
+        headers["authorization"] = f"Basic {cred.basic}"
     try:
         r = await _get_client().get(realm, params=params, headers=headers)
     except (httpx.HTTPError, ValueError) as exc:
@@ -264,7 +333,14 @@ async def _fetch_token(ref: Ref, challenge: dict, out: dict | None = None) -> st
         return None
     ttl = float(body.get("expires_in") or 300)
     # Expire a little early rather than discovering staleness mid-pull.
-    _tokens[(ref.upstream, params["scope"])] = (token, time.time() + max(ttl - 30, 30))
+    expires = regcreds.now() + max(ttl - 30, 30)
+    if cred.expires_at is not None:
+        # A bearer token exchanged for a short-lived OAuth token must not
+        # outlive it. The registry may issue a longer one; it is still derived
+        # from a credential that is about to stop being valid, so it is dropped
+        # with it and the next request exchanges the refreshed one.
+        expires = min(expires, cred.expires_at - 30)
+    _tokens[(ref.upstream, params["scope"])] = (token, expires)
     return token
 
 
@@ -273,7 +349,7 @@ def _cached_token(ref: Ref) -> str | None:
     if not entry:
         return None
     token, expires = entry
-    return token if time.time() < expires else None
+    return token if regcreds.now() < expires else None
 
 
 def clear_tokens() -> None:
@@ -308,7 +384,7 @@ async def _authed_request(
         out["authenticated"] = False
     client = _get_client()
     hdrs = dict(headers)
-    token = _cached_token(ref)
+    token = sent_token = _cached_token(ref)
     if token:
         hdrs["authorization"] = f"Bearer {token}"
     elif ref.upstream in _basic_upstreams and "authorization" not in hdrs:
@@ -331,7 +407,7 @@ async def _authed_request(
         # us for Basic, so configuring an auth file cannot leak them to a
         # registry that never asked. The first request to a registry is still
         # challenge-response; every one after it is not.
-        basic = _basic_for(ref.upstream)
+        basic = (await _credential(ref.upstream, out)).basic
         if basic:
             hdrs["authorization"] = f"Basic {basic}"
             if out is not None:
@@ -382,7 +458,10 @@ async def _authed_request(
         # upstream that actually asked for them, so configuring an auth file
         # cannot leak them to a registry that never challenges.
         _basic_upstreams.add(ref.upstream)
-        basic = _basic_for(ref.upstream)
+        cred = await _credential(ref.upstream, out)
+        basic = cred.basic
+        if cred.failed:
+            return r
         if not basic:
             # Challenged for Basic and we hold nothing for this upstream. Hand
             # back the registry's own answer; inventing one would hide the fact
@@ -417,8 +496,14 @@ async def _authed_request(
 
     lock = _token_locks.setdefault((ref.upstream, ref.repo), asyncio.Lock())
     async with lock:
-        # Another request may have refreshed while we waited.
-        token = _cached_token(ref) or await _fetch_token(ref, challenge, out)
+        # Another request may have refreshed while we waited. But a cached
+        # token is reused only if it is not the one just refused: re-sending a
+        # token the registry has answered 401 to is a loop that ends in that
+        # same 401 -- which is what a revoked or early-expired OAuth token
+        # behind a cached bearer token would otherwise produce until expiry.
+        cached = _cached_token(ref)
+        token = (cached if cached and cached != sent_token
+                 else await _fetch_token(ref, challenge, out))
     if not token:
         return r
     hdrs["authorization"] = f"Bearer {token}"

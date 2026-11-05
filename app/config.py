@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 
 from .jwtconfig import IssuerConfig
 from .jwtconfig import parse as parse_jwt_issuers
+from .regcreds import CredentialEntry
+from .regcreds import parse as parse_registry_credentials
 
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)i?B?\s*$", re.IGNORECASE)
 _MULT = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
@@ -547,6 +549,10 @@ class Settings:
     # Upstream credentials as a standard ~/.docker/config.json, so `docker
     # login` output can be mounted directly and nothing bespoke is invented.
     registry_auth_file: str | None = None
+    # Per-upstream credential PROVIDERS (app/regcreds.py), for registries whose
+    # credential is a short-lived token: Google Artifact Registry and gcr.io.
+    # Empty means every upstream uses the static file above, as before.
+    registry_credentials: tuple[CredentialEntry, ...] = ()
 
     # --- push-through (an internal issue) ---------------------------------------------
     # OFF by default: enabling it means a client's `docker push` causes Muninn
@@ -888,6 +894,10 @@ class Settings:
             docker_auth=docker_auth,
             docker_htpasswd=os.environ.get("XHC_DOCKER_HTPASSWD") or None,
             registry_auth_file=os.environ.get("XHC_REGISTRY_AUTH_FILE") or None,
+            # Fails on the ARGUMENTS: a malformed declaration is a named
+            # startup error, never a silently static-only cache.
+            registry_credentials=parse_registry_credentials(
+                os.environ.get("XHC_REGISTRY_CREDENTIALS")),
             docker_push_enabled=_env_bool("XHC_DOCKER_PUSH", cls.docker_push_enabled),
             docker_push_mode=push_mode,
             docker_cache_on_push=_env_bool(
