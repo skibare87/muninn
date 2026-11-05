@@ -164,29 +164,59 @@ class StaticKeys:
 class GcpMetadataToken:
     """An OAuth token from the GKE/GCE metadata server (workload identity).
 
-    Refreshed before it expires. The XML API is then called with
-    `Authorization: Bearer`, with no SigV4 at all.
+    Refreshed before it expires, single-flight: concurrent callers wait on one
+    fetch. The XML API is then called with `Authorization: Bearer`, with no
+    SigV4 at all. The registry's gcp-metadata credential provider
+    (app/regcreds.py) uses this same client rather than a second one.
+
+    `client` is a fixed httpx client (the tier's); `client_factory` instead
+    returns the client to use per fetch (the registry's, which is rebuilt per
+    event loop). `clock` is wall-clock seconds, injectable for tests.
+
+    Raises TierAuthError when the metadata server answers with anything but a
+    usable token, and lets a transport failure (httpx.HTTPError) through.
     """
 
     kind = "gcp-metadata"
 
-    def __init__(self, client: httpx.AsyncClient, url: str = GCP_TOKEN_URL):
+    def __init__(self, client: httpx.AsyncClient | None = None, url: str = GCP_TOKEN_URL,
+                 *, client_factory=None, clock=time.time):
+        if (client is None) == (client_factory is None):
+            raise ValueError("GcpMetadataToken needs exactly one of client, client_factory")
         self._client = client
+        self._client_factory = client_factory
         self._url = url
+        self._clock = clock
         self._token: str | None = None
         self._expires_at = 0.0
         self._lock = asyncio.Lock()
 
+    @property
+    def expires_at(self) -> float:
+        """When the current token stops being valid, by `clock`."""
+        return self._expires_at
+
     async def token(self) -> str:
         async with self._lock:
-            if self._token and time.time() < self._expires_at - _TOKEN_SLACK_S:
+            if self._token and self._clock() < self._expires_at - _TOKEN_SLACK_S:
                 return self._token
-            r = await self._client.get(self._url, headers={"Metadata-Flavor": "Google"})
+            client = self._client if self._client is not None else self._client_factory()
+            r = await client.get(self._url, headers={"Metadata-Flavor": "Google"})
             if r.status_code != 200:
                 raise TierAuthError(f"metadata server returned {r.status_code} for a token")
-            body = r.json()
-            self._token = body["access_token"]
-            self._expires_at = time.time() + float(body.get("expires_in", 0))
+            # A 200 that is not a token (a proxy's HTML page, a body without
+            # access_token) used to escape as ValueError/KeyError. It is a
+            # failure to obtain a credential, and is reported as one.
+            try:
+                body = r.json()
+                token = body["access_token"]
+                ttl = float(body.get("expires_in", 0))
+            except (ValueError, KeyError, TypeError):
+                raise TierAuthError("metadata server answered 200 without a usable token") from None
+            if not isinstance(token, str) or not token:
+                raise TierAuthError("metadata server answered 200 with an empty token")
+            self._token = token
+            self._expires_at = self._clock() + ttl
             return self._token
 
     def __repr__(self) -> str:
