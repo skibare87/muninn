@@ -9,6 +9,55 @@ Images are published to `ghcr.io/skibare87/muninn`. Only the full `X.Y.Z` tag is
 immutable; `X.Y`, `latest` and `edge` all move.
 
 
+## v0.9.36 — 2026-11-05
+
+v0.9.36 -- Google Artifact Registry as a first-class upstream and push target
+
+Upstream credentials were static `docker login` strings, read once and kept
+for the life of the process. Artifact Registry (`<region>-docker.pkg.dev`)
+and Container Registry (`gcr.io`) issue short-lived OAuth tokens, so a static
+login stopped working after about an hour, and workload identity could not
+be used at all.
+
+XHC_REGISTRY_CREDENTIALS chooses a credential provider per upstream host:
+
+  static                today's docker-config login. The default, so
+                        existing deployments are unchanged.
+  gcp-metadata          an access token from the GCE/GKE metadata server
+                        (workload identity; no key on disk), refreshed
+                        single-flight before it expires.
+  gcp-service-account   a service-account key file. The key stays in the
+                        process and only an hour-long access token reaches the
+                        registry; `"present": "json-key"` sends `_json_key`
+                        instead.
+
+  XHC_REGISTRY_CREDENTIALS='[{"hosts":["*-docker.pkg.dev","gcr.io","*.gcr.io"],
+                              "provider":"gcp-metadata"}]'
+
+Hosts match exactly or by a leading `*.` / `*-` covering one DNS label. An
+exact match beats any wildcard, and the longest wildcard wins. A malformed
+declaration or an unreadable key file refuses startup. If a provider fails,
+nothing is presented upstream and the client gets a 502 with
+x-xhc-upstream-auth: credential-provider-failed, never "not found".
+
+Everything Muninn does for other registries now applies to Artifact
+Registry: pull-through by path (`<cache>/us-docker.pkg.dev/<project>/<repo>/
+<image>`), push-through with the target-repository guarantees from v0.9.35,
+per-key rules, prewarm, pins and GC, and the object-store tier and restore.
+
+Verified against a live Artifact Registry from a GCE VM using gcp-metadata:
+  - a pull through a remote repository, digest-verified. The same request
+    without the provider was refused.
+  - a push into a standard repository in another project, where the client
+    skipped a layer Muninn held from a different repository. Muninn mounted
+    it into the target before the manifest PUT, and the image read back
+    complete from Artifact Registry.
+The service-account provider is tested against fakes only.
+
+Also: a cached bearer token that the registry has just refused is exchanged
+again instead of being re-sent.
+
+
 ## v0.9.35 — 2026-10-31
 
 v0.9.35 -- store-forward never sends a manifest to a repository missing one of its blobs
