@@ -1198,6 +1198,7 @@ different `pin` value is a different prewarm).
 | `XHC_DOCKER_MIN_FREE` | `1G` | below this much free space, a miss is **proxied to the client uncached** instead of ingested; `0` disables |
 | `XHC_DOCKER_PARTIAL_MAX_AGE` | `21600` | seconds a `.incomplete` blob, a manifest or tag write temp (`.part<pid>`), or a push upload's staging file must go unwritten before GC may remove it, and then only if nothing in this process owns it and no process holds its lock. Also how long a push upload session may sit idle before it expires. See *Garbage collection is mark-and-sweep* |
 | `XHC_REGISTRY_AUTH_FILE` | unset | mounted `~/.docker/config.json` for upstream credentials |
+| `XHC_REGISTRY_CREDENTIALS` | unset (every host `static`) | JSON list choosing a credential provider per upstream host: `static`, `gcp-metadata` or `gcp-service-account`. For Google Artifact Registry and `gcr.io`. See [Google Artifact Registry](#google-artifact-registry) |
 
 > **Policy defaults to `open`**, at parity with the Hugging Face side. Path-prefix routing
 > means anyone who can reach the port can pull from **any** registry onto your array. The
@@ -2247,6 +2248,105 @@ than an invented answer.
 > **This worked for the first time in 0.6.2.** Before that, credentials were loaded, logged
 > at startup and never attached to a request; a registry using plain Basic auth could not be
 > reached at all. If you are on an earlier version, the feature is documented but absent.
+
+### Google Artifact Registry
+
+> **Verified only against fakes, not a live GCP project.** The tests run a fake metadata
+> server, a fake Google token endpoint and a fake registry whose token endpoint accepts only
+> the current `oauth2accesstoken`. Nothing has been pulled from or pushed to a real
+> `*-docker.pkg.dev` yet, so the first run on a real cluster is the real test. If it fails,
+> the `x-xhc-upstream-auth` header and the cache's log say which layer refused.
+
+Artifact Registry (`<region>-docker.pkg.dev`) and Container Registry (`gcr.io`, `*.gcr.io`)
+authenticate with **short-lived OAuth access tokens**, which last about an hour. A static
+login in `XHC_REGISTRY_AUTH_FILE` works for an hour and then stops. So for these hosts the
+credential comes from a **provider**, chosen per upstream host by `XHC_REGISTRY_CREDENTIALS`:
+
+```bash
+XHC_REGISTRY_CREDENTIALS='[{"hosts": ["*-docker.pkg.dev", "gcr.io", "*.gcr.io"],
+                            "provider": "gcp-metadata"}]'
+```
+
+Then the path form is the registry host followed by the repository, as for any upstream:
+
+```bash
+docker pull muninn.example:5000/us-docker.pkg.dev/my-project/my-repo/my-image:tag
+```
+
+Pull-through, push-through (with the same target-repository guarantees as any other
+registry), per-key rules, prewarm, pins, GC and the object-store tier all apply unchanged.
+Only the credential is different.
+
+**The providers:**
+
+| `provider` | what it presents | extra keys |
+| --- | --- | --- |
+| `static` | the login for that host in `XHC_REGISTRY_AUTH_FILE`, as before. **The default for every host no entry names**, so a deployment that does not set the variable behaves exactly as it did | — |
+| `gcp-metadata` | an access token from the GKE/GCE metadata server, as Basic `oauth2accesstoken:<token>`. It is cached until 5 minutes before it expires and then refreshed, one fetch at a time however many pulls are waiting. The same token client the GCS tier uses | `metadata_url` (tests only; the default is the standard metadata endpoint) |
+| `gcp-service-account` | a service-account JSON key. By default Muninn **mints** an access token from it (an RS256 JWT assertion with `iss`, `scope`, `aud`, `iat`, `exp`, exchanged at the key's `token_uri`) and presents that as `oauth2accesstoken:<token>`, refreshed the same way. `"present": "json-key"` instead sends the key itself as `_json_key:<file contents>` | `key_file` (required), `scopes` (default `https://www.googleapis.com/auth/cloud-platform`), `present` (`access-token` \| `json-key`) |
+
+**Why the service-account provider mints a token by default.** Google documents both
+`oauth2accesstoken` and `_json_key` as Docker usernames for Artifact Registry, and calls the
+key "the least secure option" because it is long-lived
+([Configure authentication to Artifact Registry for Docker](https://cloud.google.com/artifact-registry/docs/docker/authentication)).
+Minting keeps the key inside this process. Only an hour-long token goes to the registry. The
+exchange is Google's documented server-to-server flow
+([Using OAuth 2.0 for Server to Server Applications](https://developers.google.com/identity/protocols/oauth2/service-account)).
+`json-key` exists for an environment that cannot reach `oauth2.googleapis.com`. Prefer
+`gcp-metadata` over either wherever the cache runs on GKE or GCE: then there is no key to
+leak.
+
+**Host patterns** are an exact host (`gcr.io`, `registry.example:5000`) or a leading `*.` or
+`*-` wildcard whose `*` is **one** DNS label. So `*.gcr.io` matches `us.gcr.io` but not
+`gcr.io` or `a.b.gcr.io`, and `*-docker.pkg.dev` matches `us-docker.pkg.dev` and
+`europe-west1-docker.pkg.dev`. **Precedence:** an exact host beats every wildcard, and among
+wildcards the longest pattern wins. List order never matters. The same host in two entries
+is refused at startup. A `static` entry lets one host opt out of a broader wildcard.
+
+**Refusals stay honest.** If the metadata server or token endpoint is unreachable, answers an
+error, or answers without a token, nothing is sent upstream. The pull gets **502** with
+`x-xhc-upstream-auth: credential-provider-failed`, and the log carries one line naming the
+provider and host. It is never a 404, and never "your credentials were rejected". It is not
+treated as a registry outage either, so it does not trigger a restore from the tier. If
+Google issues a token and the registry refuses it (the account lacks the role), the answer is
+the usual 502 with `x-xhc-upstream-auth: rejected`.
+
+**Lifetimes.** A registry bearer token exchanged for an OAuth token is never cached past
+that OAuth token's expiry, even if the registry offers a longer one. A cached bearer token
+that the registry refuses is dropped and exchanged again. It is not re-sent.
+
+**Security.** A malformed `XHC_REGISTRY_CREDENTIALS` refuses startup with a named error. A
+`key_file` is read once at startup, and startup is refused if it is unreadable, is not a
+service-account key, or its private key does not load. The key is held in memory only.
+Tokens, assertions and keys are never logged.
+
+**Workload identity on GKE.** Run Muninn as a Kubernetes ServiceAccount that has Workload
+Identity, and give that identity an Artifact Registry role on the repositories. Use
+**`roles/artifactregistry.reader`** to pull, and **`roles/artifactregistry.writer`** if
+push-through is enabled
+([Artifact Registry roles and permissions](https://cloud.google.com/artifact-registry/docs/access-control)).
+
+1. Enable Workload Identity on the cluster (`--workload-pool=PROJECT_ID.svc.id.goog`) and use
+   the GKE metadata server on the node pool (`--workload-metadata=GKE_METADATA`)
+   ([Authenticate to Google Cloud APIs from GKE workloads](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)).
+2. Grant the role to the Kubernetes ServiceAccount directly, as the principal
+   `principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/NAMESPACE/sa/KSA_NAME`.
+   Or link the ServiceAccount to an IAM service account: annotate it with
+   `iam.gke.io/gcp-service-account`, grant that IAM account the Artifact Registry role, and
+   grant `roles/iam.workloadIdentityUser` to
+   `serviceAccount:PROJECT_ID.svc.id.goog[NAMESPACE/KSA_NAME]` on it.
+3. Set `XHC_REGISTRY_CREDENTIALS` as above. No secret is mounted.
+
+On GCE, the instance's attached service account needs the same role, and the instance needs
+an access scope that allows it (`cloud-platform`). Google notes that pushing needs scopes
+beyond the default, and that scopes can only be set when a node pool is created.
+
+With the service-account provider, mount the key as a Secret and name it:
+
+```bash
+XHC_REGISTRY_CREDENTIALS='[{"hosts": ["*-docker.pkg.dev"], "provider": "gcp-service-account",
+                            "key_file": "/secrets/gcp/key.json"}]'
+```
 
 ### The trust boundary is the network, deliberately
 
